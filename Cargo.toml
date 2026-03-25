@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rift-common",
+    "crates/rift-protocol",
+    "crates/rift-transport",
+    "crates/rift-server",
+    "crates/rift-client",
+]
+
+# rift-fuse requires FUSE to be installed (macfuse on macOS, libfuse3 on Linux)
+# Uncomment to build: 
+# members += ["crates/rift-fuse"]
+exclude = [
+    "crates/rift-fuse",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+authors = ["Rift Contributors"]
+repository = "https://github.com/yourusername/rift"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# QUIC and TLS
+quinn = "0.11"
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# Protobuf
+prost = "0.13"
+prost-build = "0.13"
+
+# FUSE
+fuser = "0.14"
+
+# Hashing and CDC
+blake3 = "1"
+fastcdc = "3"
+
+# Configuration and serialization
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Utilities
+bytes = "1"

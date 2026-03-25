@@ -1,0 +1,20 @@
+[package]
+name = "rift-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+fuser.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+rift-common = { path = "../rift-common" }
+rift-protocol = { path = "../rift-protocol" }
+
+[dev-dependencies]
+tempfile = "3"
