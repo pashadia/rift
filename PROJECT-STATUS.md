@@ -204,205 +204,254 @@ For complete dependency list and rationale, see [`docs/05-implementation/technol
 
 **Estimated duration:** 8-12 weeks (PoC)
 
-### Week 1-2: Foundation
+---
 
-**Goal:** Set up workspace, foundation crates
+## Development Roadmap (TDD-Focused)
+
+This roadmap prioritizes early wins, dependency ordering, and test-first development. Each phase builds on the previous, with clear deliverables and test criteria.
+
+### Phase 1: Workspace Skeleton + `rift-common`
+
+**Goal:** Cargo workspace with all 8 crates compiling (empty libs/bins), plus shared types and error definitions in `rift-common`.
+
+**Why now:** Everything depends on this. You can't write a single test without a compilable workspace. Getting `Cargo.toml` files, feature flags, and dependency versions locked in first prevents churn later.
+
+**Deliverables:** 
+- `cargo build` and `cargo test` pass across the workspace
+- `rift-common` exports config parsing (TOML), error types, path types, and test utilities (temp dirs, test cert helpers)
+
+**Tests:**
+- Unit tests for config deserialization (valid, invalid, missing fields)
+- Test utility helpers return usable temp directories
+- Error types round-trip through `Display`/`Debug`
 
 **Tasks:**
 - [ ] Create workspace directory structure
 - [ ] Set up root `Cargo.toml` with workspace dependencies
-- [ ] Create per-crate `Cargo.toml` files (10 crates)
+- [ ] Create per-crate `Cargo.toml` files (8 crates)
 - [ ] Scaffold all crates with basic `lib.rs` / `main.rs`
-- [ ] Set up CI/CD (GitHub Actions: test, clippy, fmt)
 - [ ] Implement `rift-common`:
   - [ ] Configuration parsing (TOML)
   - [ ] Shared types (ShareInfo, Permissions, etc.)
   - [ ] Permission file parsing
-  - [ ] Test utilities
-- [ ] Implement `rift-protocol`:
-  - [ ] Write complete `.proto` file (all message types)
-  - [ ] Set up `prost-build` in `build.rs`
-  - [ ] Generate Rust types
-  - [ ] Message type constants
-  - [ ] Basic serialization tests
-- [ ] Implement `rift-crypto`:
+  - [ ] Test utilities (temp dirs, test cert generation)
   - [ ] BLAKE3 hashing wrapper
   - [ ] FastCDC chunking wrapper (32/128/512 KB params)
-  - [ ] Merkle tree construction (1024-ary)
-  - [ ] Unit tests (hash verification, chunking boundaries)
-
-**Deliverable:** Foundation crates compile, tests pass
+  - [ ] Merkle tree construction (64-ary)
+  - [ ] Unit tests (hash verification, chunking boundaries, config parsing)
 
 ---
 
-### Week 3-4: Transport Layer
+### Phase 2: `rift-protocol`
 
-**Goal:** QUIC connections with custom TLS verifiers
+**Goal:** All protobuf message definitions compiled via `prost-build`, plus the varint-length-delimited framing codec.
+
+**Why now:** You need wire types before you can build transport or any request/response logic. The spec has the core types defined; this step forces you to finalize the remaining operation messages (STAT, LOOKUP, READDIR, etc.) by writing them as `.proto` files.
+
+**Deliverables:**
+- `.proto` files for all message types
+- Generated Rust types via `prost`
+- A `Codec` that frames/deframes length-delimited messages on an `AsyncRead`/`AsyncWrite`
+
+**Tests:**
+- Round-trip encode/decode for every message type
+- Framing codec: write N messages into a buffer, read back exactly N messages
+- Malformed frames (truncated, oversized) produce clean errors, not panics
 
 **Tasks:**
-- [ ] Implement `rift-transport`:
-  - [ ] Custom TLS verifiers:
-    - [ ] AcceptAnyCertVerifier (server-side, accept all client certs)
-    - [ ] TofuVerifier (client-side, TOFU pinning for self-signed servers)
-  - [ ] QUIC connection establishment (quinn wrapper)
-  - [ ] Certificate fingerprint extraction (SHA256 of DER)
-  - [ ] 0-RTT session resumption
-  - [ ] Connection migration handling
-  - [ ] Integration tests (establish connection, verify certs)
-- [ ] Implement `rift-wire`:
-  - [ ] Varint message framing (type + length encoding)
-  - [ ] Send/receive message helpers
-  - [ ] Request/response correlation (for bi-directional streams)
-  - [ ] Stream multiplexing utilities
-  - [ ] Integration tests (send/receive over QUIC streams)
-
-**Deliverable:** Can establish QUIC connection with mutual TLS, send/receive protobuf messages
+- [ ] Write complete `.proto` file (all message types)
+- [ ] Set up `prost-build` in `build.rs`
+- [ ] Generate Rust types
+- [ ] Message type constants
+- [ ] Varint message framing (type + length encoding)
+- [ ] Send/receive message helpers
+- [ ] Request/response correlation (for bi-directional streams)
+- [ ] Stream multiplexing utilities
+- [ ] Basic serialization tests
 
 ---
 
-### Week 5-6: Server Core
+### Phase 3: `rift-transport`
 
-**Goal:** Minimal server daemon with handshake and discovery
+**Goal:** QUIC connection setup with mutual TLS using `quinn` + `rustls`, stream multiplexing abstraction.
+
+**Why now:** You have wire types (Phase 2) and need a transport to send them over. This is the next layer up. Doing it before server/client logic keeps the abstraction clean.
+
+**Deliverables:**
+- A `RiftConnection` that wraps a QUIC connection, opens bidirectional streams, and sends/receives framed protocol messages
+- TLS setup with self-signed certs for testing
+- The handshake (RiftHello/RiftWelcome) works
+
+**Tests:**
+- Two-process (or two-task) test: client connects to server, handshake completes, both sides see correct protocol version and share info
+- Connection with bad cert is rejected
+- Multiple concurrent streams work independently
+- Connection drop is detected cleanly
 
 **Tasks:**
-- [ ] Implement `rift-server`:
-  - [ ] Accept QUIC connections
-  - [ ] Handle RiftHello/RiftWelcome handshake
-  - [ ] Extract client fingerprint from TLS session
-  - [ ] Load server config (`/etc/rift/config.toml`)
-  - [ ] Load permission files (`/etc/rift/permissions/*.allow`)
-  - [ ] Authorization logic (check fingerprint against permissions)
-  - [ ] Handle DiscoverRequest (list authorized shares)
-  - [ ] Handle WhoamiRequest (return identity info)
-  - [ ] Connection logging (in-memory + persistent JSONL)
-  - [ ] Share management (map share names to filesystem paths)
-- [ ] Implement `riftd` (binary):
-  - [ ] CLI args parsing (config file path, etc.)
-  - [ ] Load config
-  - [ ] Initialize server
-  - [ ] Run server (tokio runtime)
-  - [ ] Graceful shutdown (SIGTERM/SIGINT handling)
-
-**Deliverable:** Server daemon runs, accepts connections, handles handshake and discovery
+- [ ] Custom TLS verifiers:
+  - [ ] AcceptAnyCertVerifier (server-side, accept all client certs)
+  - [ ] TofuVerifier (client-side, TOFU pinning for self-signed servers)
+- [ ] QUIC connection establishment (quinn wrapper)
+- [ ] Certificate fingerprint extraction (SHA256 of DER)
+- [ ] 0-RTT session resumption
+- [ ] Connection migration handling
+- [ ] Integration tests (establish connection, verify certs)
 
 ---
 
-### Week 7-8: Client Core
+### Phase 4: `rift-server` (Minimal, Read-Only)
 
-**Goal:** Client library and CLI basics
+**Goal:** A server that accepts connections, validates certs, handles STAT/LOOKUP/READDIR/OPEN/READ on a real directory.
+
+**Why now:** You have transport and protocol layers. A read-only server is the simplest useful thing you can build, and it exercises the full stack top-to-bottom for the first time.
+
+**Deliverables:**
+- `rift-server --export /some/path` starts a server
+- A client can connect and browse/read files
+- File handles use the encrypted-path scheme
+- Responses include real file metadata
+
+**Tests:**
+- Integration tests using a temp directory with known contents
+- STAT returns correct size/mode/mtime
+- READDIR lists all entries
+- READ returns correct file bytes
+- LOOKUP of nonexistent path returns proper error
+- Permission denied paths return proper error
 
 **Tasks:**
-- [ ] Implement `rift-client`:
-  - [ ] Connect to server (QUIC + TLS)
-  - [ ] Send RiftHello, receive RiftWelcome
-  - [ ] Verify server cert (CA validation or TOFU prompt)
-  - [ ] Send DiscoverRequest, parse response
-  - [ ] Send WhoamiRequest, parse response
-  - [ ] High-level API (list_shares, whoami)
-  - [ ] Session management (connection pooling)
-- [ ] Implement `rift` (binary):
-   - [ ] CLI args parsing (clap derive API)
-   - [ ] Implement basic client commands (see `docs/03-cli-design/commands.md` for full reference)
-   - [ ] Interactive prompts (TOFU confirmation)
-   - [ ] Output formatting (table, JSON)
-
-**Deliverable:** Client can connect to server, pair, discover shares
+- [ ] Accept QUIC connections
+- [ ] Handle RiftHello/RiftWelcome handshake
+- [ ] Extract client fingerprint from TLS session
+- [ ] Load server config (`/etc/rift/config.toml`)
+- [ ] Load permission files (`/etc/rift/permissions/*.allow`)
+- [ ] Authorization logic (check fingerprint against permissions)
+- [ ] Handle DiscoverRequest (list authorized shares)
+- [ ] Handle WhoamiRequest (return identity info)
+- [ ] Connection logging (in-memory + persistent JSONL)
+- [ ] Share management (map share names to filesystem paths)
+- [ ] File handle generation (encrypted paths)
+- [ ] File handle tracking (open files table)
+- [ ] STAT (return file metadata)
+- [ ] LOOKUP (resolve path to inode)
+- [ ] READDIR (list directory, optionally with stat info)
+- [ ] OPEN (allocate file handle)
+- [ ] READ (serve file data, block-level)
+- [ ] CLOSE (deallocate file handle)
+- [ ] CLI args parsing (config file path, etc.)
+- [ ] Graceful shutdown (SIGTERM/SIGINT handling)
 
 ---
 
-### Week 9-10: Filesystem Operations (Read-Only)
+### Phase 5: `rift-client` (Library)
 
-**Goal:** Basic read-only filesystem operations
+**Goal:** High-level client API that connects to a server and performs filesystem operations.
+
+**Why now:** The server exists; now build the client-side mirror. This is the API that both the CLI and FUSE layer will consume, so getting it right matters.
+
+**Deliverables:**
+- A `RiftClient` struct with async methods: `stat()`, `readdir()`, `read_file()`, `lookup()`
+- Internally manages connection, handles reconnection
+
+**Tests:**
+- Against a real `rift-server` instance (spawned in-process)
+- Read a file through the client API, compare bytes to the original
+- List a directory, verify all entries present
+- Client reconnects after server restart (if you implement reconnection here)
 
 **Tasks:**
-- [ ] Protocol messages:
-  - [ ] STAT_REQUEST/RESPONSE
-  - [ ] LOOKUP_REQUEST/RESPONSE
-  - [ ] READDIR_REQUEST/RESPONSE (with READDIR_PLUS)
-  - [ ] OPEN_REQUEST/RESPONSE
-  - [ ] READ_REQUEST/RESPONSE
-  - [ ] CLOSE_REQUEST
-- [ ] Server implementation:
-  - [ ] File handle generation (opaque tokens)
-  - [ ] File handle tracking (open files table)
-  - [ ] STAT (return file metadata)
-  - [ ] LOOKUP (resolve path to inode)
-  - [ ] READDIR (list directory, optionally with stat info)
-  - [ ] OPEN (allocate file handle)
-  - [ ] READ (serve file data, block-level)
-  - [ ] CLOSE (deallocate file handle)
-- [ ] Client implementation:
-   - [ ] High-level read operations (stat, readdir, read_file)
-   - [ ] File handle caching (reuse across operations)
-- [ ] Implement read CLI commands (see `docs/03-cli-design/commands.md` for full reference)
-
-**Deliverable:** Can list directories, read file metadata, read file contents
+- [ ] Connect to server (QUIC + TLS)
+- [ ] Send RiftHello, receive RiftWelcome
+- [ ] Verify server cert (CA validation or TOFU prompt)
+- [ ] Send DiscoverRequest, parse response
+- [ ] Send WhoamiRequest, parse response
+- [ ] High-level API (list_shares, whoami, stat, readdir, read_file)
+- [ ] Session management (connection pooling)
+- [ ] File handle caching (reuse across operations)
+- [ ] CLI args parsing (clap derive API)
+- [ ] Implement basic client commands
+- [ ] Interactive prompts (TOFU confirmation)
+- [ ] Output formatting (table, JSON)
 
 ---
 
-### Week 11: Merkle Tree & Delta Sync (Read)
+### Phase 6: Write Path
 
-**Goal:** Merkle tree comparison for efficient reads
+**Goal:** Add CREATE, MKDIR, WRITE, RENAME, UNLINK, RMDIR to server and client. Implement CoW write semantics with hash preconditions.
+
+**Why now:** Read path is solid. Writes are the next major complexity jump, and the CoW + `expected_root` conflict detection is the novel part of Rift's write model.
+
+**Deliverables:**
+- Client can create files, write data, create/remove directories
+- Server performs CoW writes (temp file, fsync, rename)
+- Concurrent write conflicts detected via Merkle root mismatch
+
+**Tests:**
+- Write a file, read it back, bytes match
+- Create nested directories
+- Delete file, confirm STAT returns not-found
+- **Conflict test:** two clients write the same file, second writer gets a conflict error (not silent corruption)
+- CoW atomicity: kill server mid-write, original file is intact
 
 **Tasks:**
-- [ ] Protocol messages:
-  - [ ] MERKLE_COMPARE (exchange root hashes)
-  - [ ] MERKLE_LEVEL (request tree level)
-  - [ ] MERKLE_DRILL (identify differing blocks)
-  - [ ] MERKLE_LEAVES (batch leaf hashes)
-- [ ] Server implementation:
-  - [ ] Build Merkle tree on first read (cache to disk)
-  - [ ] Serve Merkle tree levels
-  - [ ] Identify changed blocks via tree comparison
-- [ ] Client implementation:
-  - [ ] Build Merkle tree from received data
-  - [ ] Compare trees (root → drill down to leaves)
-  - [ ] Request only changed blocks
-  - [ ] Cache Merkle trees to disk (`/var/lib/rift/`)
-- [ ] Testing:
-  - [ ] Full file transfer (no cached tree)
-  - [ ] Delta sync (partial file change)
-  - [ ] Verify end-to-end integrity (root hash match)
-
-**Deliverable:** Delta sync works for reads (only changed blocks transferred)
+- [ ] Protocol messages: WRITE_REQUEST/RESPONSE, ACQUIRE_LOCK/RELEASE_LOCK, CREATE/MKDIR/UNLINK/RMDIR/RENAME
+- [ ] Server: Write locking (single-writer MVCC), CoW writes, Merkle verification, atomic commit
+- [ ] Client: Acquire lock, stream write data, build Merkle tree, exchange root hash, handle errors
+- [ ] CLI: Implement write commands
 
 ---
 
-### Week 12: Write Operations & PoC Demo
+### Phase 7: Delta Sync / Block Transfer
 
-**Goal:** Write support, complete PoC demo
+**Goal:** Integrate `rift-common` chunking and Merkle trees into the transfer path. Implement block-level reads and Merkle drill-down sync.
+
+**Why now:** The read/write paths work at the whole-file level. Delta sync is Rift's primary value proposition over NFS/SMB. You have all the pieces (crypto, protocol, transport) -- this step wires them together.
+
+**Deliverables:**
+- Large file reads transfer only changed blocks
+- `rift refresh` (or equivalent API) compares Merkle roots and syncs only divergent subtrees
+- Server stores/serves chunk manifests
+
+**Tests:**
+- Modify 1 byte in a 10 MB file. Sync transfers ~128 KB (one chunk), not 10 MB
+- Merkle drill-down correctly identifies the single changed leaf
+- Full-file sync and delta sync produce identical results
 
 **Tasks:**
-- [ ] Protocol messages:
-  - [ ] WRITE_REQUEST/RESPONSE
-  - [ ] ACQUIRE_LOCK/RELEASE_LOCK
-  - [ ] CREATE/MKDIR/UNLINK/RMDIR/RENAME
-- [ ] Server implementation:
-  - [ ] Write locking (single-writer MVCC)
-  - [ ] Write to temp file (CoW semantics)
-  - [ ] Merkle tree verification (root hash exchange)
-  - [ ] Atomic commit (fsync + rename)
-  - [ ] Lock timeout handling
-  - [ ] Mutation broadcasts (notify other clients - not PoC)
-- [ ] Client implementation:
-   - [ ] Acquire write lock
-   - [ ] Stream write data
-   - [ ] Build Merkle tree during write
-   - [ ] Exchange root hash with server
-   - [ ] Handle write errors (retry, resume)
-   - [ ] Release lock
-- [ ] Implement write CLI commands (see `docs/03-cli-design/commands.md` for full reference)
-- [ ] Implement server CLI commands (see `docs/03-cli-design/commands.md` for full reference)
-- [ ] **PoC Demo:**
-  - [ ] Start server, export share
-  - [ ] Client pairs, discovers shares
-  - [ ] Client reads file (full transfer)
-  - [ ] Edit file locally
-  - [ ] Client writes file (delta sync)
-  - [ ] Verify only changed blocks transferred
-  - [ ] Second client reads (benefits from server's cached tree)
+- [ ] Protocol messages: MERKLE_COMPARE, MERKLE_LEVEL, MERKLE_DRILL, MERKLE_LEAVES
+- [ ] Server: Build Merkle tree on first read (cache to disk), serve tree levels, identify changed blocks
+- [ ] Client: Build Merkle tree from received data, compare trees, request only changed blocks, cache trees
+- [ ] Testing: Full transfer, delta sync, integrity verification
 
-**Deliverable:** Working PoC with read/write, delta sync, multi-client reads
+---
+
+### Phase 8: `rift-fuse`
+
+**Goal:** FUSE filesystem that mounts a Rift share as a local directory.
+
+**Why now:** All the underlying layers are solid and tested. FUSE is the primary user-facing interface but is essentially a translation layer from VFS ops to `rift-client` calls.
+
+**Deliverables:**
+- `rift mount server:/share /mnt/point` works
+- `ls`, `cat`, `cp`, `mkdir`, `rm` all work on the mounted filesystem
+- Basic caching (stat cache with TTL)
+
+**Tests:**
+- Mount a share, run standard filesystem operations through the mount point
+- `diff` between a local file and the same file read through the mount returns no differences
+- Write through the mount, verify on server side
+- Unmount is clean
+
+**Tasks:**
+- [ ] Implement `fuser::Filesystem` trait
+- [ ] Map FUSE operations to `rift-client` calls
+- [ ] File handle management (map FUSE fh to Rift handles)
+- [ ] Inode number generation
+- [ ] Metadata caching (optional optimization)
+- [ ] Background worker for async ops
+- [ ] CLI: `rift mount` and `rift umount` commands
+- [ ] Testing: Basic file ops, git clone/pull, compile code, stream video
 
 ---
 
@@ -553,10 +602,18 @@ See `docs/05-implementation/crate-architecture.md` for the complete crate archit
 - Hashing: BLAKE3
 - Serialization: protobuf (prost)
 - FUSE: fuser
-- Crate structure: 10 crates (2 binaries, 8 libraries)
+- Crate structure: 8 crates (2 binaries with libs, 6 libraries)
+
+**Crate architecture (simplified from original 10-crate design):**
+- `rift-server` - Server binary (includes server logic)
+- `rift-client` - Client binary (includes client logic)  
+- `rift-protocol` - Protobuf messages + framing (merged `rift-wire`)
+- `rift-transport` - QUIC/TLS abstraction
+- `rift-fuse` - FUSE filesystem implementation
+- `rift-common` - Shared types, config, utilities, crypto (merged `rift-crypto`)
 
 **Next immediate task:**
-Complete protocol message definitions (filesystem ops, transfer, Merkle tree)
+Create workspace skeleton and implement Phase 1 (rift-common foundation)
 
 ---
 

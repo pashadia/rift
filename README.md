@@ -18,3 +18,44 @@ Rift is built to provide a POSIX-like remote filesystem with strong integrity, e
 ## Design notes
 
 The current design favors a single-client-per-share proof of concept, while keeping the protocol extensible for future multi-client coherency, snapshots, xattrs, reflinks, and other filesystem capabilities. It is intended to adapt to the capabilities of the backing filesystem rather than requiring a specific storage backend.
+
+## Building
+
+```bash
+# Build all crates
+cargo build
+
+# Run tests
+cargo test
+
+# Build release binaries
+cargo build --release
+```
+
+**Note:** The `rift-fuse` crate is excluded by default as it requires FUSE to be installed:
+- **macOS:** Install [macFUSE](https://osxfuse.github.io/)
+- **Linux:** Install `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
+
+To include `rift-fuse` in the build, uncomment it in the root `Cargo.toml`.
+
+## Project Status
+
+See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the current development roadmap and implementation status.
+
+## Crate Structure
+
+- `rift-common` - Shared types, config, utilities, crypto (BLAKE3, FastCDC, Merkle trees)
+- `rift-protocol` - Protobuf messages + framing codec
+- `rift-transport` - QUIC/TLS abstraction
+- `rift-server` - Server binary
+- `rift-client` - Client binary
+- `rift-fuse` - FUSE filesystem implementation (optional)
+
+## Documentation
+
+Detailed design documentation is in the `docs/` directory:
+- `docs/01-requirements/` - Feature specs and design decisions
+- `docs/02-protocol-design/` - Protocol specifications
+- `docs/03-cli-design/` - CLI command reference
+- `docs/04-security/` - Security model and pairing protocol
+- `docs/05-implementation/` - Implementation planning
