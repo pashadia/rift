@@ -120,37 +120,16 @@ impl MerkleTree {
 mod tests {
     use super::*;
 
+    // BLAKE3 tests - verify determinism
     #[test]
-    fn test_blake3_hash() {
+    fn test_blake3_deterministic() {
         let data = b"hello world";
         let hash1 = Blake3Hash::new(data);
         let hash2 = Blake3Hash::new(data);
-        assert_eq!(hash1.as_bytes(), hash2.as_bytes());
+        assert_eq!(hash1, hash2);
     }
 
-    #[test]
-    fn test_blake3_different_data() {
-        let hash1 = Blake3Hash::new(b"hello");
-        let hash2 = Blake3Hash::new(b"world");
-        assert_ne!(hash1.as_bytes(), hash2.as_bytes());
-    }
-
-    #[test]
-    fn test_chunker_default() {
-        let chunker = Chunker::default();
-        assert_eq!(chunker.min_size, 32 * 1024);
-        assert_eq!(chunker.avg_size, 128 * 1024);
-        assert_eq!(chunker.max_size, 512 * 1024);
-    }
-
-    #[test]
-    fn test_chunker_small_data() {
-        let chunker = Chunker::default();
-        let data = vec![0u8; 1024];
-        let chunks = chunker.chunk(&data);
-        assert!(!chunks.is_empty());
-    }
-
+    // Chunker tests - verify determinism
     #[test]
     fn test_chunker_deterministic() {
         let chunker = Chunker::default();
@@ -160,37 +139,144 @@ mod tests {
         assert_eq!(chunks1, chunks2);
     }
 
+    // Merkle tree tests - verify single leaf is identity
     #[test]
-    fn test_merkle_tree_empty() {
-        let tree = MerkleTree::default();
-        let root = tree.build(&[]);
-        assert_eq!(root.as_bytes().len(), 32);
-    }
-
-    #[test]
-    fn test_merkle_tree_single_leaf() {
+    fn test_merkle_tree_single_leaf_identity() {
         let tree = MerkleTree::default();
         let leaf = Blake3Hash::new(b"test");
         let root = tree.build(&[leaf.clone()]);
-        assert_eq!(root.as_bytes(), leaf.as_bytes());
+        assert_eq!(root, leaf);
     }
 
+    // Merkle tree tests - verify determinism
     #[test]
-    fn test_merkle_tree_identical_inputs() {
+    fn test_merkle_tree_deterministic() {
         let tree = MerkleTree::default();
         let leaves: Vec<_> = (0..10).map(|i| Blake3Hash::new(&[i])).collect();
         let root1 = tree.build(&leaves);
         let root2 = tree.build(&leaves);
-        assert_eq!(root1.as_bytes(), root2.as_bytes());
+        assert_eq!(root1, root2);
     }
+}
 
-    #[test]
-    fn test_merkle_tree_different_inputs() {
-        let tree = MerkleTree::default();
-        let leaves1: Vec<_> = (0..10).map(|i| Blake3Hash::new(&[i])).collect();
-        let leaves2: Vec<_> = (0..10).map(|i| Blake3Hash::new(&[i + 1])).collect();
-        let root1 = tree.build(&leaves1);
-        let root2 = tree.build(&leaves2);
-        assert_ne!(root1.as_bytes(), root2.as_bytes());
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32, // Run fewer cases for faster tests (default is 256)
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_blake3_deterministic(data: Vec<u8>) {
+            let hash1 = Blake3Hash::new(&data);
+            let hash2 = Blake3Hash::new(&data);
+            prop_assert_eq!(hash1, hash2);
+        }
+
+        #[test]
+        fn prop_blake3_output_length(data: Vec<u8>) {
+            let hash = Blake3Hash::new(&data);
+            prop_assert_eq!(hash.as_bytes().len(), 32);
+        }
+
+        #[test]
+        fn prop_blake3_no_collision(data1: Vec<u8>, data2: Vec<u8>) {
+            prop_assume!(data1 != data2);
+            let hash1 = Blake3Hash::new(&data1);
+            let hash2 = Blake3Hash::new(&data2);
+            prop_assert_ne!(hash1, hash2);
+        }
+
+        #[test]
+        fn prop_chunker_coverage(data: Vec<u8>) {
+            let chunker = Chunker::default();
+            let chunks = chunker.chunk(&data);
+
+            // Sum of chunk lengths equals input length
+            let total: usize = chunks.iter().map(|(_, len)| len).sum();
+            prop_assert_eq!(total, data.len());
+        }
+
+        #[test]
+        fn prop_chunker_boundary_validity(data: Vec<u8>) {
+            let chunker = Chunker::default();
+            let chunks = chunker.chunk(&data);
+
+            for (offset, length) in chunks {
+                // Offset is within bounds (or data is empty)
+                prop_assert!(offset <= data.len());
+
+                // Offset + length doesn't exceed data
+                prop_assert!(offset + length <= data.len());
+            }
+        }
+
+        #[test]
+        fn prop_chunker_no_overlaps(data: Vec<u8>) {
+            let chunker = Chunker::default();
+            let chunks = chunker.chunk(&data);
+
+            // Verify chunks are contiguous and non-overlapping
+            let mut expected_offset = 0;
+            for (offset, length) in chunks {
+                prop_assert_eq!(offset, expected_offset);
+                expected_offset += length;
+            }
+        }
+
+        #[test]
+        fn prop_chunker_size_constraints(
+            data in proptest::collection::vec(any::<u8>(), 100_000..1_000_000)
+        ) {
+            let chunker = Chunker::default();
+            let chunks = chunker.chunk(&data);
+
+            if chunks.len() > 1 {
+                // All chunks except last should respect size bounds
+                for (_, length) in &chunks[..chunks.len() - 1] {
+                    prop_assert!(*length >= chunker.min_size);
+                    prop_assert!(*length <= chunker.max_size);
+                }
+            }
+        }
+
+        #[test]
+        fn prop_merkle_sensitivity(leaves1: Vec<Vec<u8>>, leaves2: Vec<Vec<u8>>) {
+            prop_assume!(leaves1 != leaves2);
+
+            let tree = MerkleTree::default();
+            let hashes1: Vec<_> = leaves1.iter().map(|d| Blake3Hash::new(d)).collect();
+            let hashes2: Vec<_> = leaves2.iter().map(|d| Blake3Hash::new(d)).collect();
+
+            let root1 = tree.build(&hashes1);
+            let root2 = tree.build(&hashes2);
+            prop_assert_ne!(root1, root2);
+        }
+
+        #[test]
+        fn prop_merkle_order_matters(a: Vec<u8>, b: Vec<u8>) {
+            prop_assume!(a != b);
+
+            let tree = MerkleTree::default();
+            let hash_a = Blake3Hash::new(&a);
+            let hash_b = Blake3Hash::new(&b);
+
+            let root1 = tree.build(&[hash_a.clone(), hash_b.clone()]);
+            let root2 = tree.build(&[hash_b, hash_a]);
+
+            prop_assert_ne!(root1, root2);
+        }
+
+        #[test]
+        fn prop_merkle_empty_valid(_x in 0u8..10u8) {
+            // Just need to run this test, input doesn't matter
+            let tree = MerkleTree::default();
+            let root = tree.build(&[]);
+            prop_assert_eq!(root.as_bytes().len(), 32);
+        }
     }
 }

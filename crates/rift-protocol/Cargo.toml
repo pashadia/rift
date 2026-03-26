@@ -18,3 +18,4 @@ prost-build.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+proptest.workspace = true

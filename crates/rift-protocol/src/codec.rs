@@ -188,3 +188,45 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_codec_round_trip(msg: Vec<u8>) {
+            prop_assume!(msg.len() <= MAX_MESSAGE_SIZE);
+
+            let mut buf = BytesMut::new();
+            encode_message(&msg, &mut buf).unwrap();
+            let decoded = decode_message(&mut buf).unwrap().unwrap();
+
+            prop_assert_eq!(decoded, msg);
+        }
+
+        #[test]
+        fn prop_codec_multiple_messages(messages: Vec<Vec<u8>>) {
+            // Filter out oversized messages
+            let messages: Vec<_> = messages.into_iter()
+                .filter(|msg| msg.len() <= MAX_MESSAGE_SIZE)
+                .collect();
+
+            let mut buf = BytesMut::new();
+
+            // Encode all
+            for msg in &messages {
+                encode_message(msg, &mut buf).unwrap();
+            }
+
+            // Decode all
+            let mut decoded = Vec::new();
+            while let Some(msg) = decode_message(&mut buf).unwrap() {
+                decoded.push(msg);
+            }
+
+            prop_assert_eq!(decoded, messages);
+        }
+    }
+}

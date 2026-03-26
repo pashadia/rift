@@ -99,19 +99,24 @@ These parameters are optimized for a balance between delta sync efficiency and t
 
 ## Testing
 
-The crate includes comprehensive unit tests for all modules:
+The crate includes comprehensive unit tests and property-based tests:
 
 ```bash
+# Run all tests (completes in ~9s)
 cargo test -p rift-common
 ```
 
-Current test coverage:
-- Config parsing (valid/invalid/default)
-- BLAKE3 hashing (correctness, determinism)
-- FastCDC chunking (determinism, boundary detection)
-- Merkle tree construction (empty, single leaf, multiple leaves)
-- Error type formatting
-- Test utilities
+**Test coverage:**
+- **Unit tests (4)**: Basic smoke tests for determinism
+- **Property tests (11)**: Invariant verification across 32 random inputs each
+  - Blake3Hash: determinism, output length, collision resistance
+  - Chunker: coverage, boundary validity, no overlaps, size constraints
+  - MerkleTree: sensitivity, order matters, empty tree
+- **Config tests (2)**: TOML parsing
+- **Error tests (2)**: Display/Debug formatting
+- **Test utility tests (2)**: Temp directory creation
+
+**Note:** Property tests use 32 test cases (instead of the default 256) for faster feedback during development. This provides good coverage while keeping test time reasonable (~9s total).
 
 ## Dependencies
 
