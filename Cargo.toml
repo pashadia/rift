@@ -6,14 +6,12 @@ members = [
     "crates/rift-transport",
     "crates/rift-server",
     "crates/rift-client",
-]
-
-# rift-fuse requires FUSE to be installed (macfuse on macOS, libfuse3 on Linux)
-# Uncomment to build: 
-# members += ["crates/rift-fuse"]
-exclude = [
     "crates/rift-fuse",
 ]
+
+# rift-fuse is Linux-only and requires FUSE to be installed
+# Linux: sudo apt install libfuse3-dev (Ubuntu/Debian) or sudo dnf install fuse3-devel (Fedora/RHEL)
+# The crate will build on other platforms but all code is conditionally compiled out
 
 [workspace.package]
 version = "0.1.0"

@@ -8,13 +8,17 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-fuser.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
+
+# FUSE dependencies only on Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

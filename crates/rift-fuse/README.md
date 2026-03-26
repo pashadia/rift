@@ -13,13 +13,69 @@ This crate provides a FUSE (Filesystem in Userspace) adapter that allows Rift sh
 
 ## Status
 
-**Phase 8 (Not Started)**: This crate is a placeholder for Phase 8 implementation.
+**Phase 8 (Early Development)**: Basic empty directory mount implemented with tests.
 
-The FUSE layer will be implemented after delta sync is complete (Phase 7).
+✅ **Implemented:**
+- Minimal FUSE filesystem (empty directory)
+- Mount/unmount functionality
+- 9 integration tests covering basic operations
+
+🚧 **Next steps:**
+- Add static file support
+- Implement file reading
+- Connect to mock Rift client backend
 
 **Note:** This crate is excluded from the default workspace build because it requires FUSE to be installed:
-- **macOS:** Install [macFUSE](https://osxfuse.github.io/)
+- **macOS:** Install [macFUSE](https://osxfuse.github.io/) - `brew install --cask macfuse`
 - **Linux:** Install `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
+
+## Building and Testing
+
+### Prerequisites
+
+**macOS:**
+```bash
+brew install --cask macfuse
+# You may need to approve the kernel extension in System Settings → Privacy & Security
+# Some systems require a reboot after installation
+```
+
+**Linux:**
+```bash
+# Ubuntu/Debian
+sudo apt install libfuse3-dev
+
+# Fedora/RHEL
+sudo dnf install fuse3-devel
+```
+
+### Enable in Workspace
+
+Edit the root `Cargo.toml`:
+```toml
+members = [
+    # ... other crates ...
+    "crates/rift-fuse",  # Add this line
+]
+
+# Remove or comment out:
+# exclude = ["crates/rift-fuse"]
+```
+
+### Running Tests
+
+```bash
+# Build the crate
+cargo build -p rift-fuse
+
+# Run all tests (requires FUSE installed)
+cargo test -p rift-fuse
+
+# Run a specific test
+cargo test -p rift-fuse test_empty_directory_listing
+```
+
+**Note:** The integration tests in `tests/basic_mount.rs` require FUSE to be installed and will fail at build time if it's not available. There's no way to run these tests without the FUSE kernel extension.
 
 ## Usage
 

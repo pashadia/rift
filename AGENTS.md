@@ -21,7 +21,6 @@ cargo check
 ```
 
 ### Testing
-
 ```bash
 # Run all tests
 cargo test
@@ -41,6 +40,8 @@ cargo test -- --nocapture
 # Run property tests with custom case count
 PROPTEST_CASES=256 cargo test
 ```
+
+**Note on FUSE tests:** `rift-fuse` tests only run on Linux with libfuse3-dev installed. On other platforms, the crate builds successfully but all tests are conditionally compiled out (0 tests run). See `crates/rift-fuse/TESTING.md` for details.
 
 ### Linting
 
