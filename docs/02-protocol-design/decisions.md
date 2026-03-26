@@ -47,7 +47,7 @@ Additional decisions:
 ```
 Client → Server: RiftHello
   • protocol_version: 1
-  • capabilities: [RIFT_READDIR_PLUS, RIFT_RESUMABLE, ...]
+  • capabilities: [RIFT_RESUMABLE, RIFT_MERKLE_TREE, ...]
   • share_name: "webdata"
 
 Server → Client: RiftWelcome
@@ -1248,7 +1248,188 @@ Cost: one `MERKLE_LEVEL_RESPONSE` per tree level, each returning up to
 
 ---
 
-## 19. Server-Side CDC Boundary Validation on Write
+## 19. READDIR Returns Handles; STAT Accepts List
+
+**Decision: READDIR returns file handles in addition to names, and STAT
+accepts a list of handles for batch queries.**
+
+### The N+1 Query Problem
+
+The classic filesystem performance issue: to display a directory listing
+with metadata (`ls -l`), naive implementations require:
+
+```
+1 READDIR  → get 1000 names
+1000 STATs → get metadata for each file
+```
+
+Over a 50ms WAN link, this is 50 seconds of round trips — unusable.
+
+### Why QUIC Doesn't Fully Solve This
+
+QUIC's stream multiplexing allows sending 1000 STAT requests in parallel,
+reducing latency from 50 seconds to ~150ms (1 RTT READDIR + 1 RTT for
+parallel STATs, assuming unlimited streams and instant server processing).
+
+However:
+- **Practical stream limits**: Quinn defaults to 100 concurrent streams.
+  For 1000 files, you need 10 batches = 10 RTTs = 550ms.
+- **Bandwidth overhead**: 1000 separate messages (stream IDs, protobuf
+  headers, varint framing) add ~30 KB overhead vs ~30 bytes for one message.
+- **Server-side batching lost**: Server processes 1000 individual requests
+  instead of one batched request, losing the opportunity to optimize disk
+  I/O or parallelize across cores.
+- **Error handling complexity**: Partial failures (50 of 1000 STATs fail)
+  must be handled by the client.
+
+### Design: READDIR + Batch STAT
+
+**READDIR returns handles:**
+
+```protobuf
+message ReaddirRequest {
+  bytes directory_handle = 1;
+  uint32 offset = 2;   // For pagination (0-based)
+  uint32 limit = 3;    // Max entries to return (0 = server default)
+}
+
+message ReaddirResponse {
+  repeated ReaddirEntry entries = 1;
+  bool has_more = 2;   // True if offset + limit < total entries
+}
+
+message ReaddirEntry {
+  string name = 1;
+  FileType file_type = 2;  // FILE, DIRECTORY, SYMLINK
+  bytes handle = 3;        // Opaque handle for this entry
+}
+```
+
+**Key property**: Server issues a handle for each entry during READDIR.
+Client receives handles without needing additional LOOKUP operations.
+
+**STAT accepts a list of handles:**
+
+```protobuf
+message StatRequest {
+  repeated bytes handles = 1;  // 1..N handles
+}
+
+message StatResponse {
+  repeated StatResult results = 1;  // Same order as request
+}
+
+message StatResult {
+  oneof result {
+    FileAttrs attrs = 1;
+    ErrorDetail error = 2;  // Permission denied, stale handle, etc.
+  }
+}
+```
+
+**Key property**: Single operation works for 1 file or N files. Partial
+failures don't fail the entire batch — each entry gets a success or error.
+
+### Usage Patterns
+
+**Pattern 1: Just names (`ls`)**
+```
+READDIR → [(name1, type1, handle1), ...]
+Client prints names, ignores handles
+Total: 1 RTT
+```
+
+**Pattern 2: All metadata (`ls -l`)**
+```
+READDIR → [(name1, handle1), (name2, handle2), ...]
+STAT [handle1, handle2, ...] → [attrs1, attrs2, ...]
+Client prints names + metadata
+Total: 2 RTTs
+```
+
+**Pattern 3: Filtered metadata (`ls -l *.mp4`)**
+```
+READDIR → 5000 entries
+Filter locally → 500 .mp4 files
+STAT [500 handles] → [attrs...]
+Total: 2 RTTs, only stat what's needed
+```
+
+**Pattern 4: Virtual scrolling (GUI file browser)**
+```
+READDIR → 10,000 entries
+Display rows 1-50 → STAT [first 50 handles]
+User scrolls → STAT [next 50 handles]
+Total: 1 READDIR + incremental STATs as needed
+```
+
+### Handle Overhead in READDIR
+
+Including handles in READDIR adds ~16 bytes per entry:
+- 1000 entries × 16 bytes = 16 KB
+- At 100 Mbps: 1.3ms transfer time
+- **Negligible** compared to the RTT savings
+
+The simplicity of always including handles outweighs the minor bandwidth
+cost. Clients that don't need metadata (e.g., `ls` without `-l`) can
+ignore the handles.
+
+### Error Handling in Batch STAT
+
+Each StatResult contains either FileAttrs or ErrorDetail. This allows:
+- Server to handle per-file errors gracefully (e.g., 5 of 100 files are
+  permission-denied)
+- Client receives partial results + errors in one response
+- No need to retry individual files to discover which failed
+
+Example:
+```
+STAT [handle1, handle2, handle3]
+→ [
+    StatResult { attrs: {...} },              // Success
+    StatResult { error: PERMISSION_DENIED },  // Failed
+    StatResult { attrs: {...} }               // Success
+  ]
+```
+
+### Deferred: READDIR_PLUS
+
+An earlier design included a `READDIR_PLUS` operation that returns names
++ handles + metadata in one RTT (equivalent to `READDIR` followed by
+`STAT(all handles)`).
+
+**Advantages of READDIR_PLUS:**
+- 1 RTT instead of 2 for `ls -l`
+- Server can optimize the single batch operation
+
+**Why deferred:**
+- Adds a second directory listing operation (protocol complexity)
+- READDIR + STAT(all) achieves the same result in 2 RTTs
+- For most use cases, 2 RTTs (100-150ms on WAN) is acceptable
+- Selective STAT (virtual scrolling, filtering) is more valuable than
+  saving 1 RTT on `ls -l`
+
+**READDIR_PLUS may be revisited** if profiling shows the extra RTT is a
+bottleneck for common workflows. The design is documented in internal
+notes for future reference.
+
+### Comparison to Other Protocols
+
+**NFS v4**: Has READDIR (with cookies/handles) + GETATTR (batch).
+Similar to Rift's design.
+
+**SMB**: QUERY_DIRECTORY returns all metadata (no separate STAT).
+Equivalent to READDIR_PLUS.
+
+**9P**: READDIR returns basic info; GETATTR is per-file.
+Less efficient than Rift's batch STAT.
+
+**Rift's choice**: Middle ground — READDIR returns handles enabling
+efficient batch STAT, but doesn't force metadata when not needed.
+
+---
+
+## 20. Server-Side CDC Boundary Validation on Write
 
 **Decision: The server validates every submitted chunk boundary using
 FastCDC during WRITE processing. Non-canonical boundaries are
