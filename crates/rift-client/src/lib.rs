@@ -4,4 +4,5 @@
 
 pub mod client;
 
-// Placeholder for Phase 5 implementation
+#[cfg(target_os = "linux")]
+pub mod mount;

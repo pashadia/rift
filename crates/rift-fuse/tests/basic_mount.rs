@@ -13,18 +13,29 @@
 
 use std::fs;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+
+// fusermount3 uses a Unix socket to pass the FUSE fd back to the caller.
+// When tests run in parallel, child processes inherit each other's open fds
+// and fusermount3 picks the wrong one, breaking the mount.  Serialize all
+// tests that create a FUSE mount to avoid this.
+static MOUNT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Test fixture that manages FUSE mount lifecycle
 struct MountFixture {
     mount_point: TempDir,
     _session: fuser::BackgroundSession,
+    // Holds the global lock for the duration of the test.
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl MountFixture {
     fn new() -> Self {
+        let _lock = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let mount_point = TempDir::new().expect("Failed to create temp mount point");
 
         // Mount the filesystem
@@ -36,6 +47,7 @@ impl MountFixture {
         Self {
             mount_point,
             _session: session,
+            _lock,
         }
     }
 

@@ -23,5 +23,9 @@ rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
 rift-transport = { path = "../rift-transport" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rift-fuse = { path = "../rift-fuse" }
+fuser = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
