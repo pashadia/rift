@@ -1632,3 +1632,278 @@ Each will be defined when implementing the operation that needs it
 8. Should `mode` field include file type bits (redundant with
    file_type) or zero them out? Current: include them to match POSIX
    stat exactly. Revisit if this causes confusion.
+
+---
+
+## 21. CdcParams Moved Into ShareInfo
+
+**Decision: `CdcParams` is a field of `ShareInfo`, not a top-level field of `RiftWelcome`.**
+
+CDC parameters are per-share configuration, not per-connection. Moving them into
+`ShareInfo` means each share carries its own chunking policy. When `DISCOVER` (via
+`WhoamiResponse`) returns a list of shares, each entry already includes its CDC
+parameters — no separate field needed in the welcome message.
+
+```protobuf
+message ShareInfo {
+  string    name       = 1;
+  bool      read_only  = 2;
+  CdcParams cdc_params = 3;
+}
+```
+
+`RiftWelcome.cdc_params` (previously a top-level field) is removed. The mounted
+share's parameters are in `RiftWelcome.share.cdc_params`.
+
+---
+
+## 22. Capability Flags Reduced to NOTIFICATIONS Only
+
+**Decision: `CAPABILITY_MERKLE_TREE` and `CAPABILITY_RESUMABLE` removed.**
+
+`CAPABILITY_MERKLE_TREE`: The Merkle tree protocol is not optional — the entire
+delta sync design depends on it. There is no coherent mode of operation without
+Merkle trees. Advertising it as a capability is meaningless.
+
+`CAPABILITY_RESUMABLE`: QUIC handles connection-level resumption (0-RTT, connection
+migration). At the protocol level, any interrupted READ can be restarted with a new
+`ReadRequest` specifying a chunk offset, and any interrupted WRITE restarts from
+scratch. This is not a negotiable feature; it is how the operations work.
+
+The capability enum retains `CAPABILITY_NOTIFICATIONS` as the only current optional
+feature. New capabilities are added when the corresponding feature is implemented.
+
+```protobuf
+enum Capability {
+  CAPABILITY_UNSPECIFIED   = 0;
+  CAPABILITY_NOTIFICATIONS = 1;
+}
+```
+
+---
+
+## 23. Sequence Numbers Deferred to Notifications Phase
+
+**Decision: `last_seen_sequence` and `current_sequence` removed from the handshake
+until `CAPABILITY_NOTIFICATIONS` is implemented.**
+
+Rationale: a sequence number in the handshake only has value if the server can
+replay the missed notifications to the reconnecting client. Without replay, the
+sequence number only signals "you are stale by N mutations" — information the
+Merkle comparison already provides. Carrying a field that has no actionable use
+adds confusion without benefit.
+
+When `CAPABILITY_NOTIFICATIONS` is implemented, the handshake gains:
+- `RiftHello.last_seen_sequence: uint64` — client's last known sequence (0 on first connect)
+- `RiftWelcome.current_sequence: uint64` — server's current sequence
+- `RiftWelcome.missed_notifications: repeated <NotificationMessage>` — mutations missed
+  since `last_seen_sequence`, enabling cache recovery without a full Merkle comparison
+
+The exact notification message type for replay is to be specified alongside the
+notifications design.
+
+---
+
+## 24. WhoamiRequest Allowed Before RiftHello
+
+**Decision: `WhoamiRequest` may be sent on the control stream before `RiftHello`,
+enabling share discovery without prior knowledge of available share names.**
+
+The control stream state machine:
+
+```
+State 0 (initial):
+  WhoamiRequest → WhoamiResponse   (remains in State 0)
+  RiftHello     → RiftWelcome      (moves to State 1)
+
+State 1 (mounted):
+  normal filesystem operations
+```
+
+A client with no configured share sends `WhoamiRequest` to discover available shares,
+then sends `RiftHello` with the chosen share name. A client that already knows its
+share skips `WhoamiRequest` and proceeds directly with `RiftHello`.
+
+The server already has the client's TLS certificate at this point, so `WhoamiResponse`
+can be answered without a mounted share context.
+
+Any filesystem operation received in State 0 (other than `WhoamiRequest`) returns
+`ERROR_UNSUPPORTED` and the connection is closed.
+
+A client that sends `WhoamiRequest` and then closes the connection without sending
+`RiftHello` is valid. The QUIC idle timeout reclaims the connection.
+
+`DISCOVER` as a separate operation is removed. Its function is covered by
+`WhoamiResponse.available_shares`.
+
+---
+
+## 25. DISCOVER Removed; Merged Into WhoamiResponse
+
+**Decision: No separate DISCOVER operation. `WhoamiResponse` returns both identity
+info and the list of accessible shares.**
+
+```protobuf
+message WhoamiRequest {}
+message WhoamiResponse {
+  string             fingerprint      = 1;  // hex SHA-256 of client cert DER
+  string             common_name      = 2;  // CN from client cert
+  repeated ShareInfo available_shares = 3;  // only shares this client can access
+}
+```
+
+The client never sees shares it is not authorized for. Each `ShareInfo` includes
+`cdc_params` (decision 21), so the client has full information before connecting.
+
+---
+
+## 26. CREATE Merged Into WRITE via oneof target
+
+**Decision: No separate CREATE operation. `WriteRequest` handles both file creation
+and file update via a `oneof target` discriminator.**
+
+```protobuf
+message WriteRequest {
+  oneof target {
+    bytes   existing_handle = 1;  // update existing file
+    NewFile new_file        = 2;  // create new file
+  }
+  bytes              expected_root = 3;  // must be empty when new_file is set
+  repeated ChunkInfo chunks        = 4;
+}
+
+message NewFile {
+  bytes  parent_handle = 1;
+  string name          = 2;
+  uint32 mode          = 3;
+}
+
+message WriteSuccess {
+  bytes new_root = 1;
+  bytes handle   = 2;  // populated when new_file was set; empty for updates
+}
+```
+
+When `new_file` is set, `expected_root` must be empty (file does not yet exist).
+The server returns the new file's handle in `WriteSuccess.handle`, saving the client
+a follow-up `LOOKUP`.
+
+---
+
+## 27. Reads Are Chunk-Index-Based
+
+**Decision: `ReadRequest` uses chunk indices, not byte offsets. The client always
+holds the file's Merkle tree before issuing a read.**
+
+```protobuf
+message ReadRequest {
+  bytes  handle      = 1;
+  uint32 start_chunk = 2;  // 0 = from beginning
+  uint32 chunk_count = 3;  // 0 = all chunks
+}
+
+message ReadSuccess {
+  uint32 chunk_count = 1;  // number of BLOCK_HEADER/BLOCK_DATA pairs to follow
+}
+```
+
+Rationale: CDC chunks are the indivisible unit of transfer. Byte-offset reads would
+require the server to translate offsets to chunk boundaries on every request, adding
+complexity and an edge case (first chunk start may not align to requested offset).
+
+Since the client always has the Merkle tree before reading (either freshly fetched
+via `MerkleDrill` or cached from a previous session), it knows the chunk layout and
+can request the right chunks by index. For FUSE random-access reads, the client
+fetches the full file on first access and serves subsequent reads from its local
+page cache.
+
+For delta sync, the client requests only the specific chunk indices that the Merkle
+comparison identified as changed.
+
+---
+
+## 28. Server Is Source of Truth for Merkle Tree
+
+**Decision: The server serves its Merkle tree on demand. The client drills down,
+compares against its cache, and decides what to fetch. No client-root is sent
+to the server during Merkle comparison.**
+
+This replaces the `MERKLE_COMPARE` message (which had a `client_root` field and
+implied server-side comparison logic). The server's only job is to serve tree levels
+on request.
+
+```
+Client → Server:  MerkleDrill { handle, level: 0, subtrees: [] }
+                  (empty subtrees = give me everything at this level)
+Server → Client:  MerkleLevelResponse { level, hashes, subtree_bytes }
+Client compares received hashes against its cache.
+Client → Server:  MerkleDrill { handle, level: 1, subtrees: [12, 47] }
+Server → Client:  MerkleLevelResponse { ... }
+... repeat until leaves are reached ...
+Client → Server:  (READ or WRITE for differing chunks)
+```
+
+The entire exchange runs on a single bidirectional operation stream (decision 1).
+The stream closes when the client has enough information to proceed.
+
+**Race condition:** The file may change between Merkle drill rounds. This is
+self-healing: chunk hashes in `BlockHeader` catch stale data on reads; the
+`expected_root` precondition in `WriteRequest` catches drift on writes.
+For PoC (single client), this race does not occur.
+
+**Write validation:** The server still validates `expected_root` in `WriteRequest`
+(decision 11). This is a concurrency primitive, not part of the Merkle sync flow.
+
+---
+
+## 29. SetAttr Uses Optional Fields; uid/gid Deferred
+
+**Decision: `SetAttrRequest` uses proto3 `optional` fields. No `valid` bitmask.
+uid/gid fields are deferred pending identity mapping design.**
+
+```protobuf
+message SetAttrRequest {
+  bytes                              handle = 1;
+  optional uint32                    mode   = 2;
+  optional google.protobuf.Timestamp mtime  = 3;
+}
+```
+
+`optional` generates `Option<T>` in Rust via prost. An absent field means "do not
+change this attribute." This is cleaner than a bitmask and does not mimic the FUSE
+`struct iattr` API — the server translates to whatever its backing storage requires.
+
+Truncation (size change) is implemented as client-side read-modify-write: the client
+fetches the Merkle tree, reads the single chunk at the truncation boundary, trims it,
+drops subsequent chunks, recomputes the tree, and issues a normal `WRITE`. No
+`size` field is needed in `SetAttrRequest`.
+
+uid/gid handling requires a separate design decision on identity mapping
+(passthrough / fixed / name-based). Deferred.
+
+---
+
+## 30. RENAME Uses POSIX Atomic Replace Semantics
+
+**Decision: `RenameRequest` atomically replaces the destination if it exists,
+matching POSIX `rename()`. No `expected_root` guard. No `flags` field.**
+
+```protobuf
+message RenameRequest {
+  bytes  old_parent_handle = 1;
+  string old_name          = 2;
+  bytes  new_parent_handle = 3;
+  string new_name          = 4;
+}
+```
+
+POSIX rename semantics are expected by shells, editors, and build tools. A
+non-POSIX variant (return `ERROR_ALREADY_EXISTS`) would break common workflows.
+
+No `expected_root` guard: RENAME does not change file content, only directory
+structure. The write guard (decision 11) exists to prevent data loss from
+overwriting unseen changes; it does not apply here. If the client needs to assert
+file content before renaming, it performs a `MerkleDrill` separately.
+
+`flags` for `RENAME_NOREPLACE` / `RENAME_EXCHANGE` (Linux `rename2`) are deferred.
+Add a `flags` field when the feature is implemented.
