@@ -77,7 +77,7 @@ message ErasureCodeConfig {
 message ServerEndpoint {
   string server_id = 1;          // Unique identifier (e.g., "server-a")
   string address = 2;            // "server-a.example.com:8433"
-  bytes fingerprint = 3;         // TLS cert SHA256 fingerprint
+  bytes fingerprint = 3;         // TLS cert BLAKE3 fingerprint
   uint32 priority = 4;           // Lower = prefer for reads (latency hint)
 }
 
@@ -445,12 +445,12 @@ max_shard_size = 16777216        # 16 MB (reject larger shards)
 [[server.erasure_coding.peers]]
 server_id = "server-b"
 address = "192.168.1.11:8433"
-fingerprint = "SHA256:abcd1234..."
+fingerprint = "BLAKE3:abcd1234..."
 
 [[server.erasure_coding.peers]]
 server_id = "server-c"
 address = "192.168.1.12:8433"
-fingerprint = "SHA256:def5678..."
+fingerprint = "BLAKE3:def5678..."
 ```
 
 ---

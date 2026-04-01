@@ -1746,7 +1746,7 @@ info and the list of accessible shares.**
 ```protobuf
 message WhoamiRequest {}
 message WhoamiResponse {
-  string             fingerprint      = 1;  // hex SHA-256 of client cert DER
+  string             fingerprint      = 1;  // hex BLAKE3 of client cert DER
   string             common_name      = 2;  // CN from client cert
   repeated ShareInfo available_shares = 3;  // only shares this client can access
 }

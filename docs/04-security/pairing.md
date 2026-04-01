@@ -23,7 +23,7 @@ Rift uses a **connection-based pairing model** where the act of connecting is it
 
 1. **Client establishes QUIC+TLS connection** to server (mutual TLS)
 2. **Server extracts client certificate** from TLS session
-3. **Server computes client fingerprint** (SHA256 of DER-encoded cert)
+3. **Server computes client fingerprint** (BLAKE3 of DER-encoded cert)
 4. **Server logs the connection** (fingerprint, IP, timestamp, cert CN) to connection log
 5. **Server checks authorization:**
    - If fingerprint matches entries in `/etc/rift/permissions/<share>.allow` → Client can access those shares
@@ -37,8 +37,8 @@ Rift uses a **connection-based pairing model** where the act of connecting is it
 
 **Connection log** (`/var/lib/rift/connection-log.jsonl`):
 ```jsonl
-{"timestamp":"2025-03-19T10:30:00Z","fingerprint":"SHA256:def456...abc123","cn":"client.example.com","ip":"192.168.1.50","event":"connect"}
-{"timestamp":"2025-03-19T10:35:12Z","fingerprint":"SHA256:abc789...012def","cn":"laptop.local","ip":"192.168.1.75","event":"connect"}
+{"timestamp":"2025-03-19T10:30:00Z","fingerprint":"BLAKE3:def456...abc123","cn":"client.example.com","ip":"192.168.1.50","event":"connect"}
+{"timestamp":"2025-03-19T10:35:12Z","fingerprint":"BLAKE3:abc789...012def","cn":"laptop.local","ip":"192.168.1.75","event":"connect"}
 ```
 
 **In-memory tracking:**
@@ -170,7 +170,7 @@ Server responds with client identity and authorization status.
 ```protobuf
 message WhoamiResponse {
   // Identity information
-  string fingerprint = 1;           // Client cert fingerprint (SHA256:...)
+  string fingerprint = 1;           // Client cert fingerprint (BLAKE3:...)
   string common_name = 2;           // CN from cert subject
   string source_ip = 3;             // Client IP as seen by server
 
@@ -203,7 +203,7 @@ $ rift whoami server.example.com
 Connected to: server.example.com:8433
 Server sees you as:
 
-  Certificate fingerprint: SHA256:def456...abc123
+  Certificate fingerprint: BLAKE3:def456...abc123
   Common name: client.example.com
   Source IP: 192.168.1.50
 
@@ -230,7 +230,7 @@ Available shares:
 # Expected to see 'data' share, but don't
 
 $ rift whoami server.example.com
-Certificate fingerprint: SHA256:abc123...WRONG
+Certificate fingerprint: BLAKE3:abc123...WRONG
 Common name: old-client.example.com
 Authorization status: Unknown client
 
@@ -238,12 +238,12 @@ Authorization status: Unknown client
 
 $ rift show-cert --client
 Certificate: /etc/rift/client-cert.pem
-Fingerprint: SHA256:abc123...WRONG
+Fingerprint: BLAKE3:abc123...WRONG
 
 # Using old cert, need to use new one
 $ export RIFT_CLIENT_CERT=/etc/rift/new-cert.pem
 $ rift whoami server.example.com
-Certificate fingerprint: SHA256:def456...abc123
+Certificate fingerprint: BLAKE3:def456...abc123
 Authorization status: Known client
 Authorized shares: data (rw), backup (ro)
 
@@ -267,9 +267,9 @@ $ rift list-connections [--all] [--format table|json]
 Recent connections:
 
 Fingerprint                                          Common Name           IP              Last Seen          Status
-SHA256:def456...abc123                               client.example.com    192.168.1.50    2025-03-19 10:30   Authorized (data, backup)
-SHA256:abc789...012def                               laptop.local          192.168.1.75    2025-03-19 11:00   Unknown
-SHA256:123abc...456def                               remote.internal       10.0.1.100      2025-03-19 09:15   Authorized (data)
+BLAKE3:def456...abc123                               client.example.com    192.168.1.50    2025-03-19 10:30   Authorized (data, backup)
+BLAKE3:abc789...012def                               laptop.local          192.168.1.75    2025-03-19 11:00   Unknown
+BLAKE3:123abc...456def                               remote.internal       10.0.1.100      2025-03-19 09:15   Authorized (data)
 
 Total: 3 connections (2 authorized, 1 unknown)
 ```
@@ -291,8 +291,8 @@ $ rift list-clients [--verbose] [--format table|json]
 Authorized clients:
 
 Fingerprint                                          Friendly Name          First Seen          Shares
-SHA256:def456...abc123                               Engineering Laptop     2025-03-15 10:00    data (rw), backup (ro)
-SHA256:123abc...456def                               Remote Office          2025-03-18 14:30    data (ro)
+BLAKE3:def456...abc123                               Engineering Laptop     2025-03-15 10:00    data (rw), backup (ro)
+BLAKE3:123abc...456def                               Remote Office          2025-03-18 14:30    data (ro)
 
 Total: 2 clients
 ```
@@ -309,8 +309,8 @@ Grant a client access to a share.
 rift allow <share> <client-fingerprint> <ro|rw> [--name <friendly-name>]
 
 # Examples:
-rift allow data SHA256:def456...abc123 rw --name "Engineering Laptop"
-rift allow backup SHA256:abc789...012def ro --name "Backup Service"
+rift allow data BLAKE3:def456...abc123 rw --name "Engineering Laptop"
+rift allow backup BLAKE3:abc789...012def ro --name "Backup Service"
 ```
 
 **Behavior:**
@@ -323,14 +323,14 @@ rift allow backup SHA256:abc789...012def ro --name "Backup Service"
 5. Store client metadata: `/etc/rift/clients/<fingerprint>/metadata.toml`
 6. Append to `/etc/rift/permissions/<share>.allow`:
    ```
-   SHA256:def456...abc123 rw
+   BLAKE3:def456...abc123 rw
    ```
 7. Log to audit log
 8. Client can immediately access the share (no server restart)
 
 **Output:**
 ```
-✓ Client SHA256:def456...abc123 granted rw access to share 'data'
+✓ Client BLAKE3:def456...abc123 granted rw access to share 'data'
   Friendly name: Engineering Laptop
   Client can now mount: rift mount data@server.example.com /mnt/data
 ```
@@ -343,7 +343,7 @@ Revoke a client's access to a specific share.
 rift deny <share> <client-fingerprint>
 
 # Example:
-rift deny data SHA256:def456...abc123
+rift deny data BLAKE3:def456...abc123
 ```
 
 **Behavior:**
@@ -360,7 +360,7 @@ Revoke a client's access to ALL shares.
 rift revoke <client-fingerprint>
 
 # Example:
-rift revoke SHA256:def456...abc123
+rift revoke BLAKE3:def456...abc123
 ```
 
 **Behavior:**
@@ -401,7 +401,7 @@ Connecting to server.example.com:8433...
 ✓ Connected successfully
 
 Your client fingerprint:
-  SHA256:def456...abc123
+  BLAKE3:def456...abc123
 
 Provide this to the server administrator to request access to shares.
 
@@ -412,7 +412,7 @@ Check available shares: rift show-mounts server.example.com
 ```
 Connecting to server.example.com:8433...
 ⚠️  Server certificate is self-signed
-Server fingerprint: SHA256:abc123...def456
+Server fingerprint: BLAKE3:abc123...def456
 
 Verify this fingerprint matches the server's certificate.
 Run on server: rift show-cert --server
@@ -422,7 +422,7 @@ Trust this server? [y/N]: y
 ✓ Connected successfully
 
 Your client fingerprint:
-  SHA256:def456...abc123
+  BLAKE3:def456...abc123
 
 Provide this to the server administrator to request access.
 ```
@@ -448,7 +448,7 @@ rift whoami server.example.com
 Connected to: server.example.com:8433
 Server sees you as:
 
-  Certificate fingerprint: SHA256:def456...abc123
+  Certificate fingerprint: BLAKE3:def456...abc123
   Common name: client.example.com
   Source IP: 192.168.1.50
 
@@ -575,7 +575,7 @@ Mount with:
 **Attack:** Attacker generates cert with same fingerprint as legitimate client.
 
 **Protection:**
-- SHA256 collision is computationally infeasible (2^256 brute force)
+- BLAKE3 collision is computationally impossible
 - TLS validates cert signature (can't forge without CA private key)
 - Not a practical threat
 
@@ -606,7 +606,7 @@ rift server start
 
 # Display server fingerprint for client verification
 rift show-cert --server
-Server fingerprint: SHA256:abc123...def456
+Server fingerprint: BLAKE3:abc123...def456
 ```
 
 **2. Client connects:**
@@ -617,11 +617,11 @@ rift init --client
 # Connect to server
 rift pair server.example.com
 ⚠️  Server certificate is self-signed
-Server fingerprint: SHA256:abc123...def456
+Server fingerprint: BLAKE3:abc123...def456
 Trust this server? [y/N]: y
 ✓ Connected
 
-Your client fingerprint: SHA256:def456...abc123
+Your client fingerprint: BLAKE3:def456...abc123
 
 # Check available shares
 rift show-mounts server.example.com
@@ -636,10 +636,10 @@ rift mount public@server.example.com /mnt/public
 ```bash
 # View recent connections
 rift list-connections
-SHA256:def456...abc123    client.example.com    192.168.1.50    Just now    Unknown
+BLAKE3:def456...abc123    client.example.com    192.168.1.50    Just now    Unknown
 
 # Grant access to data share
-rift allow data SHA256:def456...abc123 rw --name "Alice's Laptop"
+rift allow data BLAKE3:def456...abc123 rw --name "Alice's Laptop"
 ✓ Access granted
 ```
 
@@ -676,7 +676,7 @@ Available shares:
 # Expected 'data' but don't see it
 
 $ rift whoami server.example.com
-Certificate fingerprint: SHA256:OLD123...WRONG
+Certificate fingerprint: BLAKE3:OLD123...WRONG
 Common name: old-cert.example.com
 Authorization status: Unknown client
 Authorized shares: (none)
@@ -685,14 +685,14 @@ Authorized shares: (none)
 
 $ rift show-cert --client
 Certificate: /home/user/.config/rift/old-cert.pem
-Fingerprint: SHA256:OLD123...WRONG
+Fingerprint: BLAKE3:OLD123...WRONG
 
 # Found the issue - using old cert
 # Tell Rift to use new cert
 $ export RIFT_CLIENT_CERT=/home/user/.config/rift/new-cert.pem
 
 $ rift whoami server.example.com
-Certificate fingerprint: SHA256:def456...abc123
+Certificate fingerprint: BLAKE3:def456...abc123
 Common name: client.example.com
 Authorization status: Known client
 Friendly name: Alice's Laptop
@@ -722,9 +722,9 @@ $ rift show-cert --client --format pem > client-cert.pem
 ```bash
 $ rift import-cert client-cert.pem --name "Secure Client"
 ✓ Client certificate imported
-  Fingerprint: SHA256:def456...abc123
+  Fingerprint: BLAKE3:def456...abc123
 
-$ rift allow data SHA256:def456...abc123 rw
+$ rift allow data BLAKE3:def456...abc123 rw
 ✓ Access granted
 ```
 

@@ -199,7 +199,7 @@ read_only = true
 
 `clients/<fingerprint>/metadata.toml`:
 ```toml
-fingerprint = "SHA256:abc123...def456"
+fingerprint = "BLAKE3:abc123...def456"
 common_name = "client.example.com"
 accepted_at = "2025-03-19T10:30:00Z"
 accepted_by = "admin@server"
@@ -208,8 +208,8 @@ accepted_by = "admin@server"
 `permissions/data.allow`:
 ```
 # Format: <fingerprint> <perms>
-SHA256:abc123...def456 rw
-SHA256:def456...abc123 ro
+BLAKE3:abc123...def456 rw
+BLAKE3:def456...abc123 ro
 ```
 
 **Concurrency handling:**

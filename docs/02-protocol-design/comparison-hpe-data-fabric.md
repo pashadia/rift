@@ -1121,8 +1121,8 @@ Rift provides **simple mTLS certificate-based authentication**:
   [[shares]]
   name = "home"
   allowed_clients = [
-    "sha256:ABCDEF0123...",  # Alice's cert fingerprint
-    "sha256:456789GHIJ...",  # Bob's cert fingerprint
+    "blake3:ABCDEF0123...",  # Alice's cert fingerprint
+    "blake3:456789GHIJ...",  # Bob's cert fingerprint
   ]
   ```
 - **No username/password**: Certificates are the identity

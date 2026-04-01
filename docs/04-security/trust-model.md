@@ -48,7 +48,7 @@ If the server certificate is self-signed or signed by an unknown CA:
 $ rift pair server.example.com
 ⚠️  Server certificate is self-signed
 Server: server.example.com:8433
-Fingerprint: SHA256:a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4
+Fingerprint: BLAKE3:a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4
 
 Verify this fingerprint matches the server's certificate.
 Run on server: rift show-cert --server
@@ -66,7 +66,7 @@ Trust this server? [y/N]: y
 [[server]]
 hostname = "server.example.com"
 port = 8433
-fingerprint = "SHA256:a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4"
+fingerprint = "BLAKE3:a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4"
 pinned_at = "2025-03-19T10:30:00Z"
 ```
 
@@ -82,7 +82,7 @@ Every QUIC connection uses **mutual TLS**:
 
 1. Client presents its certificate during TLS handshake (TLS 1.3 client authentication)
 2. Server extracts client certificate from TLS session
-3. Server computes client certificate fingerprint (SHA256)
+3. Server computes client certificate fingerprint (BLAKE3)
 4. Server checks if fingerprint is authorized (see Authorization below)
 
 **Important:** The server **allows TLS connections from any client** (even unknown ones) but restricts protocol operations based on authorization state. This enables the pairing flow (see `pairing.md`).
@@ -95,7 +95,7 @@ Client certificates are **self-signed** by default:
 $ rift init --client
 Generating client certificate...
 ✓ Client certificate generated: /etc/rift/client-cert.pem
-  Fingerprint: SHA256:def456...abc123
+  Fingerprint: BLAKE3:def456...abc123
 ```
 
 **Certificate details:**
@@ -262,8 +262,8 @@ Rift's model is closest to **SSH** (TOFU-based trust, decentralized) but with op
 
 3. **Server admin approves:**
    ```bash
-   rift accept SHA256:def456...abc123
-   rift allow data SHA256:def456...abc123 rw
+   rift accept BLAKE3:def456...abc123
+   rift allow data BLAKE3:def456...abc123 rw
    ```
 
 4. **Client mounts:**
@@ -290,7 +290,7 @@ Rift's model is closest to **SSH** (TOFU-based trust, decentralized) but with op
    # Pair (TOFU prompt)
    rift pair 192.168.1.10
    ⚠️  Server certificate is self-signed
-   Fingerprint: SHA256:abc123...def456
+   Fingerprint: BLAKE3:abc123...def456
    Trust this server? [y/N]: y  # User verifies out-of-band
    ✓ Server fingerprint pinned
    ```

@@ -119,8 +119,8 @@ For CA-signed server certificates (Let's Encrypt, enterprise CA):
 - If server cert was TOFU-pinned, client must re-pin on first connection with new cert:
   ```
   ⚠️  Server certificate has changed
-  Old fingerprint: SHA256:abc123...
-  New fingerprint: SHA256:def456...
+  Old fingerprint: BLAKE3:abc123...
+  New fingerprint: BLAKE3:def456...
 
   This is expected if the server renewed its certificate.
   Verify with server administrator.
@@ -138,7 +138,7 @@ For CA-signed server certificates (Let's Encrypt, enterprise CA):
 
 ```protobuf
 message CertRenewal {
-  bytes old_cert_fingerprint = 1;  // SHA256 of current cert
+  bytes old_cert_fingerprint = 1;  // BLAKE3 of current cert
   bytes new_cert = 2;               // DER-encoded new certificate
   bytes proof_of_possession = 3;    // Signature of (old_fp || new_cert) using old private key
   int64 effective_at = 4;           // Unix timestamp when new cert becomes active
@@ -272,7 +272,7 @@ Critical: When a client sends a new certificate, server must verify the client c
 
 **Solution:** Require signature in `proof_of_possession` field:
 ```
-proof = sign(SHA256(old_cert_fingerprint || new_cert), old_private_key)
+proof = sign(BLAKE3(old_cert_fingerprint || new_cert), old_private_key)
 ```
 
 Server verifies signature using public key from old cert.
@@ -337,8 +337,8 @@ If server cert renewal allows automatic re-pinning (no user prompt), a MITM atta
 **TOFU-pinned server cert changed:**
 ```
 ⚠️  Server certificate has changed: server.example.com
-  Old fingerprint: SHA256:abc123...
-  New fingerprint: SHA256:def456...
+  Old fingerprint: BLAKE3:abc123...
+  New fingerprint: BLAKE3:def456...
 
   This is expected if the server renewed its certificate.
   Contact server administrator to verify fingerprint.

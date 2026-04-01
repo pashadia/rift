@@ -590,7 +590,7 @@ impl fuser::Filesystem for RiftFilesystem {
 - BLAKE3 hashing (wrapper around `blake3` crate)
 - Content-defined chunking (wrapper around `fastcdc`)
 - Merkle tree construction and verification
-- Fingerprint computation (SHA256 of certs)
+- Fingerprint computation (BLAKE3 of certs)
 
 **Dependencies:**
 ```toml
@@ -769,7 +769,7 @@ rift CLI → displays fingerprint for admin to grant access
 **`rift-common/`** - Permission File Parsing
 - `load_permission_file(share)` → `Vec<String>` (fingerprints)
 - `add_permission(share, fingerprint, perms)` → append to `.allow` file
-- Parse permission files: `SHA256:abc123... rw`
+- Parse permission files: `BLAKE3:abc123... rw`
 
 **`riftd/`** (server binary) - Admin Commands
 - `rift allow <share> <fingerprint> <perms>` - Grant access
@@ -784,7 +784,7 @@ Client connects (mutual TLS)
   ↓
 rift-transport → AcceptAnyCertVerifier accepts cert
   ↓
-rift-server → extracts fingerprint: SHA256:def456...abc123
+rift-server → extracts fingerprint: BLAKE3:def456...abc123
   ↓
 Client sends DISCOVER_REQUEST
   ↓
@@ -797,7 +797,7 @@ Server responds with authorized shares only
   ↓
 Admin sees connection in `rift list-connections`
   ↓
-Admin: rift allow data SHA256:def456...abc123 rw --name "Alice's Laptop"
+Admin: rift allow data BLAKE3:def456...abc123 rw --name "Alice's Laptop"
   ↓
 rift-common → append to /etc/rift/permissions/data.allow
   ↓

@@ -100,7 +100,7 @@ Tracks all servers in the cluster.
 CREATE TABLE servers (
   server_id TEXT PRIMARY KEY,          -- e.g., "server-a"
   address TEXT NOT NULL,               -- "server-a.local:8433"
-  fingerprint BLOB NOT NULL,           -- TLS cert SHA256
+  fingerprint BLOB NOT NULL,           -- TLS cert BLAKE3
   capacity_bytes INTEGER,              -- Total storage capacity
   free_bytes INTEGER,                  -- Available storage
   status TEXT NOT NULL,                -- "online", "degraded", "offline"

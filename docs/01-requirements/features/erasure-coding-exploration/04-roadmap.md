@@ -280,8 +280,8 @@ servers = [
 
 # Server fingerprints (optional, for TOFU)
 [mount.erasure_coding.fingerprints]
-"server-a.local:8433" = "SHA256:abc123..."
-"server-b.local:8433" = "SHA256:def456..."
+"server-a.local:8433" = "BLAKE3:abc123..."
+"server-b.local:8433" = "BLAKE3:def456..."
 # ... etc
 ```
 
@@ -344,7 +344,7 @@ metadata_service = "metadata.local:9433"  # For receiving rebuild instructions
 [[server.erasure_coding.peers]]
 server_id = "server-b"
 address = "192.168.1.11:8433"
-fingerprint = "SHA256:def456..."
+fingerprint = "BLAKE3:def456..."
 ```
 
 ---

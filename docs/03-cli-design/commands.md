@@ -62,7 +62,7 @@ Certificate: /etc/rift/client-cert.pem
 Subject: CN=client.example.com
 Issuer: CN=client.example.com (self-signed)
 Valid: 2025-01-15 to 2027-01-15
-Fingerprint: SHA256:a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4
+Fingerprint: BLAKE3:a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4
 ```
 
 ---
@@ -139,7 +139,7 @@ rift pair 192.168.1.10:8433                  # Using IP address and custom port
 ```
 Connecting to server.example.com:8433...
 ⚠️  Server certificate is self-signed
-Fingerprint: SHA256:abc123...def456
+Fingerprint: BLAKE3:abc123...def456
 
 Verify this fingerprint matches the server's certificate:
   Run 'rift show-cert --server' on the server
@@ -149,7 +149,7 @@ Confirm pairing? [y/N]: y
 ✓ Connected successfully
 
 Your client fingerprint:
-  SHA256:def456...abc123
+  BLAKE3:def456...abc123
 
 Provide this to the server administrator to request access.
 ```
@@ -171,14 +171,14 @@ rift list-servers
 Trusted servers:
 
 server.example.com:8433
-  Server fingerprint: SHA256:abc123...
+  Server fingerprint: BLAKE3:abc123...
   Trust method: TOFU (pinned)
   Trusted at: 2025-03-19 10:30:45
   Last connection: 2025-03-19 15:20:00
   Available shares: 2 (use 'rift show-mounts' for details)
 
 backup.local:8433
-  Server fingerprint: SHA256:789def...
+  Server fingerprint: BLAKE3:789def...
   Trust method: CA-signed (Let's Encrypt)
   Trusted at: 2025-03-18 14:00:00
   Last connection: Never
@@ -223,9 +223,9 @@ rift list-connections --all        # All connections from log file
 Recent connections:
 
 Fingerprint                          Common Name         IP              Last Seen          Status
-SHA256:def456...abc123               client.example.com  192.168.1.50    2025-03-19 10:30   Authorized (data, backup)
-SHA256:abc789...012def               laptop.local        192.168.1.75    2025-03-19 11:00   Unknown
-SHA256:123abc...456def               remote.internal     10.0.1.100      2025-03-19 09:15   Authorized (data)
+BLAKE3:def456...abc123               client.example.com  192.168.1.50    2025-03-19 10:30   Authorized (data, backup)
+BLAKE3:abc789...012def               laptop.local        192.168.1.75    2025-03-19 11:00   Unknown
+BLAKE3:123abc...456def               remote.internal     10.0.1.100      2025-03-19 09:15   Authorized (data)
 
 Total: 3 connections (2 authorized, 1 unknown)
 ```
@@ -263,7 +263,7 @@ Revoke a client's access (removes from all shares, disconnects active sessions).
 rift revoke <client-fingerprint>
 
 # Example:
-rift revoke SHA256:def456...abc123
+rift revoke BLAKE3:def456...abc123
 ```
 
 **Behavior:**
@@ -287,9 +287,9 @@ rift list-clients --verbose
 **Output:**
 ```
 Fingerprint                                                      Name                    Accepted            Shares
-SHA256:abc123...def456                                           Engineering Laptop      2025-03-15 10:00    data (rw), backup (ro)
-SHA256:def456...abc123                                           Remote Office           2025-03-18 14:30    data (ro)
-SHA256:789abc...012def                                           CI/CD Runner            2025-03-19 09:15    backup (rw)
+BLAKE3:abc123...def456                                           Engineering Laptop      2025-03-15 10:00    data (rw), backup (ro)
+BLAKE3:def456...abc123                                           Remote Office           2025-03-18 14:30    data (ro)
+BLAKE3:789abc...012def                                           CI/CD Runner            2025-03-19 09:15    backup (rw)
 ```
 
 ---
@@ -379,11 +379,11 @@ Root squash: true
 Identity mode: fixed
 
 Authorized clients (5):
-  SHA256:abc123...def456  Engineering Laptop    rw
-  SHA256:def456...abc123  Remote Office         ro
-  SHA256:789abc...012def  CI/CD Runner          ro
-  SHA256:321cba...654fed  Analytics Server      rw
-  SHA256:654fed...321cba  Backup Service        ro
+  BLAKE3:abc123...def456  Engineering Laptop    rw
+  BLAKE3:def456...abc123  Remote Office         ro
+  BLAKE3:789abc...012def  CI/CD Runner          ro
+  BLAKE3:321cba...654fed  Analytics Server      rw
+  BLAKE3:654fed...321cba  Backup Service        ro
 
 Statistics:
   Size: 458 GB
@@ -414,8 +414,8 @@ Grant a client access to a share.
 rift allow <share> <client-fingerprint> <ro|rw>
 
 # Examples:
-rift allow data SHA256:abc123...def456 rw
-rift allow backup SHA256:def456...abc123 ro
+rift allow data BLAKE3:abc123...def456 rw
+rift allow backup BLAKE3:def456...abc123 ro
 ```
 
 **Behavior:**
@@ -432,7 +432,7 @@ Revoke a client's access to a specific share.
 rift deny <share> <client-fingerprint>
 
 # Example:
-rift deny data SHA256:abc123...def456
+rift deny data BLAKE3:abc123...def456
 ```
 
 **Behavior:**
@@ -454,9 +454,9 @@ rift show-access <share>
 Share: data
 Authorized clients (3):
 
-SHA256:abc123...def456  Engineering Laptop    rw   Active (connected)
-SHA256:def456...abc123  Remote Office         ro   Inactive
-SHA256:321cba...654fed  Analytics Server      rw   Active (connected)
+BLAKE3:abc123...def456  Engineering Laptop    rw   Active (connected)
+BLAKE3:def456...abc123  Remote Office         ro   Inactive
+BLAKE3:321cba...654fed  Analytics Server      rw   Active (connected)
 ```
 
 ---
@@ -522,7 +522,7 @@ rift whoami server.example.com
 Connected to: server.example.com:8433
 Server sees you as:
 
-  Certificate fingerprint: SHA256:def456...abc123
+  Certificate fingerprint: BLAKE3:def456...abc123
   Common name: client.example.com
   Source IP: 192.168.1.50
 
@@ -554,17 +554,17 @@ Available shares:
 # Expected 'data' share but don't see it
 
 $ rift whoami server.example.com
-Certificate fingerprint: SHA256:OLD123...WRONG
+Certificate fingerprint: BLAKE3:OLD123...WRONG
 Authorization status: Unknown client
 # Aha! Using wrong certificate
 
 $ rift show-cert --client
 Certificate: /home/user/.config/rift/old-cert.pem
-Fingerprint: SHA256:OLD123...WRONG
+Fingerprint: BLAKE3:OLD123...WRONG
 
 $ export RIFT_CLIENT_CERT=/home/user/.config/rift/new-cert.pem
 $ rift whoami server.example.com
-Certificate fingerprint: SHA256:def456...abc123
+Certificate fingerprint: BLAKE3:def456...abc123
 Friendly name: Alice's Laptop
 Authorized shares: data (rw), backup (ro)
 # Fixed!
@@ -1227,8 +1227,8 @@ rift mount data@server.example.com /mnt/data
 rift list-connections
 
 # 2. Grant access to shares (this implicitly authorizes the client)
-rift allow data SHA256:abc123...def456 rw --name "New Client"
-rift allow backup SHA256:abc123...def456 ro
+rift allow data BLAKE3:abc123...def456 rw --name "New Client"
+rift allow backup BLAKE3:abc123...def456 ro
 
 # 3. Client can now discover and mount shares (no server restart needed)
 ```

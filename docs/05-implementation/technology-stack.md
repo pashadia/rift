@@ -76,7 +76,7 @@
 - ✅ Self-signed certificate support
 - ✅ CA-signed certificate support (Let's Encrypt, enterprise PKI)
 - ✅ Custom verification logic (accept any cert, TOFU)
-- ✅ Certificate fingerprint extraction (SHA256 of DER-encoded cert)
+- ✅ Certificate fingerprint extraction (BLAKE3 of DER-encoded cert)
 - ✅ TLS 1.3 only (modern, secure, fast)
 
 **Minor limitations (acceptable):**

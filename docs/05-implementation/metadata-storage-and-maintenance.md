@@ -398,7 +398,7 @@ CREATE TABLE IF NOT EXISTS resume_data (
 CREATE TABLE IF NOT EXISTS connection_log (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at   INTEGER NOT NULL,  -- Unix timestamp (nanoseconds)
-    client_fp     TEXT    NOT NULL,  -- SHA256:... fingerprint
+    client_fp     TEXT    NOT NULL,  -- BLAKE3:... fingerprint
     client_cn     TEXT,              -- CN from certificate, if present
     client_ip     TEXT    NOT NULL,
     event_type    TEXT    NOT NULL,  -- 'connect', 'disconnect', 'auth_fail', etc.
