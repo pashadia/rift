@@ -1,0 +1,79 @@
+syntax = "proto3";
+package rift;
+
+import "common.proto";
+
+// READ (0x30 / 0x31)
+message ReadRequest {
+  bytes  handle      = 1;
+  uint32 start_chunk = 2;
+  uint32 chunk_count = 3;
+}
+message ReadResponse {
+  oneof result {
+    ReadSuccess ok    = 1;
+    ErrorDetail error = 2;
+  }
+}
+message ReadSuccess {
+  uint32 chunk_count = 1;
+}
+
+// BLOCK_HEADER (0x32)
+message BlockHeader {
+  ChunkInfo chunk = 1;
+}
+
+// TRANSFER_COMPLETE (0x33)
+message TransferComplete {
+  bytes merkle_root = 1;
+}
+
+// WRITE (0x34 / 0x35 / 0x36)
+message WriteRequest {
+  oneof target {
+    bytes   existing_handle = 1;
+    NewFile new_file        = 2;
+  }
+  bytes              expected_root = 3;
+  repeated ChunkInfo chunks        = 4;
+}
+message NewFile {
+  bytes  parent_handle = 1;
+  string name          = 2;
+  uint32 mode          = 3;
+}
+message WriteCommit {}
+message WriteResponse {
+  oneof result {
+    WriteSuccess ok    = 1;
+    ErrorDetail  error = 2;
+  }
+}
+message WriteSuccess {
+  bytes new_root = 1;
+  bytes handle   = 2;
+}
+
+// MERKLE_DRILL (0x50)
+message MerkleDrill {
+  bytes           handle   = 1;
+  uint32          level    = 2;
+  repeated uint32 subtrees = 3;
+}
+
+// MERKLE_LEVEL_RESPONSE (0x51)
+message MerkleLevelResponse {
+  uint32          level         = 1;
+  repeated bytes  hashes        = 2;
+  repeated uint64 subtree_bytes = 3;
+}
+
+// MERKLE_LEAVES_RESPONSE (0x52)
+message MerkleLeavesResponse {
+  repeated SubtreeLeaves subtrees = 1;
+}
+message SubtreeLeaves {
+  uint32             subtree_index = 1;
+  repeated ChunkInfo chunks        = 2;
+}

@@ -1,0 +1,31 @@
+syntax = "proto3";
+package rift;
+
+import "common.proto";
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED   = 0;
+  CAPABILITY_NOTIFICATIONS = 1;
+}
+
+message WhoamiRequest {}
+
+message WhoamiResponse {
+  string             fingerprint      = 1;
+  string             common_name      = 2;
+  repeated ShareInfo available_shares = 3;
+}
+
+message RiftHello {
+  uint32              protocol_version = 1;
+  repeated Capability capabilities     = 2;
+  string              share_name       = 3;
+}
+
+message RiftWelcome {
+  uint32              protocol_version       = 1;
+  repeated Capability active_capabilities    = 2;
+  bytes               root_handle            = 3;
+  uint32              max_concurrent_streams = 4;
+  ShareInfo           share                  = 5;
+}

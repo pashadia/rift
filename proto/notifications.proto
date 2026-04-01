@@ -1,0 +1,58 @@
+syntax = "proto3";
+package rift;
+
+import "common.proto";
+
+// Sent on server-initiated unidirectional streams.
+// Deferred from PoC — type IDs reserved.
+
+message FileChangedNotification {
+  bytes              handle         = 1;
+  bytes              new_root       = 2;
+  FileAttrs          attrs          = 3;
+  repeated ChunkInfo changed_chunks = 4;
+  uint64             sequence       = 5;
+}
+
+message FileCreatedNotification {
+  bytes     parent_handle = 1;
+  bytes     handle        = 2;
+  string    name          = 3;
+  FileAttrs attrs         = 4;
+  bytes     root_hash     = 5;
+  uint64    sequence      = 6;
+}
+
+message FileDeletedNotification {
+  bytes  parent_handle = 1;
+  bytes  handle        = 2;
+  string name          = 3;
+  uint64 sequence      = 4;
+}
+
+message FileRenamedNotification {
+  bytes  old_handle = 1;
+  bytes  new_handle = 2;
+  uint64 sequence   = 3;
+}
+
+message DirCreatedNotification {
+  bytes     parent_handle = 1;
+  bytes     handle        = 2;
+  string    name          = 3;
+  FileAttrs attrs         = 4;
+  uint64    sequence      = 5;
+}
+
+message DirDeletedNotification {
+  bytes  parent_handle = 1;
+  bytes  handle        = 2;
+  string name          = 3;
+  uint64 sequence      = 4;
+}
+
+message DirRenamedNotification {
+  bytes  old_handle = 1;
+  bytes  new_handle = 2;
+  uint64 sequence   = 3;
+}

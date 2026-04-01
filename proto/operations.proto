@@ -1,0 +1,135 @@
+syntax = "proto3";
+package rift;
+
+import "common.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// LOOKUP (0x10 / 0x11)
+message LookupRequest {
+  bytes  parent_handle = 1;
+  string name          = 2;
+}
+message LookupResponse {
+  oneof result {
+    LookupResult entry = 1;
+    ErrorDetail  error = 2;
+  }
+}
+message LookupResult {
+  bytes     handle = 1;
+  FileAttrs attrs  = 2;
+}
+
+// STAT (0x12 / 0x13)
+message StatRequest {
+  repeated bytes handles = 1;
+}
+message StatResponse {
+  repeated StatResult results = 1;
+}
+message StatResult {
+  oneof result {
+    FileAttrs   attrs = 1;
+    ErrorDetail error = 2;
+  }
+}
+
+// READDIR (0x14 / 0x15)
+message ReaddirRequest {
+  bytes  directory_handle = 1;
+  uint32 offset           = 2;
+  uint32 limit            = 3;
+}
+message ReaddirResponse {
+  oneof result {
+    ReaddirSuccess entries = 1;
+    ErrorDetail    error   = 2;
+  }
+}
+message ReaddirSuccess {
+  repeated ReaddirEntry entries  = 1;
+  bool                  has_more = 2;
+}
+message ReaddirEntry {
+  string   name      = 1;
+  FileType file_type = 2;
+  bytes    handle    = 3;
+}
+
+// MKDIR (0x16 / 0x17)
+message MkdirRequest {
+  bytes  parent_handle = 1;
+  string name          = 2;
+  uint32 mode          = 3;
+}
+message MkdirResponse {
+  oneof result {
+    LookupResult entry = 1;
+    ErrorDetail  error = 2;
+  }
+}
+
+// UNLINK (0x18 / 0x19)
+message UnlinkRequest {
+  bytes  parent_handle = 1;
+  string name          = 2;
+}
+message UnlinkResponse {
+  oneof result {
+    google.protobuf.Empty ok    = 1;
+    ErrorDetail           error = 2;
+  }
+}
+
+// RMDIR (0x1A / 0x1B)
+message RmdirRequest {
+  bytes  parent_handle = 1;
+  string name          = 2;
+}
+message RmdirResponse {
+  oneof result {
+    google.protobuf.Empty ok    = 1;
+    ErrorDetail           error = 2;
+  }
+}
+
+// RENAME (0x1C / 0x1D)
+message RenameRequest {
+  bytes  old_parent_handle = 1;
+  string old_name          = 2;
+  bytes  new_parent_handle = 3;
+  string new_name          = 4;
+}
+message RenameResponse {
+  oneof result {
+    google.protobuf.Empty ok    = 1;
+    ErrorDetail           error = 2;
+  }
+}
+
+// LINK (0x1E / 0x1F) — deferred
+message LinkRequest {
+  bytes  source_handle  = 1;
+  bytes  parent_handle  = 2;
+  string name           = 3;
+}
+message LinkResponse {
+  oneof result {
+    LookupResult entry = 1;
+    ErrorDetail  error = 2;
+  }
+}
+
+// SETATTR (0x20 / 0x21)
+message SetAttrRequest {
+  bytes                             handle = 1;
+  optional uint32                   mode   = 2;
+  optional google.protobuf.Timestamp mtime  = 3;
+}
+message SetAttrResponse {
+  oneof result {
+    FileAttrs   attrs = 1;
+    ErrorDetail error = 2;
+  }
+}

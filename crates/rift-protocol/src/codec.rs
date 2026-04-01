@@ -1,4 +1,9 @@
-//! Message framing codec for length-delimited messages
+//! Message framing codec for type-and-length-delimited messages
+//!
+//! Wire format: varint(type_id) || varint(length) || payload
+//!
+//! The type byte tells the receiver which protobuf message to decode (or that
+//! the payload is raw bytes for BLOCK_DATA frames at 0xF0+).
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::io;
@@ -19,44 +24,54 @@ pub enum CodecError {
 /// Maximum message size (16 MB)
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
-/// Encode a message with varint length prefix
-pub fn encode_message(msg: &[u8], buf: &mut BytesMut) -> Result<(), CodecError> {
-    if msg.len() > MAX_MESSAGE_SIZE {
-        return Err(CodecError::MessageTooLarge(msg.len()));
+/// Encode a message with varint type_id prefix and varint length prefix.
+pub fn encode_message(type_id: u8, payload: &[u8], buf: &mut BytesMut) -> Result<(), CodecError> {
+    if payload.len() > MAX_MESSAGE_SIZE {
+        return Err(CodecError::MessageTooLarge(payload.len()));
     }
 
-    // Encode length as varint
-    encode_varint(msg.len() as u64, buf);
-
-    // Write message
-    buf.put_slice(msg);
+    encode_varint(type_id as u64, buf);
+    encode_varint(payload.len() as u64, buf);
+    buf.put_slice(payload);
 
     Ok(())
 }
 
-/// Decode a message from a buffer
-pub fn decode_message(buf: &mut BytesMut) -> Result<Option<Vec<u8>>, CodecError> {
-    // Try to read varint length
-    let length = match decode_varint(buf)? {
-        Some(len) => len as usize,
-        None => return Ok(None), // Not enough data yet
+/// Decode a message from a buffer.
+///
+/// Returns `Ok(Some((type_id, payload)))` when a complete frame is available,
+/// `Ok(None)` when more data is needed, or an error on malformed input.
+pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Vec<u8>)>, CodecError> {
+    // Peek at the buffer without consuming to check if we have enough data.
+    let mut peek = &buf[..];
+
+    let type_id = match decode_varint_peek(&mut peek)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let length = match decode_varint_peek(&mut peek)? {
+        Some(v) => v as usize,
+        None => return Ok(None),
     };
 
     if length > MAX_MESSAGE_SIZE {
         return Err(CodecError::MessageTooLarge(length));
     }
 
-    // Check if we have enough data
-    if buf.len() < length {
+    if peek.len() < length {
         return Ok(None);
     }
 
-    // Read message
-    let msg = buf.split_to(length).to_vec();
-    Ok(Some(msg))
+    // We have a complete frame — now consume from the real buffer.
+    decode_varint(buf)?.unwrap(); // type_id
+    decode_varint(buf)?.unwrap(); // length
+    let payload = buf.split_to(length).to_vec();
+
+    Ok(Some((type_id as u8, payload)))
 }
 
-/// Encode a u64 as varint
+/// Encode a u64 as varint.
 fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     while value >= 0x80 {
         buf.put_u8((value as u8) | 0x80);
@@ -65,26 +80,42 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     buf.put_u8(value as u8);
 }
 
-/// Decode a varint from buffer, consuming bytes if successful
+/// Decode a varint from a mutable byte slice without a BytesMut (peek, no consume).
+fn decode_varint_peek(buf: &mut &[u8]) -> Result<Option<u64>, CodecError> {
+    let mut value = 0u64;
+    let mut shift = 0;
+
+    for i in 0..10 {
+        if i >= buf.len() {
+            return Ok(None);
+        }
+        let byte = buf[i];
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            *buf = &buf[i + 1..];
+            return Ok(Some(value));
+        }
+        shift += 7;
+    }
+
+    Err(CodecError::InvalidVarint)
+}
+
+/// Decode a varint from a BytesMut, consuming bytes.
 fn decode_varint(buf: &mut BytesMut) -> Result<Option<u64>, CodecError> {
     let mut value = 0u64;
     let mut shift = 0;
 
     for i in 0..10 {
-        // Max 10 bytes for u64
         if i >= buf.len() {
-            return Ok(None); // Need more data
+            return Ok(None);
         }
-
         let byte = buf[i];
         value |= ((byte & 0x7F) as u64) << shift;
-
         if byte & 0x80 == 0 {
-            // Last byte
             buf.advance(i + 1);
             return Ok(Some(value));
         }
-
         shift += 7;
     }
 
@@ -97,67 +128,91 @@ mod tests {
 
     #[test]
     fn test_encode_decode_message() {
-        let msg = b"hello world";
         let mut buf = BytesMut::new();
-
-        encode_message(msg, &mut buf).unwrap();
-        let decoded = decode_message(&mut buf).unwrap().unwrap();
-
-        assert_eq!(decoded, msg);
+        encode_message(0x01, b"hello world", &mut buf).unwrap();
+        let (type_id, payload) = decode_message(&mut buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x01);
+        assert_eq!(payload, b"hello world");
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn test_encode_decode_empty() {
-        let msg = b"";
+    fn test_encode_decode_empty_payload() {
         let mut buf = BytesMut::new();
-
-        encode_message(msg, &mut buf).unwrap();
-        let decoded = decode_message(&mut buf).unwrap().unwrap();
-
-        assert_eq!(decoded, msg);
+        encode_message(0x02, b"", &mut buf).unwrap();
+        let (type_id, payload) = decode_message(&mut buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x02);
+        assert_eq!(payload, b"");
     }
 
     #[test]
-    fn test_decode_partial() {
-        let msg = b"hello world";
+    fn test_type_id_preserved() {
+        let type_ids: &[u8] = &[0x01, 0x0F, 0x10, 0x30, 0x50, 0x60, 0xF0, 0x7F];
+        for &id in type_ids {
+            let mut buf = BytesMut::new();
+            encode_message(id, b"data", &mut buf).unwrap();
+            let (decoded_id, _) = decode_message(&mut buf).unwrap().unwrap();
+            assert_eq!(decoded_id, id, "type_id 0x{id:02X} not preserved");
+        }
+    }
+
+    #[test]
+    fn test_decode_partial_header() {
         let mut buf = BytesMut::new();
+        encode_message(0x01, b"hello world", &mut buf).unwrap();
+        // Only provide the first byte — not enough for a complete frame
+        let mut partial = buf.split_to(1);
+        assert!(decode_message(&mut partial).unwrap().is_none());
+    }
 
-        encode_message(msg, &mut buf).unwrap();
-
-        // Split buffer - not enough data
-        let mut partial = buf.split_to(5);
+    #[test]
+    fn test_decode_partial_payload() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"hello world", &mut buf).unwrap();
+        // Drop the last byte so the payload is incomplete
+        let len = buf.len();
+        let mut partial = buf.split_to(len - 1);
         assert!(decode_message(&mut partial).unwrap().is_none());
     }
 
     #[test]
     fn test_message_too_large() {
-        let msg = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let payload = vec![0u8; MAX_MESSAGE_SIZE + 1];
         let mut buf = BytesMut::new();
-
-        let result = encode_message(&msg, &mut buf);
+        let result = encode_message(0x01, &payload, &mut buf);
         assert!(matches!(result, Err(CodecError::MessageTooLarge(_))));
     }
 
     #[test]
-    fn test_multiple_messages() {
+    fn test_multiple_messages_in_sequence() {
         let mut buf = BytesMut::new();
+        encode_message(0x01, b"first", &mut buf).unwrap();
+        encode_message(0x30, b"second", &mut buf).unwrap();
+        encode_message(0xF0, b"third", &mut buf).unwrap();
 
-        encode_message(b"first", &mut buf).unwrap();
-        encode_message(b"second", &mut buf).unwrap();
-        encode_message(b"third", &mut buf).unwrap();
+        let (t1, p1) = decode_message(&mut buf).unwrap().unwrap();
+        let (t2, p2) = decode_message(&mut buf).unwrap().unwrap();
+        let (t3, p3) = decode_message(&mut buf).unwrap().unwrap();
 
-        let msg1 = decode_message(&mut buf).unwrap().unwrap();
-        let msg2 = decode_message(&mut buf).unwrap().unwrap();
-        let msg3 = decode_message(&mut buf).unwrap().unwrap();
-
-        assert_eq!(msg1, b"first");
-        assert_eq!(msg2, b"second");
-        assert_eq!(msg3, b"third");
+        assert_eq!((t1, p1.as_slice()), (0x01, b"first" as &[u8]));
+        assert_eq!((t2, p2.as_slice()), (0x30, b"second" as &[u8]));
+        assert_eq!((t3, p3.as_slice()), (0xF0, b"third" as &[u8]));
         assert!(buf.is_empty());
     }
 
     #[test]
-    fn test_varint_encoding() {
+    fn test_block_data_raw_bytes() {
+        // 0xF0 is BLOCK_DATA — raw bytes, not protobuf, but same framing
+        let chunk = vec![0xAB_u8; 131_072]; // 128 KB
+        let mut buf = BytesMut::new();
+        encode_message(0xF0, &chunk, &mut buf).unwrap();
+        let (type_id, payload) = decode_message(&mut buf).unwrap().unwrap();
+        assert_eq!(type_id, 0xF0);
+        assert_eq!(payload, chunk);
+    }
+
+    #[test]
+    fn test_varint_encoding_sizes() {
         let mut buf = BytesMut::new();
 
         encode_varint(0, &mut buf);
@@ -179,13 +234,24 @@ mod tests {
     #[test]
     fn test_varint_round_trip() {
         let values = [0, 1, 127, 128, 255, 256, 65535, 65536, u64::MAX];
-
         for &value in &values {
             let mut buf = BytesMut::new();
             encode_varint(value, &mut buf);
             let decoded = decode_varint(&mut buf).unwrap().unwrap();
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn test_wire_format_type_before_length() {
+        // Verify the on-wire order: varint(type) || varint(length) || payload
+        // For type=0x01, payload=b"hi" (2 bytes):
+        //   type:   0x01 (1 byte varint)
+        //   length: 0x02 (1 byte varint)
+        //   payload: b"hi"
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"hi", &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0x01, 0x02, b'h', b'i']);
     }
 }
 
@@ -196,37 +262,35 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn prop_codec_round_trip(msg: Vec<u8>) {
-            prop_assume!(msg.len() <= MAX_MESSAGE_SIZE);
+        fn prop_codec_round_trip(type_id: u8, payload: Vec<u8>) {
+            prop_assume!(payload.len() <= MAX_MESSAGE_SIZE);
 
             let mut buf = BytesMut::new();
-            encode_message(&msg, &mut buf).unwrap();
-            let decoded = decode_message(&mut buf).unwrap().unwrap();
+            encode_message(type_id, &payload, &mut buf).unwrap();
+            let (decoded_type, decoded_payload) = decode_message(&mut buf).unwrap().unwrap();
 
-            prop_assert_eq!(decoded, msg);
+            prop_assert_eq!(decoded_type, type_id);
+            prop_assert_eq!(decoded_payload, payload);
         }
 
         #[test]
-        fn prop_codec_multiple_messages(messages: Vec<Vec<u8>>) {
-            // Filter out oversized messages
+        fn prop_codec_multiple_messages(messages: Vec<(u8, Vec<u8>)>) {
             let messages: Vec<_> = messages.into_iter()
-                .filter(|msg| msg.len() <= MAX_MESSAGE_SIZE)
+                .filter(|(_, p)| p.len() <= MAX_MESSAGE_SIZE)
                 .collect();
 
             let mut buf = BytesMut::new();
-
-            // Encode all
-            for msg in &messages {
-                encode_message(msg, &mut buf).unwrap();
+            for (type_id, payload) in &messages {
+                encode_message(*type_id, payload, &mut buf).unwrap();
             }
 
-            // Decode all
             let mut decoded = Vec::new();
-            while let Some(msg) = decode_message(&mut buf).unwrap() {
-                decoded.push(msg);
+            while let Some(frame) = decode_message(&mut buf).unwrap() {
+                decoded.push(frame);
             }
 
-            prop_assert_eq!(decoded, messages);
+            let expected: Vec<(u8, Vec<u8>)> = messages;
+            prop_assert_eq!(decoded, expected);
         }
     }
 }

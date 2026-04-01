@@ -1,0 +1,71 @@
+syntax = "proto3";
+package rift;
+
+import "google/protobuf/timestamp.proto";
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_REGULAR     = 1;
+  FILE_TYPE_DIRECTORY   = 2;
+  FILE_TYPE_SYMLINK     = 3;
+  FILE_TYPE_SPECIAL     = 4;
+}
+
+enum ErrorCode {
+  ERROR_UNSPECIFIED       = 0;
+  ERROR_NOT_FOUND         = 1;
+  ERROR_PERMISSION_DENIED = 2;
+  ERROR_STALE_HANDLE      = 3;
+  ERROR_NOT_A_DIRECTORY   = 4;
+  ERROR_IS_A_DIRECTORY    = 5;
+  ERROR_NOT_EMPTY         = 6;
+  ERROR_ALREADY_EXISTS    = 7;
+  ERROR_CONFLICT          = 8;
+  ERROR_FILE_LOCKED       = 9;
+  ERROR_UNSUPPORTED       = 10;
+}
+
+message FileAttrs {
+  FileType                  file_type = 1;
+  uint64                    size      = 2;
+  google.protobuf.Timestamp mtime     = 3;
+  uint32                    mode      = 4;
+  uint32                    uid       = 5;
+  uint32                    gid       = 6;
+  uint32                    nlinks    = 7;
+}
+
+message ChunkInfo {
+  uint32 index  = 1;
+  uint64 length = 2;
+  bytes  hash   = 3;
+}
+
+message CdcParams {
+  uint32 min_chunk_size    = 1;
+  uint32 target_chunk_size = 2;
+  uint32 max_chunk_size    = 3;
+}
+
+message ShareInfo {
+  string    name       = 1;
+  bool      read_only  = 2;
+  CdcParams cdc_params = 3;
+}
+
+message ConflictMetadata {
+  bytes server_root = 1;
+}
+
+message FileLockMetadata {
+  uint32 retry_after_ms = 1;
+}
+
+message ErrorDetail {
+  ErrorCode code    = 1;
+  string    message = 2;
+  oneof metadata {
+    ConflictMetadata conflict  = 3;
+    FileLockMetadata file_lock = 4;
+  }
+}
