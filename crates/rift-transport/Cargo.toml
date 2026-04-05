@@ -14,6 +14,8 @@ rustls-pemfile.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
 
 rift-protocol = { path = "../rift-protocol" }
 
