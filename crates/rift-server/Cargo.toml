@@ -18,10 +18,14 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
+prost.workspace = true
+rcgen.workspace = true
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
 rift-transport = { path = "../rift-transport" }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
