@@ -22,6 +22,9 @@ pub enum TransportError {
     #[error("QUIC read error: {0}")]
     QuicRead(#[from] quinn::ReadError),
 
+    #[error("QUIC connect error: {0}")]
+    QuicConnect(#[from] quinn::ConnectError),
+
     #[error("codec error: {0}")]
     Codec(#[from] rift_protocol::codec::CodecError),
 
@@ -34,7 +37,9 @@ pub enum CertError {
     #[error("certificate rejected: fingerprint {fingerprint} is not trusted")]
     NotTrusted { fingerprint: String },
 
-    #[error("certificate rejected: fingerprint changed from {expected} to {actual} — possible MITM")]
+    #[error(
+        "certificate rejected: fingerprint changed from {expected} to {actual} — possible MITM"
+    )]
     FingerprintChanged { expected: String, actual: String },
 
     #[error("certificate is malformed: {0}")]

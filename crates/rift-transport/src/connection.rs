@@ -61,22 +61,42 @@ pub trait RiftStream: Send {
 
 use tokio::sync::mpsc;
 
+/// One half of a wired in-memory stream channel.
+type FrameTx = mpsc::UnboundedSender<(u8, Bytes)>;
+type FrameRx = mpsc::UnboundedReceiver<(u8, Bytes)>;
+/// Announcement of a new stream: (remote-tx, remote-rx) handed to the peer.
+type StreamAnnouncement = (FrameTx, FrameRx);
+
 /// A pair of in-memory connections wired together.
 ///
 /// `InMemoryConnection::pair()` returns `(client_conn, server_conn)`. Streams
 /// opened on one side are accepted on the other. No real QUIC or TLS involved.
 pub struct InMemoryConnection {
     /// Sender for pushing new stream channel pairs to the remote side.
-    stream_tx: mpsc::UnboundedSender<(mpsc::UnboundedSender<(u8, Bytes)>, mpsc::UnboundedReceiver<(u8, Bytes)>)>,
+    stream_tx: mpsc::UnboundedSender<StreamAnnouncement>,
     /// Receiver for stream channel pairs pushed by the remote side.
-    stream_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(mpsc::UnboundedSender<(u8, Bytes)>, mpsc::UnboundedReceiver<(u8, Bytes)>)>>,
+    stream_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<StreamAnnouncement>>,
     fingerprint: String,
     closed: std::sync::atomic::AtomicBool,
 }
 
 impl InMemoryConnection {
-    /// Create a connected pair: `(client, server)`.
+    /// Create a connected pair with default test fingerprints.
+    ///
+    /// The client's `peer_fingerprint()` returns `"test-server-fingerprint"`;
+    /// the server's returns `"test-client-fingerprint"`.
     pub fn pair() -> (Self, Self) {
+        Self::pair_with_fingerprints("test-server-fingerprint", "test-client-fingerprint")
+    }
+
+    /// Create a connected pair with explicit peer fingerprints.
+    ///
+    /// `server_fingerprint` — what the client's `peer_fingerprint()` returns.
+    /// `client_fingerprint` — what the server's `peer_fingerprint()` returns.
+    pub fn pair_with_fingerprints(
+        server_fingerprint: &str,
+        client_fingerprint: &str,
+    ) -> (Self, Self) {
         // client → server stream announcements
         let (c_to_s_tx, c_to_s_rx) = mpsc::unbounded_channel();
         // server → client stream announcements
@@ -85,13 +105,13 @@ impl InMemoryConnection {
         let client = Self {
             stream_tx: c_to_s_tx,
             stream_rx: tokio::sync::Mutex::new(s_to_c_rx),
-            fingerprint: "test-server-fingerprint".to_string(),
+            fingerprint: server_fingerprint.to_string(),
             closed: std::sync::atomic::AtomicBool::new(false),
         };
         let server = Self {
             stream_tx: s_to_c_tx,
             stream_rx: tokio::sync::Mutex::new(c_to_s_rx),
-            fingerprint: "test-client-fingerprint".to_string(),
+            fingerprint: client_fingerprint.to_string(),
             closed: std::sync::atomic::AtomicBool::new(false),
         };
         (client, server)
@@ -114,13 +134,19 @@ impl RiftConnection for InMemoryConnection {
             .send((remote_tx, remote_rx))
             .map_err(|_| TransportError::ConnectionClosed)?;
 
-        Ok(InMemoryStream { tx: Some(local_tx), rx: local_rx })
+        Ok(InMemoryStream {
+            tx: Some(local_tx),
+            rx: local_rx,
+        })
     }
 
     async fn accept_stream(&self) -> Result<InMemoryStream, TransportError> {
         let mut rx = self.stream_rx.lock().await;
         let (tx, rx_frames) = rx.recv().await.ok_or(TransportError::ConnectionClosed)?;
-        Ok(InMemoryStream { tx: Some(tx), rx: rx_frames })
+        Ok(InMemoryStream {
+            tx: Some(tx),
+            rx: rx_frames,
+        })
     }
 
     fn peer_fingerprint(&self) -> &str {
@@ -233,7 +259,7 @@ mod tests {
         cs.finish_send().await.unwrap(); // half-close send side
 
         let (_, _) = ss.recv_frame().await.unwrap().unwrap(); // first message
-        let next = ss.recv_frame().await.unwrap();             // then None
+        let next = ss.recv_frame().await.unwrap(); // then None
         assert!(next.is_none());
     }
 
@@ -247,7 +273,9 @@ mod tests {
     #[tokio::test]
     async fn in_memory_open_stream_after_closed_errors() {
         let (client, _server) = InMemoryConnection::pair();
-        client.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        client
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let result = client.open_stream().await;
         assert!(matches!(result, Err(TransportError::ConnectionClosed)));
     }

@@ -63,3 +63,5 @@ async-trait = "0.1"
 
 # Testing
 proptest = "1"
+rcgen = "0.13"
+tempfile = "3"

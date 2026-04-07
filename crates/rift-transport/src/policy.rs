@@ -20,6 +20,7 @@ pub trait FingerprintPolicy: Send + Sync {
 /// Used server-side: the server accepts all client connections and performs
 /// authorization at the application layer (checking fingerprints against
 /// per-share permission files).
+#[derive(Debug)]
 pub struct AcceptAnyPolicy;
 
 impl FingerprintPolicy for AcceptAnyPolicy {
@@ -36,6 +37,7 @@ impl FingerprintPolicy for AcceptAnyPolicy {
 ///
 /// Used server-side when hard allowlisting is preferred over per-share
 /// permission files.
+#[derive(Debug)]
 pub struct AllowlistPolicy {
     allowed: HashSet<String>,
 }
@@ -68,6 +70,7 @@ impl FingerprintPolicy for AllowlistPolicy {
 ///
 /// The caller retains an `Arc<Mutex<TofuStore>>` to observe `dirty` and
 /// persist the updated map after a connection is established.
+#[derive(Debug)]
 pub struct TofuStore {
     /// Map of server identity (e.g. hostname or address) → pinned fingerprint.
     pub known: HashMap<String, String>,
@@ -77,7 +80,10 @@ pub struct TofuStore {
 
 impl TofuStore {
     pub fn new(known: HashMap<String, String>) -> Self {
-        Self { known, dirty: false }
+        Self {
+            known,
+            dirty: false,
+        }
     }
 }
 
@@ -89,6 +95,7 @@ impl TofuStore {
 ///
 /// Persistence is the caller's responsibility: hold the `Arc<Mutex<TofuStore>>`
 /// returned by `TofuPolicy::store()` and save `known` to disk when `dirty`.
+#[derive(Debug)]
 pub struct TofuPolicy {
     /// The host identity used as the lookup key (e.g. "hostname:port").
     host: String,
@@ -115,7 +122,9 @@ impl FingerprintPolicy for TofuPolicy {
         match store.known.get(&self.host) {
             None => {
                 // First contact: pin the fingerprint.
-                store.known.insert(self.host.clone(), fingerprint.to_string());
+                store
+                    .known
+                    .insert(self.host.clone(), fingerprint.to_string());
                 store.dirty = true;
                 Ok(())
             }
