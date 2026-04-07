@@ -21,6 +21,6 @@ async fn main() -> Result<()> {
 
     // Placeholder - actual implementation in Phase 4
     println!("Rift server (placeholder)");
-    
+
     Ok(())
 }

@@ -12,6 +12,7 @@ use std::time::{Duration, UNIX_EPOCH};
 const FUSE_ROOT_ID: u64 = 1;
 
 /// Minimal empty FUSE filesystem
+#[derive(Default)]
 pub struct RiftFilesystem;
 
 impl RiftFilesystem {

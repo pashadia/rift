@@ -6,53 +6,53 @@ include!(concat!(env!("OUT_DIR"), "/rift.rs"));
 /// Message type ID constants — must match the type IDs in the framing codec.
 pub mod msg {
     // Handshake
-    pub const RIFT_HELLO: u8       = 0x01;
-    pub const RIFT_WELCOME: u8     = 0x02;
-    pub const WHOAMI_REQUEST: u8   = 0x03;
-    pub const WHOAMI_RESPONSE: u8  = 0x04;
+    pub const RIFT_HELLO: u8 = 0x01;
+    pub const RIFT_WELCOME: u8 = 0x02;
+    pub const WHOAMI_REQUEST: u8 = 0x03;
+    pub const WHOAMI_RESPONSE: u8 = 0x04;
 
     // Metadata operations
-    pub const LOOKUP_REQUEST: u8   = 0x10;
-    pub const LOOKUP_RESPONSE: u8  = 0x11;
-    pub const STAT_REQUEST: u8     = 0x12;
-    pub const STAT_RESPONSE: u8    = 0x13;
-    pub const READDIR_REQUEST: u8  = 0x14;
+    pub const LOOKUP_REQUEST: u8 = 0x10;
+    pub const LOOKUP_RESPONSE: u8 = 0x11;
+    pub const STAT_REQUEST: u8 = 0x12;
+    pub const STAT_RESPONSE: u8 = 0x13;
+    pub const READDIR_REQUEST: u8 = 0x14;
     pub const READDIR_RESPONSE: u8 = 0x15;
-    pub const MKDIR_REQUEST: u8    = 0x16;
-    pub const MKDIR_RESPONSE: u8   = 0x17;
-    pub const UNLINK_REQUEST: u8   = 0x18;
-    pub const UNLINK_RESPONSE: u8  = 0x19;
-    pub const RMDIR_REQUEST: u8    = 0x1A;
-    pub const RMDIR_RESPONSE: u8   = 0x1B;
-    pub const RENAME_REQUEST: u8   = 0x1C;
-    pub const RENAME_RESPONSE: u8  = 0x1D;
-    pub const LINK_REQUEST: u8     = 0x1E; // deferred
-    pub const LINK_RESPONSE: u8    = 0x1F; // deferred
-    pub const SETATTR_REQUEST: u8  = 0x20;
+    pub const MKDIR_REQUEST: u8 = 0x16;
+    pub const MKDIR_RESPONSE: u8 = 0x17;
+    pub const UNLINK_REQUEST: u8 = 0x18;
+    pub const UNLINK_RESPONSE: u8 = 0x19;
+    pub const RMDIR_REQUEST: u8 = 0x1A;
+    pub const RMDIR_RESPONSE: u8 = 0x1B;
+    pub const RENAME_REQUEST: u8 = 0x1C;
+    pub const RENAME_RESPONSE: u8 = 0x1D;
+    pub const LINK_REQUEST: u8 = 0x1E; // deferred
+    pub const LINK_RESPONSE: u8 = 0x1F; // deferred
+    pub const SETATTR_REQUEST: u8 = 0x20;
     pub const SETATTR_RESPONSE: u8 = 0x21;
 
     // Data operations
-    pub const READ_REQUEST: u8       = 0x30;
-    pub const READ_RESPONSE: u8      = 0x31;
-    pub const BLOCK_HEADER: u8       = 0x32;
-    pub const TRANSFER_COMPLETE: u8  = 0x33;
-    pub const WRITE_REQUEST: u8      = 0x34;
-    pub const WRITE_COMMIT: u8       = 0x35;
-    pub const WRITE_RESPONSE: u8     = 0x36;
+    pub const READ_REQUEST: u8 = 0x30;
+    pub const READ_RESPONSE: u8 = 0x31;
+    pub const BLOCK_HEADER: u8 = 0x32;
+    pub const TRANSFER_COMPLETE: u8 = 0x33;
+    pub const WRITE_REQUEST: u8 = 0x34;
+    pub const WRITE_COMMIT: u8 = 0x35;
+    pub const WRITE_RESPONSE: u8 = 0x36;
 
     // Merkle operations
-    pub const MERKLE_DRILL: u8           = 0x50;
-    pub const MERKLE_LEVEL_RESPONSE: u8  = 0x51;
+    pub const MERKLE_DRILL: u8 = 0x50;
+    pub const MERKLE_LEVEL_RESPONSE: u8 = 0x51;
     pub const MERKLE_LEAVES_RESPONSE: u8 = 0x52;
 
     // Notifications (deferred from PoC)
-    pub const FILE_CHANGED: u8  = 0x60;
-    pub const FILE_CREATED: u8  = 0x61;
-    pub const FILE_DELETED: u8  = 0x62;
-    pub const FILE_RENAMED: u8  = 0x63;
-    pub const DIR_CREATED: u8   = 0x64;
-    pub const DIR_DELETED: u8   = 0x65;
-    pub const DIR_RENAMED: u8   = 0x66;
+    pub const FILE_CHANGED: u8 = 0x60;
+    pub const FILE_CREATED: u8 = 0x61;
+    pub const FILE_DELETED: u8 = 0x62;
+    pub const FILE_RENAMED: u8 = 0x63;
+    pub const DIR_CREATED: u8 = 0x64;
+    pub const DIR_DELETED: u8 = 0x65;
+    pub const DIR_RENAMED: u8 = 0x66;
 
     // Raw data frames
     pub const BLOCK_DATA: u8 = 0xF0;
@@ -289,9 +289,15 @@ mod tests {
     #[test]
     fn write_request_existing_file() {
         let msg = WriteRequest {
-            target: Some(write_request::Target::ExistingHandle(b"file-handle".to_vec())),
+            target: Some(write_request::Target::ExistingHandle(
+                b"file-handle".to_vec(),
+            )),
             expected_root: vec![0xAB; 32],
-            chunks: vec![ChunkInfo { index: 0, length: 131072, hash: vec![0xCD; 32] }],
+            chunks: vec![ChunkInfo {
+                index: 0,
+                length: 131072,
+                hash: vec![0xCD; 32],
+            }],
         };
         let encoded = msg.encode_to_vec();
         let decoded = WriteRequest::decode(encoded.as_slice()).unwrap();
@@ -395,7 +401,9 @@ mod tests {
 
     #[test]
     fn transfer_complete_round_trip() {
-        let msg = TransferComplete { merkle_root: vec![0xFF; 32] };
+        let msg = TransferComplete {
+            merkle_root: vec![0xFF; 32],
+        };
         let encoded = msg.encode_to_vec();
         let decoded = TransferComplete::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.merkle_root, vec![0xFF; 32]);
@@ -447,8 +455,16 @@ mod tests {
             subtrees: vec![SubtreeLeaves {
                 subtree_index: 12,
                 chunks: vec![
-                    ChunkInfo { index: 768, length: 131072, hash: vec![0xAB; 32] },
-                    ChunkInfo { index: 769, length: 98304,  hash: vec![0xCD; 32] },
+                    ChunkInfo {
+                        index: 768,
+                        length: 131072,
+                        hash: vec![0xAB; 32],
+                    },
+                    ChunkInfo {
+                        index: 769,
+                        length: 98304,
+                        hash: vec![0xCD; 32],
+                    },
                 ],
             }],
         };
@@ -474,7 +490,11 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
             }),
-            changed_chunks: vec![ChunkInfo { index: 3, length: 131072, hash: vec![0xAB; 32] }],
+            changed_chunks: vec![ChunkInfo {
+                index: 3,
+                length: 131072,
+                hash: vec![0xAB; 32],
+            }],
             sequence: 42,
         };
         let encoded = msg.encode_to_vec();
@@ -490,17 +510,45 @@ mod tests {
     fn type_id_constants_no_duplicates() {
         use msg::*;
         let ids = [
-            RIFT_HELLO, RIFT_WELCOME, WHOAMI_REQUEST, WHOAMI_RESPONSE,
-            LOOKUP_REQUEST, LOOKUP_RESPONSE, STAT_REQUEST, STAT_RESPONSE,
-            READDIR_REQUEST, READDIR_RESPONSE, MKDIR_REQUEST, MKDIR_RESPONSE,
-            UNLINK_REQUEST, UNLINK_RESPONSE, RMDIR_REQUEST, RMDIR_RESPONSE,
-            RENAME_REQUEST, RENAME_RESPONSE, LINK_REQUEST, LINK_RESPONSE,
-            SETATTR_REQUEST, SETATTR_RESPONSE,
-            READ_REQUEST, READ_RESPONSE, BLOCK_HEADER, TRANSFER_COMPLETE,
-            WRITE_REQUEST, WRITE_COMMIT, WRITE_RESPONSE,
-            MERKLE_DRILL, MERKLE_LEVEL_RESPONSE, MERKLE_LEAVES_RESPONSE,
-            FILE_CHANGED, FILE_CREATED, FILE_DELETED, FILE_RENAMED,
-            DIR_CREATED, DIR_DELETED, DIR_RENAMED,
+            RIFT_HELLO,
+            RIFT_WELCOME,
+            WHOAMI_REQUEST,
+            WHOAMI_RESPONSE,
+            LOOKUP_REQUEST,
+            LOOKUP_RESPONSE,
+            STAT_REQUEST,
+            STAT_RESPONSE,
+            READDIR_REQUEST,
+            READDIR_RESPONSE,
+            MKDIR_REQUEST,
+            MKDIR_RESPONSE,
+            UNLINK_REQUEST,
+            UNLINK_RESPONSE,
+            RMDIR_REQUEST,
+            RMDIR_RESPONSE,
+            RENAME_REQUEST,
+            RENAME_RESPONSE,
+            LINK_REQUEST,
+            LINK_RESPONSE,
+            SETATTR_REQUEST,
+            SETATTR_RESPONSE,
+            READ_REQUEST,
+            READ_RESPONSE,
+            BLOCK_HEADER,
+            TRANSFER_COMPLETE,
+            WRITE_REQUEST,
+            WRITE_COMMIT,
+            WRITE_RESPONSE,
+            MERKLE_DRILL,
+            MERKLE_LEVEL_RESPONSE,
+            MERKLE_LEAVES_RESPONSE,
+            FILE_CHANGED,
+            FILE_CREATED,
+            FILE_DELETED,
+            FILE_RENAMED,
+            DIR_CREATED,
+            DIR_DELETED,
+            DIR_RENAMED,
             BLOCK_DATA,
         ];
         let mut seen = std::collections::HashSet::new();
