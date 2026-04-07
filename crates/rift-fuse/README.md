@@ -1,317 +1,235 @@
 # rift-fuse
 
-FUSE filesystem implementation for mounting Rift shares as local directories.
-
-## Overview
-
-This crate provides a FUSE (Filesystem in Userspace) adapter that allows Rift shares to be mounted as local directories:
-
-- **FUSE adapter** - Maps POSIX VFS operations to Rift protocol operations
-- **Inode management** - Generate and track inode numbers
-- **Metadata caching** - Cache file attributes with configurable TTL
-- **Background I/O** - Async operation handling in FUSE context
+FUSE filesystem adapter that mounts a Rift share as a local directory.
 
 ## Status
 
-**Phase 8 (Early Development)**: Basic empty directory mount implemented with tests.
+**Phase 8 — implemented (PoC scope)**
 
-✅ **Implemented:**
-- Minimal FUSE filesystem (empty directory)
-- Mount/unmount functionality
-- 9 integration tests covering basic operations
-
-🚧 **Next steps:**
-- Add static file support
-- Implement file reading
-- Connect to mock Rift client backend
-
-**Note:** This crate is excluded from the default workspace build because it requires FUSE to be installed:
-- **macOS:** Install [macFUSE](https://osxfuse.github.io/) - `brew install --cask macfuse`
-- **Linux:** Install `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
-
-## Building and Testing
-
-### Prerequisites
-
-**macOS:**
-```bash
-brew install --cask macfuse
-# You may need to approve the kernel extension in System Settings → Privacy & Security
-# Some systems require a reboot after installation
-```
-
-**Linux:**
-```bash
-# Ubuntu/Debian
-sudo apt install libfuse3-dev
-
-# Fedora/RHEL
-sudo dnf install fuse3-devel
-```
-
-### Enable in Workspace
-
-Edit the root `Cargo.toml`:
-```toml
-members = [
-    # ... other crates ...
-    "crates/rift-fuse",  # Add this line
-]
-
-# Remove or comment out:
-# exclude = ["crates/rift-fuse"]
-```
-
-### Running Tests
-
-```bash
-# Build the crate
-cargo build -p rift-fuse
-
-# Run all tests (requires FUSE installed)
-cargo test -p rift-fuse
-
-# Run a specific test
-cargo test -p rift-fuse test_empty_directory_listing
-```
-
-**Note:** The integration tests in `tests/basic_mount.rs` require FUSE to be installed and will fail at build time if it's not available. There's no way to run these tests without the FUSE kernel extension.
-
-## Usage
-
-Once implemented, mounting a Rift share:
-
-```bash
-# Mount a share
-rift-client mount server.example.com/share /mnt/rift
-
-# Use it like a local directory
-ls /mnt/rift
-cat /mnt/rift/file.txt
-echo "hello" > /mnt/rift/newfile.txt
-
-# Unmount
-rift-client umount /mnt/rift
-```
+The FUSE layer is complete for read-only `ls` / `stat` operations.
+Write operations, change notifications, and xattr support are deferred to v1.
 
 ## Architecture
 
-The FUSE layer translates VFS operations to Rift protocol operations:
-
-| FUSE Operation | Rift Operation |
-|----------------|----------------|
-| `lookup()` | `LOOKUP` |
-| `getattr()` | `STAT` |
-| `readdir()` | `READDIR` |
-| `open()` | `OPEN` |
-| `read()` | `READ` |
-| `release()` | `CLOSE` |
-| `create()` | `CREATE` |
-| `write()` | `WRITE` |
-| `unlink()` | `UNLINK` |
-| `mkdir()` | `MKDIR` |
-| `rmdir()` | `RMDIR` |
-| `rename()` | `RENAME` |
-
-## Planned Modules
-
 ```
-rift-fuse/
-├── filesystem.rs      # FUSE filesystem trait implementation
-├── inode.rs           # Inode number generation and mapping
-├── cache.rs           # Metadata and attribute caching
-└── handle.rs          # File handle management
+fuser OS threads (sync callbacks)
+  └── RiftFilesystem
+        │  holds Mutex<InodeMap>
+        │  holds Box<dyn FsClient>
+        │  holds tokio::runtime::Handle
+        │
+        ├── getattr  ──rt.block_on──► compute_getattr  ──► FsClient::stat
+        ├── lookup   ──rt.block_on──► compute_lookup   ──► FsClient::lookup
+        ├── readdir  ──rt.block_on──► compute_readdir  ──► FsClient::readdir
+        ├── opendir  (trivial OK)
+        └── releasedir (trivial OK)
 ```
 
-## Inode Management
+### Why `rt.block_on` instead of async FUSE?
 
-FUSE requires stable inode numbers. The adapter generates them from:
+`fuser` has synchronous callbacks; there is no async-native FUSE library that
+is stable enough for production use as of 2026-04.  The bridge is:
 
 ```rust
-// Hash of (server, share, path) -> 64-bit inode
-fn path_to_inode(server: &str, share: &str, path: &Path) -> u64 {
-    let mut hasher = Blake3Hash::new();
-    hasher.update(server.as_bytes());
-    hasher.update(share.as_bytes());
-    hasher.update(path.as_os_str().as_bytes());
-    u64::from_le_bytes(hasher.finalize()[..8])
-}
-```
-
-**Properties:**
-- Deterministic (same path = same inode)
-- Collision-resistant (64-bit from BLAKE3)
-- Stable across remounts
-- No server-side state required
-
-## Metadata Caching
-
-The FUSE layer caches file attributes to reduce server round-trips:
-
-```rust
-struct AttrCache {
-    // Map: inode -> (attrs, expiry_time)
-    cache: HashMap<u64, (FileAttr, Instant)>,
-    ttl: Duration,  // e.g., 5 seconds
-}
-```
-
-**Cache invalidation:**
-- Time-based expiry (TTL)
-- Explicit invalidation on write operations
-- Configurable via mount options
-
-## Async I/O Handling
-
-FUSE operations are synchronous, but Rift client is async. The adapter uses:
-
-```rust
-// Tokio runtime for async operations
-let runtime = tokio::runtime::Runtime::new()?;
-
-impl fuser::Filesystem for RiftFilesystem {
-    fn read(&mut self, req: &Request, ino: u64, ...) {
-        // Block on async operation
-        let data = runtime.block_on(async {
-            self.client.read(path, offset, size).await
-        })?;
-        reply.data(&data);
+fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    let inodes = self.inodes.lock().unwrap();
+    match self.rt.block_on(compute_getattr(ino, &inodes, self.client.as_ref())) {
+        Ok((attr, ttl)) => reply.attr(&ttl, &attr),
+        Err(e) => reply.error(e),
     }
 }
 ```
 
-Alternative: Background worker thread with channel communication.
+`rt` is a `tokio::runtime::Handle` captured from the tokio runtime that drives
+`RiftClient`.  `fuser`'s OS threads are not tokio threads; calling
+`Handle::block_on` from them parks the OS thread while the tokio reactor drives
+the async I/O, so the CPU is not wasted.
 
-## Testing Strategy
+**Concurrency model:** The `Mutex<InodeMap>` is held for the duration of each
+`block_on` call, serialising concurrent FUSE operations.  This is acceptable
+for the PoC; at higher concurrency a two-phase lookup (check → async → insert)
+would reduce lock contention.
 
-FUSE integration tests will cover:
+**`fuser` thread safety:** `fuser` calls `Filesystem` methods from multiple OS
+threads.  `RiftFilesystem` is `Send` because all interior state is either
+`Mutex`-protected or `Clone`.
 
-- [ ] Mount a share successfully
-- [ ] List directory (`ls`)
-- [ ] Read file (`cat`)
-- [ ] Create file (`touch`)
-- [ ] Write file (`echo >`)
-- [ ] Delete file (`rm`)
-- [ ] Create directory (`mkdir`)
-- [ ] Delete directory (`rmdir`)
-- [ ] Rename file/directory (`mv`)
-- [ ] Large file I/O (sequential read/write)
-- [ ] Concurrent access (multiple processes)
-- [ ] Unmount cleanly
+### `InodeMap`
 
-**Real-world tests:**
-- [ ] Git clone/pull on mounted share
-- [ ] Compile code on mounted share
-- [ ] Stream video from mounted share
-- [ ] SQLite database operations
+FUSE requires stable 64-bit inode numbers for the lifetime of a mount.
+`InodeMap` maintains a bidirectional `inode ↔ handle` mapping:
 
-## Mount Options
+- Inode 1 is always the share root.
+- New inodes are allocated sequentially starting from 2.
+- The same handle always gets the same inode (idempotent `get_or_insert`).
+- Inodes are never freed in the PoC.
 
-Planned mount options (passed via `-o` to FUSE):
+**Limitation:** Deleted or renamed files keep their old inodes in the map.
+The kernel will call `getattr` on the stale inode, receive `ENOENT` from the
+server (via `FsClient::stat`), and evict the dentry.  Formally correct, but
+the map grows without bound on shares with high churn.
+**TODO(v1):** evict inodes on `unlink`/`rename` once write operations land.
 
-```bash
-rift-client mount server/share /mnt/rift \
-  -o attr_timeout=5 \
-  -o entry_timeout=5 \
-  -o negative_timeout=0 \
-  -o ro \
-  -o allow_other \
-  -o default_permissions
+### `compute_*` functions
+
+The compute functions are `async fn` that contain all the logic:
+
+| Function | Client call | Error mapping |
+|---|---|---|
+| `compute_getattr` | `stat(handle)` | `FsError::*` → errno |
+| `compute_lookup` | `lookup(parent, name)` | `FsError::*` → errno |
+| `compute_readdir` | `readdir(handle)` | `FsError::*` → errno |
+
+Keeping them `async fn` (not `fn`) allows them to be `await`ed directly in
+tests without a `block_on`.  `RiftFilesystem` is the only caller that needs
+the sync bridge.
+
+### `FsClient` trait
+
+```rust
+#[async_trait]
+pub trait FsClient: Send + Sync + 'static {
+    async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs>;
+    async fn lookup(&self, parent: &[u8], name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)>;
+    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>>;
+}
 ```
 
-| Option | Description |
-|--------|-------------|
-| `attr_timeout` | Attribute cache TTL (seconds) |
-| `entry_timeout` | Directory entry cache TTL (seconds) |
-| `negative_timeout` | Negative lookup cache TTL (seconds) |
-| `ro` | Mount read-only |
-| `allow_other` | Allow other users to access |
-| `default_permissions` | Enable kernel permission checks |
+Defined here (in `rift-fuse`) rather than in `rift-client` because:
 
-## Dependencies
+- `rift-client` depends on `rift-fuse` (for FUSE mounting), so
+  `rift-fuse` cannot depend on `rift-client` — that would be circular.
+- `rift-fuse` owns the interface it needs; `rift-client` implements it.
 
-- `fuser` - FUSE bindings for Rust
-- `tokio` - Async runtime
-- `tracing` - Structured logging
-- `thiserror` - Error type derivation
-- `rift-common` - Shared types
-- `rift-protocol` - Protocol messages
+### Error mapping — `FsError`
 
-## Future Work
+`FsError` lives in `rift-common`, not here, because it is the shared
+vocabulary for filesystem errors across the entire stack:
 
-**Phase 8 (FUSE implementation):**
-- [ ] Implement `fuser::Filesystem` trait
-- [ ] Map FUSE operations to Rift client calls
-- [ ] Inode generation and mapping
-- [ ] File handle management
-- [ ] Metadata caching (configurable TTL)
-- [ ] Background async worker
-- [ ] Integration tests
-- [ ] CLI: `mount` and `umount` commands
+- **`rift-client`** produces `FsError` values (wraps them in `anyhow::Error`)
+  when the server returns error responses.
+- **`rift-fuse`** consumes them — `map_err` downcasts `anyhow::Error` to
+  `FsError` and calls `to_errno()`.
 
-**Future enhancements:**
-- [ ] Writeback caching (buffer writes locally)
-- [ ] Prefetching (predict read patterns)
-- [ ] Kernel module (replace FUSE for performance)
-- [ ] Extended attributes (xattrs) support
-- [ ] File locking support
-- [ ] Async I/O (FUSE_ASYNC_READ)
-
-## Performance Considerations
-
-**FUSE overhead:**
-- Context switches (userspace ↔ kernel)
-- System call overhead
-- No direct memory mapping
-
-**Optimizations:**
-- Large read/write buffers (reduce syscalls)
-- Metadata caching (reduce server round-trips)
-- Parallel I/O (multiple concurrent operations)
-- Readahead (sequential access detection)
-
-**Benchmarking goals:**
-- 90%+ of network bandwidth for sequential I/O
-- <1ms metadata operations (with cache hit)
-- Comparable to NFS/SMB performance
-
-## Limitations
-
-FUSE has some inherent limitations:
-
-- **Memory mapping:** `mmap()` may have reduced performance
-- **Direct I/O:** Limited support for `O_DIRECT`
-- **File locking:** Advisory locks only (no mandatory locks)
-- **Permissions:** Client-side enforcement (trust client)
-
-For production use, consider a kernel module (Phase post-v1).
-
-## Debugging
-
-Enable FUSE debug logging:
-
-```bash
-# Environment variable
-RUST_LOG=rift_fuse=debug rift-client mount ...
-
-# FUSE debug flag
-rift-client mount -o debug ...
-
-# Verbose kernel FUSE logs (Linux)
-echo 1 > /sys/module/fuse/parameters/debug
+```
+rift-server (proto ErrorCode) → rift-client (FsError) → anyhow → rift-fuse → libc errno
 ```
 
-## Platform Support
+Any `anyhow::Error` that does NOT contain an `FsError` maps to `EIO` — safe
+default for unexpected transport or decode failures.
 
-- **Linux:** Primary target (Ubuntu 22.04+, Debian 12+)
-- **macOS:** Requires macFUSE (community support)
-- **FreeBSD:** Future work
-- **Windows:** Not planned (use WinFsp if needed)
+`FsError` is a *unit* enum: no string messages are needed because the kernel
+only receives an integer errno, never a string.  This also keeps the FUSE hot
+path allocation-free on the error path.
 
-## Security
+## Module layout
 
-- All data encrypted in transit (QUIC/TLS)
-- Client certificate authentication
-- Server-side authorization checks
-- Local cache permissions (0700, user-only)
-- No elevation required (FUSE in userspace)
+```
+src/
+├── lib.rs         — FsClient trait, mount(), re-exports FsError from rift-common
+└── filesystem.rs  — InodeMap, proto_to_fuse_attr, compute_*, RiftFilesystem
+
+tests/
+├── filesystem.rs  — unit tests: InodeMap, compute_*, error mapping (MockFsClient)
+└── basic_mount.rs — integration: real FUSE mount with EmptyRootClient
+```
+
+## Prerequisites
+
+```bash
+# Ubuntu / Debian
+sudo apt install libfuse3-dev fuse3
+
+# Fedora / RHEL
+sudo dnf install fuse3-devel fuse3
+```
+
+## Running tests
+
+```bash
+# Unit tests only (no FUSE kernel driver needed)
+cargo test -p rift-fuse --test filesystem
+
+# All tests including real FUSE mounts (requires libfuse3)
+cargo test -p rift-fuse
+```
+
+## Next steps
+
+### Step 1 — wire `rift-client` and make `ls` work (immediate)
+
+`rift-client` must implement `FsClient` on `RiftClient`.  Once that is done,
+`rift-client mount --server … /mnt` can construct a `RiftClient`, box it as
+`Box<dyn FsClient>`, and pass it to `mount()`.  At that point `ls /mnt` and
+`ls -la /mnt` work end-to-end.
+
+Dependencies: `rift-server` (STAT / LOOKUP / READDIR handlers) and
+`rift-client` (`RiftClient` + `FsClient` impl) must both be implemented first.
+
+### Step 2 — `open` / `read` / `release` (enables `cat`)
+
+Add three methods to `FsClient`:
+
+```rust
+async fn open(&self, handle: &[u8]) -> anyhow::Result<Vec<u8>>;   // returns file handle token
+async fn read(&self, handle: &[u8], offset: u64, size: u32) -> anyhow::Result<Vec<u8>>;
+async fn release(&self, handle: &[u8]) -> anyhow::Result<()>;
+```
+
+Implement `open`, `read`, and `release` on `RiftFilesystem`.  `open` maps the
+FUSE file-handle integer to a server-side `OPEN` request; `read` drives the
+`READ` / `BLOCK_HEADER` / `BLOCK_DATA` sequence; `release` sends `CLOSE`.
+
+At this point `cat`, `cp`, and `diff` work on the mounted share.
+
+### Step 3 — correct `..` inode
+
+`compute_readdir` currently uses the directory's own inode for both `.` and
+`..`.  When a user does `cd /mnt/subdir; cd ..` the kernel resolves `..` via
+`lookup`, which calls `FsClient::lookup(current_handle, "..")`.  The server
+needs to handle `..` or the client needs to maintain a parent-pointer map.
+
+The simplest fix: `InodeMap` tracks `inode → parent_inode`; `compute_readdir`
+uses `parent_inode` for the `..` entry.
+
+### Step 4 — inode eviction on unlink/rename (write path prerequisite)
+
+Once write operations land, `unlink` and `rename` must remove (or invalidate)
+stale entries from `InodeMap`.  The inode map must also call
+`fuser::Filesystem::notify_inval_inode` so the kernel evicts cached dentries.
+
+### Step 5 — write operations (`create`, `write`, `mkdir`, `unlink`, `rename`)
+
+Implement the write side of `FsClient` and the corresponding `RiftFilesystem`
+methods.  Each operation maps to the server-side write-path handlers (Phase 6
+of the roadmap): `ACQUIRE_LOCK`, `WRITE_REQUEST`, `WRITE_COMMIT`, `CREATE`,
+`MKDIR`, `UNLINK`, `RMDIR`, `RENAME`.
+
+Until this step, the mount should be presented as read-only via the
+`MountOption::RO` flag to give the kernel and user clear expectations.
+
+### Step 6 — concurrency improvements
+
+Replace the coarse `Mutex<InodeMap>` with a two-phase approach:
+1. Lock → check if handle is already mapped → unlock.
+2. If not mapped: async network call (no lock held) → lock → insert.
+
+Also consider a `RwLock`: `get_or_insert` is the only write; `handle()` could
+use a read lock, removing contention for concurrent `getattr` calls on
+already-mapped inodes.
+
+### Step 7 — tunable TTLs and metadata caching
+
+Expose `attr_timeout` and `entry_timeout` as mount options (passed via
+`MountOption::Custom`).  Longer TTLs reduce round-trips on static content;
+shorter TTLs are needed for shares with active writers.  The server's lease
+window (30 s in the PoC) is the natural upper bound for `attr_timeout`.
+
+### Step 8 — v1 deferred features
+
+| Feature | Prerequisite |
+|---|---|
+| Symlink support (`readlink`, `symlink`) | Server-side `SYMLINK` op |
+| Extended attributes (`getxattr`, `setxattr`) | Server-side xattr ops |
+| Change notifications / inode invalidation | Server push streams |
+| `mmap` / `O_DIRECT` optimisation | Block-level read protocol |

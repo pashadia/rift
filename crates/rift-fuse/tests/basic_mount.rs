@@ -18,6 +18,34 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+use async_trait::async_trait;
+use rift_fuse::{FsClient, FsError};
+use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
+
+/// Minimal mock that serves an empty root directory.
+struct EmptyRootClient;
+
+#[async_trait]
+impl FsClient for EmptyRootClient {
+    async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs> {
+        if handle == b"." {
+            Ok(FileAttrs { file_type: FileType::Directory as i32, ..Default::default() })
+        } else {
+            Err(anyhow::Error::from(FsError::NotFound))
+        }
+    }
+    async fn lookup(&self, _parent: &[u8], _name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)> {
+        Err(anyhow::Error::from(FsError::NotFound))
+    }
+    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
+        if handle == b"." {
+            Ok(vec![])
+        } else {
+            Err(anyhow::Error::from(FsError::NotFound))
+        }
+    }
+}
+
 // fusermount3 uses a Unix socket to pass the FUSE fd back to the caller.
 // When tests run in parallel, child processes inherit each other's open fds
 // and fusermount3 picks the wrong one, breaking the mount.  Serialize all
@@ -38,8 +66,19 @@ impl MountFixture {
 
         let mount_point = TempDir::new().expect("Failed to create temp mount point");
 
-        // Mount the filesystem
-        let session = rift_fuse::mount(mount_point.path()).expect("Failed to mount filesystem");
+        // Build a tokio runtime and capture a handle for RiftFilesystem's block_on calls.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = rt.handle().clone();
+        // Keep the runtime alive for the duration of the test.
+        std::mem::forget(rt);
+
+        let session = rift_fuse::mount(
+            Box::new(EmptyRootClient),
+            b".".to_vec(),
+            handle,
+            mount_point.path(),
+        )
+        .expect("Failed to mount filesystem");
 
         // Give FUSE a moment to initialize
         thread::sleep(Duration::from_millis(100));

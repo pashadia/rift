@@ -11,14 +11,18 @@ repository.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
 
-# FUSE dependencies only on Linux
+# FUSE and libc only needed on Linux (filesystem.rs uses libc errno constants)
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+prost.workspace = true
