@@ -1,3 +1,167 @@
-//! Server implementation
+//! QUIC connection acceptance and per-stream dispatch.
 //!
-//! Placeholder for Phase 4 implementation
+//! The entry point is [`accept_loop`], which accepts incoming connections and
+//! spawns a task per connection.  Each connection task accepts streams and
+//! spawns a task per stream.  Each stream task reads the first frame to
+//! determine the request type and delegates to the appropriate handler.
+//!
+//! # Protocol flow
+//!
+//! ```text
+//! Client                          Server
+//!   │─── open stream 0 ──────────►│
+//!   │─── RIFT_HELLO ─────────────►│  version check + send_welcome
+//!   │◄── RIFT_WELCOME ────────────│
+//!   │
+//!   │─── open stream N ──────────►│  (one stream per operation)
+//!   │─── STAT_REQUEST ───────────►│  handler::stat_response
+//!   │◄── STAT_RESPONSE ───────────│
+//! ```
+
+use std::path::PathBuf;
+
+use prost::Message as _;
+
+use rift_protocol::messages::{msg, RiftHello, RiftWelcome, ShareInfo};
+use rift_transport::{
+    send_welcome, QuicConnection, QuicListener, QuicStream, RiftConnection, RiftListener,
+    RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
+};
+
+use crate::handler;
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/// Accept connections in a loop and serve each one in a background task.
+///
+/// Returns when the listener is closed.  Individual connection or stream
+/// errors are logged and do not terminate the loop.
+pub async fn accept_loop(listener: QuicListener, share: PathBuf) -> anyhow::Result<()> {
+    loop {
+        match listener.accept().await {
+            Ok(conn) => {
+                let share = share.clone();
+                tokio::spawn(serve_connection(conn, share));
+            }
+            Err(TransportError::ConnectionClosed) => break,
+            Err(e) => {
+                tracing::warn!("accept error: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection loop
+// ---------------------------------------------------------------------------
+
+async fn serve_connection(conn: QuicConnection, share: PathBuf) {
+    let peer = conn.peer_fingerprint().to_string();
+    tracing::debug!(peer = %peer, "connection established");
+
+    // TODO(v1): authorise peer fingerprint against per-share permission files
+    // before accepting any streams.
+
+    loop {
+        match conn.accept_stream().await {
+            Ok(stream) => {
+                let share = share.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stream(stream, share).await {
+                        tracing::debug!("stream error: {e}");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::debug!(peer = %peer, "connection closed");
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream dispatch
+// ---------------------------------------------------------------------------
+
+async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result<()> {
+    let (type_id, payload) = match stream.recv_frame().await? {
+        Some(f) => f,
+        None => return Ok(()), // empty stream — ignore
+    };
+
+    match type_id {
+        // ------------------------------------------------------------------
+        // Handshake
+        // ------------------------------------------------------------------
+        msg::RIFT_HELLO => {
+            let hello = RiftHello::decode(payload.as_ref())?;
+
+            if hello.protocol_version != RIFT_PROTOCOL_VERSION {
+                // TODO(v1): send a typed error frame before closing.
+                anyhow::bail!(
+                    "unsupported protocol version {} (expected {})",
+                    hello.protocol_version,
+                    RIFT_PROTOCOL_VERSION
+                );
+            }
+
+            // TODO(v1): validate share name against configured shares.
+            // TODO(v1): check client fingerprint against permission files.
+            let welcome = RiftWelcome {
+                protocol_version: RIFT_PROTOCOL_VERSION,
+                active_capabilities: vec![],
+                root_handle: b".".to_vec(),
+                max_concurrent_streams: 128,
+                share: Some(ShareInfo {
+                    name: hello.share_name.clone(),
+                    read_only: true, // TODO(v1): derive from permission file
+                    cdc_params: None,
+                }),
+            };
+
+            tracing::debug!(share = %hello.share_name, "handshake complete");
+            send_welcome(&mut stream, welcome).await?;
+        }
+
+        // ------------------------------------------------------------------
+        // Metadata operations
+        // ------------------------------------------------------------------
+        msg::STAT_REQUEST => {
+            let response = handler::stat_response(&payload, &share);
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
+        msg::LOOKUP_REQUEST => {
+            let response = handler::lookup_response(&payload, &share);
+            stream
+                .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
+        msg::READDIR_REQUEST => {
+            let response = handler::readdir_response(&payload, &share);
+            stream
+                .send_frame(msg::READDIR_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
+        // ------------------------------------------------------------------
+        // Unknown
+        // ------------------------------------------------------------------
+        other => {
+            // TODO(v1): send ERROR_RESPONSE so clients surface a real error.
+            tracing::debug!("unknown message type 0x{other:02X} — closing stream");
+        }
+    }
+
+    Ok(())
+}

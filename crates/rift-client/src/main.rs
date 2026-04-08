@@ -35,7 +35,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Mount { server, share, path } => {
+        Command::Mount {
+            server,
+            share,
+            path,
+        } => {
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = (server, share, path);

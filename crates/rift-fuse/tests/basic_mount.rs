@@ -29,7 +29,10 @@ struct EmptyRootClient;
 impl FsClient for EmptyRootClient {
     async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs> {
         if handle == b"." {
-            Ok(FileAttrs { file_type: FileType::Directory as i32, ..Default::default() })
+            Ok(FileAttrs {
+                file_type: FileType::Directory as i32,
+                ..Default::default()
+            })
         } else {
             Err(anyhow::Error::from(FsError::NotFound))
         }

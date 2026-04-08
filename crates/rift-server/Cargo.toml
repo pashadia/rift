@@ -19,6 +19,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 rcgen.workspace = true
 
 rift-common = { path = "../rift-common" }

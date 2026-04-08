@@ -18,12 +18,11 @@ use prost::Message as _;
 use tempfile::TempDir;
 
 use rift_protocol::messages::{
-    msg, LookupRequest, ReaddirRequest, StatRequest,
-    LookupResponse, ReaddirResponse, StatResponse,
+    msg, LookupRequest, LookupResponse, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
 };
 use rift_transport::{
-    client_endpoint, connect, AcceptAnyPolicy, RiftConnection, RiftListener, RiftStream,
-    RIFT_PROTOCOL_VERSION, client_handshake, RiftWelcome,
+    client_endpoint, client_handshake, connect, AcceptAnyPolicy, RiftConnection, RiftListener,
+    RiftStream, RiftWelcome, RIFT_PROTOCOL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,9 +59,8 @@ mod helpers {
     /// The server runs until the tokio runtime shuts down.
     pub async fn start_server(share: PathBuf) -> SocketAddr {
         let (cert, key) = gen_cert("rift-test-server");
-        let listener =
-            rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
-                .expect("server_endpoint failed");
+        let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
+            .expect("server_endpoint failed");
         let addr = listener.local_addr();
         tokio::spawn(rift_server::server::accept_loop(listener, share));
         addr
@@ -70,7 +68,9 @@ mod helpers {
 
     /// Connect a client, perform the Rift handshake, return the open connection
     /// and the root handle from the welcome message.
-    pub async fn connect_and_handshake(addr: SocketAddr) -> (rift_transport::QuicConnection, Vec<u8>) {
+    pub async fn connect_and_handshake(
+        addr: SocketAddr,
+    ) -> (rift_transport::QuicConnection, Vec<u8>) {
         let (cert, key) = gen_cert("rift-test-client");
         let ep = client_endpoint(&cert, &key).expect("client_endpoint failed");
         let conn = connect(&ep, addr, "rift-test-server", Arc::new(AcceptAnyPolicy))
@@ -143,7 +143,9 @@ fn metadata_to_attrs_directory() {
 fn stat_response_valid_handle_returns_attrs() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
-    let req = StatRequest { handles: vec![b"hello.txt".to_vec()] };
+    let req = StatRequest {
+        handles: vec![b"hello.txt".to_vec()],
+    };
     let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root);
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
@@ -156,7 +158,9 @@ fn stat_response_valid_handle_returns_attrs() {
 fn stat_response_invalid_handle_returns_error() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
-    let req = StatRequest { handles: vec![b"nonexistent.txt".to_vec()] };
+    let req = StatRequest {
+        handles: vec![b"nonexistent.txt".to_vec()],
+    };
     let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root);
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
@@ -233,7 +237,10 @@ fn readdir_response_lists_directory_entries() {
         panic!("expected entries, got {:?}", response.result);
     };
     let names: Vec<&str> = success.entries.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"hello.txt"), "missing hello.txt in {names:?}");
+    assert!(
+        names.contains(&"hello.txt"),
+        "missing hello.txt in {names:?}"
+    );
     assert!(names.contains(&"subdir"), "missing subdir in {names:?}");
 }
 
@@ -243,7 +250,11 @@ fn readdir_response_applies_offset() {
     let (_dir, root) = helpers::make_share();
 
     // Fetch all entries first to know the total count.
-    let req_all = ReaddirRequest { directory_handle: b".".to_vec(), offset: 0, limit: 0 };
+    let req_all = ReaddirRequest {
+        directory_handle: b".".to_vec(),
+        offset: 0,
+        limit: 0,
+    };
     let all = rift_server::handler::readdir_response(&req_all.encode_to_vec(), &root);
     let Some(readdir_response::Result::Entries(all_entries)) = all.result else {
         panic!("expected entries");
@@ -279,7 +290,10 @@ fn resolve_rejects_symlink_target_outside_share() {
     // link → /tmp/<outside>/  (points outside the share)
     std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
     let result = rift_server::handler::resolve(&root, b"escape");
-    assert!(result.is_err(), "symlink whose target is outside the share must be rejected");
+    assert!(
+        result.is_err(),
+        "symlink whose target is outside the share must be rejected"
+    );
 }
 
 /// An *intermediate* path component that is a symlink pointing outside the
@@ -294,7 +308,10 @@ fn resolve_rejects_intermediate_symlink_escape() {
     std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
     // Client asks for a path through the symlink.
     let result = rift_server::handler::resolve(&root, b"link/secret.txt");
-    assert!(result.is_err(), "path through an escaping symlink must be rejected");
+    assert!(
+        result.is_err(),
+        "path through an escaping symlink must be rejected"
+    );
 }
 
 /// Must-fix: null bytes terminate C paths on Linux; a handle containing one
@@ -365,8 +382,13 @@ async fn server_stat_root_returns_directory_attrs() {
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
     let mut stream = conn.open_stream().await.unwrap();
-    let req = StatRequest { handles: vec![root_handle] };
-    stream.send_frame(msg::STAT_REQUEST, &req.encode_to_vec()).await.unwrap();
+    let req = StatRequest {
+        handles: vec![root_handle],
+    };
+    stream
+        .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
     stream.finish_send().await.unwrap();
     let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
     assert_eq!(type_id, msg::STAT_RESPONSE);
@@ -386,8 +408,13 @@ async fn server_stat_file_returns_correct_size() {
     let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
 
     let mut stream = conn.open_stream().await.unwrap();
-    let req = StatRequest { handles: vec![b"hello.txt".to_vec()] };
-    stream.send_frame(msg::STAT_REQUEST, &req.encode_to_vec()).await.unwrap();
+    let req = StatRequest {
+        handles: vec![b"hello.txt".to_vec()],
+    };
+    stream
+        .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
     stream.finish_send().await.unwrap();
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let response = StatResponse::decode(&payload[..]).unwrap();
@@ -405,8 +432,14 @@ async fn server_lookup_finds_file_in_root() {
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
     let mut stream = conn.open_stream().await.unwrap();
-    let req = LookupRequest { parent_handle: root_handle, name: "hello.txt".to_string() };
-    stream.send_frame(msg::LOOKUP_REQUEST, &req.encode_to_vec()).await.unwrap();
+    let req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
     stream.finish_send().await.unwrap();
     let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
     assert_eq!(type_id, msg::LOOKUP_RESPONSE);
@@ -426,13 +459,22 @@ async fn server_lookup_nonexistent_returns_error() {
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
     let mut stream = conn.open_stream().await.unwrap();
-    let req = LookupRequest { parent_handle: root_handle, name: "nope.txt".to_string() };
-    stream.send_frame(msg::LOOKUP_REQUEST, &req.encode_to_vec()).await.unwrap();
+    let req = LookupRequest {
+        parent_handle: root_handle,
+        name: "nope.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
     stream.finish_send().await.unwrap();
     let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
     assert_eq!(type_id, msg::LOOKUP_RESPONSE);
     let response = LookupResponse::decode(&payload[..]).unwrap();
-    assert!(matches!(response.result, Some(lookup_response::Result::Error(_))));
+    assert!(matches!(
+        response.result,
+        Some(lookup_response::Result::Error(_))
+    ));
 }
 
 #[tokio::test]
@@ -443,8 +485,15 @@ async fn server_readdir_root_lists_all_entries() {
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
     let mut stream = conn.open_stream().await.unwrap();
-    let req = ReaddirRequest { directory_handle: root_handle, offset: 0, limit: 0 };
-    stream.send_frame(msg::READDIR_REQUEST, &req.encode_to_vec()).await.unwrap();
+    let req = ReaddirRequest {
+        directory_handle: root_handle,
+        offset: 0,
+        limit: 0,
+    };
+    stream
+        .send_frame(msg::READDIR_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
     stream.finish_send().await.unwrap();
     let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
     assert_eq!(type_id, msg::READDIR_RESPONSE);
@@ -467,7 +516,7 @@ async fn server_readdir_root_lists_all_entries() {
 
 #[tokio::test]
 async fn server_rejects_wrong_protocol_version() {
-    use rift_protocol::messages::{RiftHello, msg};
+    use rift_protocol::messages::{msg, RiftHello};
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
@@ -534,11 +583,20 @@ async fn server_handles_stream_with_no_request_data() {
 
     // Server must still accept and serve a subsequent normal request.
     let mut stream = conn.open_stream().await.unwrap();
-    let req = StatRequest { handles: vec![b".".to_vec()] };
-    stream.send_frame(msg::STAT_REQUEST, &req.encode_to_vec()).await.unwrap();
+    let req = StatRequest {
+        handles: vec![b".".to_vec()],
+    };
+    stream
+        .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
     stream.finish_send().await.unwrap();
     let (type_id, _) = stream.recv_frame().await.unwrap().unwrap();
-    assert_eq!(type_id, msg::STAT_RESPONSE, "server must still respond after empty stream");
+    assert_eq!(
+        type_id,
+        msg::STAT_RESPONSE,
+        "server must still respond after empty stream"
+    );
 }
 
 /// A client that disconnects mid-request must not leave behind a leaked task
@@ -556,7 +614,9 @@ async fn server_remains_responsive_after_client_disconnects_mid_request() {
     {
         let (conn, _) = helpers::connect_and_handshake(addr).await;
         let mut stream = conn.open_stream().await.unwrap();
-        let req = StatRequest { handles: vec![b".".to_vec()] };
+        let req = StatRequest {
+            handles: vec![b".".to_vec()],
+        };
         stream
             .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
             .await
@@ -571,7 +631,9 @@ async fn server_remains_responsive_after_client_disconnects_mid_request() {
     // Client B: must complete a full STAT round-trip successfully.
     let (conn2, root_handle) = helpers::connect_and_handshake(addr).await;
     let mut stream2 = conn2.open_stream().await.unwrap();
-    let req2 = StatRequest { handles: vec![root_handle] };
+    let req2 = StatRequest {
+        handles: vec![root_handle],
+    };
     stream2
         .send_frame(msg::STAT_REQUEST, &req2.encode_to_vec())
         .await
@@ -614,7 +676,10 @@ async fn server_handles_concurrent_streams_on_same_connection() {
             assert_eq!(type_id, msg::STAT_RESPONSE);
             let resp = StatResponse::decode(&payload[..]).unwrap();
             assert!(!resp.results.is_empty());
-            assert!(matches!(resp.results[0].result, Some(stat_result::Result::Attrs(_))));
+            assert!(matches!(
+                resp.results[0].result,
+                Some(stat_result::Result::Attrs(_))
+            ));
         }));
     }
     for t in tasks {

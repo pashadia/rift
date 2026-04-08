@@ -42,10 +42,7 @@ pub use filesystem::{
 #[async_trait::async_trait]
 pub trait FsClient: Send + Sync + 'static {
     /// Return the attributes of the object identified by `handle`.
-    async fn stat(
-        &self,
-        handle: &[u8],
-    ) -> anyhow::Result<rift_protocol::messages::FileAttrs>;
+    async fn stat(&self, handle: &[u8]) -> anyhow::Result<rift_protocol::messages::FileAttrs>;
 
     /// Resolve `name` inside the directory identified by `parent`.
     ///

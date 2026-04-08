@@ -40,9 +40,8 @@ mod helpers {
     /// Start a rift-server in a background task; return the bound address.
     pub async fn start_server(share: PathBuf) -> SocketAddr {
         let (cert, key) = gen_cert("rift-test-server");
-        let listener =
-            rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
-                .expect("server_endpoint failed");
+        let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
+            .expect("server_endpoint failed");
         let addr = listener.local_addr();
         tokio::spawn(rift_server::server::accept_loop(listener, share));
         addr
@@ -75,9 +74,14 @@ async fn client_stat_root_returns_directory() {
     use rift_protocol::messages::FileType;
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
-    let attrs = client.stat(client.root_handle()).await.expect("stat failed");
+    let attrs = client
+        .stat(client.root_handle())
+        .await
+        .expect("stat failed");
     assert_eq!(attrs.file_type, FileType::Directory as i32);
 }
 
@@ -85,7 +89,9 @@ async fn client_stat_root_returns_directory() {
 async fn client_stat_file_returns_correct_size() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let attrs = client.stat(b"hello.txt").await.expect("stat failed");
     assert_eq!(attrs.size, b"hello rift".len() as u64);
@@ -95,7 +101,9 @@ async fn client_stat_file_returns_correct_size() {
 async fn client_stat_nonexistent_handle_returns_error() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let result = client.stat(b"no_such_file.txt").await;
     assert!(result.is_err(), "stat of nonexistent handle must error");
@@ -110,7 +118,9 @@ async fn client_lookup_returns_handle_and_attrs() {
     use rift_protocol::messages::FileType;
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let (child_handle, attrs) = client
         .lookup(client.root_handle(), "hello.txt")
@@ -127,7 +137,9 @@ async fn client_lookup_subdirectory() {
     use rift_protocol::messages::FileType;
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let (_handle, attrs) = client
         .lookup(client.root_handle(), "subdir")
@@ -140,9 +152,13 @@ async fn client_lookup_subdirectory() {
 async fn client_lookup_missing_entry_returns_error() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
-    let result = client.lookup(client.root_handle(), "does_not_exist.txt").await;
+    let result = client
+        .lookup(client.root_handle(), "does_not_exist.txt")
+        .await;
     assert!(result.is_err(), "lookup of missing entry must error");
 }
 
@@ -154,11 +170,19 @@ async fn client_lookup_missing_entry_returns_error() {
 async fn client_readdir_root_lists_entries() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
-    let entries = client.readdir(client.root_handle()).await.expect("readdir failed");
+    let entries = client
+        .readdir(client.root_handle())
+        .await
+        .expect("readdir failed");
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"hello.txt"), "missing hello.txt in {names:?}");
+    assert!(
+        names.contains(&"hello.txt"),
+        "missing hello.txt in {names:?}"
+    );
     assert!(names.contains(&"subdir"), "missing subdir in {names:?}");
 }
 
@@ -168,7 +192,9 @@ async fn client_readdir_empty_subdir_returns_no_entries() {
     // Create an empty subdirectory
     std::fs::create_dir(root.join("empty_dir")).unwrap();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let (handle, _) = client
         .lookup(client.root_handle(), "empty_dir")
@@ -185,32 +211,35 @@ async fn client_readdir_empty_subdir_returns_no_entries() {
 // These verify that the sync wrappers correctly delegate to the async methods
 // without deadlocking.
 
-#[tokio::test]
+// multi_thread flavor required: block_in_place needs at least two worker
+// threads so the I/O callbacks can run while the calling thread is blocked.
+#[tokio::test(flavor = "multi_thread")]
 async fn fsclient_sync_stat_returns_attrs() {
     #[cfg(target_os = "linux")]
     {
-        use rift_fuse::FsClient as _;
         use rift_protocol::messages::FileType;
 
         let (_dir, root) = helpers::make_share();
         let addr = helpers::start_server(root).await;
-        let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+        let client = rift_client::client::RiftClient::connect(addr, "demo")
+            .await
+            .unwrap();
 
-        // The sync wrapper must not deadlock inside a tokio runtime.
+        // The sync wrapper must not deadlock inside a tokio multi-thread runtime.
         let attrs = client.stat_sync(b".").expect("sync stat failed");
         assert_eq!(attrs.file_type, FileType::Directory as i32);
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fsclient_sync_readdir_returns_entries() {
     #[cfg(target_os = "linux")]
     {
-        use rift_fuse::FsClient as _;
-
         let (_dir, root) = helpers::make_share();
         let addr = helpers::start_server(root).await;
-        let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+        let client = rift_client::client::RiftClient::connect(addr, "demo")
+            .await
+            .unwrap();
 
         let entries = client.readdir_sync(b".").expect("sync readdir failed");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -234,7 +263,9 @@ async fn fsclient_sync_readdir_returns_entries() {
 async fn client_not_found_error_is_distinguishable_from_io_error() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let err = client
         .stat(b"does_not_exist.txt")
@@ -257,13 +288,17 @@ async fn client_not_found_error_is_distinguishable_from_io_error() {
 async fn client_lookup_not_found_is_fserror_not_found() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     let err = client
         .lookup(client.root_handle(), "no_such_entry")
         .await
         .expect_err("lookup of missing entry must fail");
-    let fs_err = err.downcast_ref::<rift_fuse::FsError>().expect("must be FsError");
+    let fs_err = err
+        .downcast_ref::<rift_fuse::FsError>()
+        .expect("must be FsError");
     assert!(matches!(fs_err, rift_fuse::FsError::NotFound));
 }
 
@@ -280,22 +315,23 @@ async fn client_lookup_not_found_is_fserror_not_found() {
 async fn client_operations_fail_after_connection_drops() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let client = rift_client::client::RiftClient::connect(addr, "demo").await.unwrap();
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
 
     // Explicitly close the underlying connection via the transport handle.
     client.close_connection();
 
     // Stat must fail, not block.
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(2),
-        client.stat(b"."),
-    )
-    .await;
+    let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), client.stat(b".")).await;
     assert!(
-        result.is_ok(),   // did not time out
+        result.is_ok(), // did not time out
         "stat must not block indefinitely after connection is closed"
     );
-    assert!(result.unwrap().is_err(), "stat must return Err on closed connection");
+    assert!(
+        result.unwrap().is_err(),
+        "stat must return Err on closed connection"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +343,7 @@ async fn client_operations_fail_after_connection_drops() {
 // would panic; but from a plain `std::thread` they must work correctly.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fsclient_sync_stat_works_from_std_thread() {
     #[cfg(target_os = "linux")]
     {
@@ -328,7 +364,9 @@ async fn fsclient_sync_stat_works_from_std_thread() {
         // from within an async context, or the Handle lifetime was wrong.
         let client_clone = Arc::clone(&client);
         std::thread::spawn(move || {
-            let attrs = client_clone.stat_sync(b".").expect("stat_sync from std::thread failed");
+            let attrs = client_clone
+                .stat_sync(b".")
+                .expect("stat_sync from std::thread failed");
             assert_eq!(attrs.file_type, FileType::Directory as i32);
         })
         .join()

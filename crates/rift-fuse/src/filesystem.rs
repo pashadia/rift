@@ -14,8 +14,10 @@ use std::ffi::OsStr;
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
-use fuser::{FileAttr, FileType as FuserFileType, Filesystem, ReplyAttr, ReplyDirectory,
-            ReplyEmpty, ReplyEntry, ReplyOpen, Request};
+use fuser::{
+    FileAttr, FileType as FuserFileType, Filesystem, ReplyAttr, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, Request,
+};
 
 use rift_protocol::messages::{FileAttrs, FileType as ProtoFileType, ReaddirEntry};
 
@@ -101,8 +103,10 @@ pub fn proto_to_fuse_attr(ino: u64, attrs: &FileAttrs) -> FileAttr {
         .mtime
         .as_ref()
         .and_then(|ts| {
-            UNIX_EPOCH
-                .checked_add(Duration::new(ts.seconds.max(0) as u64, ts.nanos.max(0) as u32))
+            UNIX_EPOCH.checked_add(Duration::new(
+                ts.seconds.max(0) as u64,
+                ts.nanos.max(0) as u32,
+            ))
         })
         .unwrap_or(UNIX_EPOCH);
 
@@ -265,7 +269,10 @@ impl RiftFilesystem {
 impl Filesystem for RiftFilesystem {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let inodes = self.inodes.lock().unwrap();
-        match self.rt.block_on(compute_getattr(ino, &inodes, self.client.as_ref())) {
+        match self
+            .rt
+            .block_on(compute_getattr(ino, &inodes, self.client.as_ref()))
+        {
             Ok((attr, ttl)) => reply.attr(&ttl, &attr),
             Err(e) => reply.error(e),
         }
@@ -273,10 +280,12 @@ impl Filesystem for RiftFilesystem {
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let mut inodes = self.inodes.lock().unwrap();
-        match self
-            .rt
-            .block_on(compute_lookup(parent, name, &mut inodes, self.client.as_ref()))
-        {
+        match self.rt.block_on(compute_lookup(
+            parent,
+            name,
+            &mut inodes,
+            self.client.as_ref(),
+        )) {
             Ok((_ino, attr, ttl)) => reply.entry(&ttl, &attr, 0),
             Err(e) => reply.error(e),
         }
@@ -296,10 +305,12 @@ impl Filesystem for RiftFilesystem {
         mut reply: ReplyDirectory,
     ) {
         let mut inodes = self.inodes.lock().unwrap();
-        match self
-            .rt
-            .block_on(compute_readdir(ino, offset, &mut inodes, self.client.as_ref()))
-        {
+        match self.rt.block_on(compute_readdir(
+            ino,
+            offset,
+            &mut inodes,
+            self.client.as_ref(),
+        )) {
             Ok(entries) => {
                 for (child_ino, next_offset, kind, name) in entries {
                     if reply.add(child_ino, next_offset, kind, &name) {

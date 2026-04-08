@@ -14,6 +14,37 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+use async_trait::async_trait;
+use rift_fuse::{FsClient, FsError};
+use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
+
+/// Minimal mock that serves an empty root directory (no real server needed).
+struct EmptyClient;
+
+#[async_trait]
+impl FsClient for EmptyClient {
+    async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs> {
+        if handle == b"." {
+            Ok(FileAttrs {
+                file_type: FileType::Directory as i32,
+                ..Default::default()
+            })
+        } else {
+            Err(anyhow::Error::from(FsError::NotFound))
+        }
+    }
+    async fn lookup(&self, _parent: &[u8], _name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)> {
+        Err(anyhow::Error::from(FsError::NotFound))
+    }
+    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
+        if handle == b"." {
+            Ok(vec![])
+        } else {
+            Err(anyhow::Error::from(FsError::NotFound))
+        }
+    }
+}
+
 // Serialize FUSE mount tests to avoid fusermount3 fd-inheritance issues
 // (same root cause as in rift-fuse tests).
 static MOUNT_LOCK: Mutex<()> = Mutex::new(());
@@ -30,9 +61,18 @@ impl MountFixture {
 
         let mount_point = TempDir::new().expect("Failed to create temp mount point");
 
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = rt.handle().clone();
+        std::mem::forget(rt); // keep alive for the session lifetime
+
         tracing::debug!(mountpoint = %mount_point.path().display(), "Mounting in test");
-        let session =
-            rift_client::mount::mount(mount_point.path()).expect("Failed to mount filesystem");
+        let session = rift_client::mount::mount(
+            Box::new(EmptyClient),
+            b".".to_vec(),
+            handle,
+            mount_point.path(),
+        )
+        .expect("Failed to mount filesystem");
 
         // Give FUSE a moment to initialize
         thread::sleep(Duration::from_millis(100));

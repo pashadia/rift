@@ -19,8 +19,8 @@ pub fn mount(
     path: &Path,
 ) -> anyhow::Result<BackgroundSession> {
     tracing::debug!(mountpoint = %path.display(), "Calling rift_fuse::mount");
-    let session = rift_fuse::mount(client, root_handle, rt, path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let session =
+        rift_fuse::mount(client, root_handle, rt, path).map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::debug!(mountpoint = %path.display(), "FUSE session established");
     Ok(session)
 }
