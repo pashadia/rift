@@ -11,7 +11,7 @@
 //!    requests and assert on the responses.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use prost::Message as _;
@@ -22,7 +22,7 @@ use rift_protocol::messages::{
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, RiftConnection, RiftListener,
-    RiftStream, RiftWelcome, RIFT_PROTOCOL_VERSION,
+    RiftStream,
 };
 
 // ---------------------------------------------------------------------------

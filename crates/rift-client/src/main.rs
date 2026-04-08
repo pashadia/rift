@@ -1,5 +1,8 @@
 //! Rift Client Binary
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -24,7 +27,7 @@ enum Command {
         share: String,
 
         /// Local directory to mount the filesystem at
-        path: std::path::PathBuf,
+        path: PathBuf,
     },
 }
 
@@ -48,31 +51,37 @@ async fn main() -> Result<()> {
 
             #[cfg(target_os = "linux")]
             {
-                let addr: std::net::SocketAddr = server.parse()?;
-                tracing::info!(server = %addr, share = %share, mountpoint = %path.display(), "Connecting");
+                let addr: SocketAddr = server
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid server address: {server}"))?;
 
-                // TODO(rift-client): replace with real RiftClient::connect once implemented
-                let _ = (addr, share);
-                todo!("wire up RiftClient::connect — implement rift-client first");
+                tracing::info!(
+                    server = %addr,
+                    share  = %share,
+                    mountpoint = %path.display(),
+                    "connecting to server"
+                );
 
-                // The code below is the intended final form; it will compile once
-                // RiftClient exists:
-                //
-                // let client = rift_client::client::RiftClient::connect(addr, &share).await?;
-                // let root_handle = client.root_handle().to_vec();
-                // let rt = tokio::runtime::Handle::current();
-                // let _session = rift_client::mount::mount(
-                //     Box::new(client),
-                //     root_handle,
-                //     rt,
-                //     &path,
-                // )?;
-                // println!("Mounted {} at {}, press Ctrl+C to unmount", share, path.display());
-                // tokio::signal::ctrl_c().await?;
+                let client = rift_client::client::RiftClient::connect(addr, &share).await?;
+
+                println!(
+                    "Connected — server fingerprint: {}",
+                    // TODO(v1): surface server fingerprint from welcome/TLS
+                    "(see server stdout)"
+                );
+
+                let root_handle = client.root_handle().to_vec();
+                let rt = tokio::runtime::Handle::current();
+
+                let _session = rift_client::mount::mount(Box::new(client), root_handle, rt, &path)?;
+
+                println!("Mounted '{}' at {}", share, path.display());
+                println!("Press Ctrl-C to unmount.");
+                tokio::signal::ctrl_c().await?;
+                println!("\nUnmounting.");
             }
         }
     }
 
-    #[allow(unreachable_code)]
     Ok(())
 }

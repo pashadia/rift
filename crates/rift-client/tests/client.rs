@@ -7,11 +7,10 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use rift_transport::{AcceptAnyPolicy, RiftListener};
+use rift_transport::RiftListener;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -347,7 +346,6 @@ async fn client_operations_fail_after_connection_drops() {
 async fn fsclient_sync_stat_works_from_std_thread() {
     #[cfg(target_os = "linux")]
     {
-        use rift_fuse::FsClient as _;
         use rift_protocol::messages::FileType;
         use std::sync::Arc;
 

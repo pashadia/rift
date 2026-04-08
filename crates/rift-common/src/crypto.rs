@@ -144,7 +144,7 @@ mod tests {
     fn test_merkle_tree_single_leaf_identity() {
         let tree = MerkleTree::default();
         let leaf = Blake3Hash::new(b"test");
-        let root = tree.build(&[leaf.clone()]);
+        let root = tree.build(std::slice::from_ref(&leaf));
         assert_eq!(root, leaf);
     }
 
