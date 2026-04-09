@@ -91,6 +91,11 @@ impl RiftClient {
         })
     }
 
+    /// The server certificate fingerprint
+    pub fn server_fingerprint(&self) -> &str {
+        self.conn.peer_fingerprint()
+    }
+
     /// The opaque root handle for this share, as received in `RiftWelcome`.
     ///
     /// Pass this as the `handle` argument to `stat`, or as `parent` to

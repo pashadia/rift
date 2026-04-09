@@ -64,8 +64,10 @@ async fn main() -> Result<()> {
 
                 let client = rift_client::client::RiftClient::connect(addr, &share).await?;
 
-                // TODO(v1): surface server fingerprint from welcome/TLS
-                println!("Connected — server fingerprint: (see server stdout)");
+                println!(
+                    "Connected — server fingerprint: {}",
+                    &client.server_fingerprint()
+                );
 
                 let handle = rift_client::mount::mount(Box::new(client), &path).await?;
 
