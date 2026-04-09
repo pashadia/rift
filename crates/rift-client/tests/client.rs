@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use rift_transport::RiftListener;
+use rift_common::FsError;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -234,10 +235,10 @@ async fn client_not_found_error_is_distinguishable_from_io_error() {
     // The error must be identifiable as "not found", not just a generic Err.
     // The implementation expresses this by wrapping a `rift_fuse::FsError::NotFound`.
     let fs_err = err
-        .downcast_ref::<rift_fuse::FsError>()
+        .downcast_ref::<FsError>()
         .expect("client error must be a FsError so the FUSE layer can map it to ENOENT");
     assert!(
-        matches!(fs_err, rift_fuse::FsError::NotFound),
+        matches!(fs_err, FsError::NotFound),
         "expected FsError::NotFound, got {fs_err:?}"
     );
 }
@@ -256,9 +257,9 @@ async fn client_lookup_not_found_is_fserror_not_found() {
         .await
         .expect_err("lookup of missing entry must fail");
     let fs_err = err
-        .downcast_ref::<rift_fuse::FsError>()
+        .downcast_ref::<FsError>()
         .expect("must be FsError");
-    assert!(matches!(fs_err, rift_fuse::FsError::NotFound));
+    assert!(matches!(fs_err, FsError::NotFound));
 }
 
 // ---------------------------------------------------------------------------

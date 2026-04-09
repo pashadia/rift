@@ -1,27 +1,39 @@
 //! FUSE filesystem implementation using fuse3's async path-based API.
 //!
-//! Two public helpers are exposed for testing:
-//! - [`path_to_handle`] — convert fuse3 absolute path to server handle bytes
-//! - [`proto_to_fuse3_attr`] — convert proto `FileAttrs` to `fuse3::path::reply::FileAttr`
-//!
-//! [`RiftFilesystem`] holds only an `Arc<dyn FsClient>` — no runtime handle,
-//! no inode map.  fuse3's internal `InoPathBridge` manages inode↔path mapping
-//! entirely; our code only works with paths.
+//! This module is feature-gated and only compiled when the `fuse`
+//! feature is enabled.
+
+// This is a combination of rift-fuse/src/lib.rs and rift-fuse/src/filesystem.rs
 
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use fuse3::path::prelude::*;
 use fuse3::{Errno, FileType as Fuse3FileType, Result as Fuse3Result};
 use futures::stream;
 use futures::stream::Stream;
 
+use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType as ProtoFileType, ReaddirEntry};
 
-use crate::FsClient;
-use crate::FsError;
+/// The async interface the FUSE filesystem uses to contact the Rift server.
+///
+#[async_trait]
+pub trait RemoteShare: Send + Sync + 'static {
+    /// Return the attributes of the object identified by `handle`.
+    async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs>;
+
+    /// Resolve `name` inside the directory identified by `parent`.
+    ///
+    /// Returns `(child_handle, child_attrs)`.
+    async fn lookup(&self, parent: &[u8], name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)>;
+
+    /// List the contents of the directory identified by `handle`.
+    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>>;
+}
 
 /// Attribute TTL: how long the kernel may cache attrs before rechecking.
 const TTL: Duration = Duration::from_secs(1);
@@ -45,11 +57,6 @@ pub fn path_to_handle(path: &OsStr) -> Vec<u8> {
 }
 
 /// Convert a proto [`FileAttrs`] to a `fuse3::path::reply::FileAttr`.
-///
-/// **Note:** `FileAttr` in fuse3's path module has no `ino` field — inode
-/// assignment is managed entirely by fuse3's internal path bridge.
-///
-/// TODO(v1): propagate atime and ctime once the server includes them.
 pub fn proto_to_fuse3_attr(attrs: &FileAttrs) -> FileAttr {
     let kind = match ProtoFileType::try_from(attrs.file_type) {
         Ok(ProtoFileType::Directory) => Fuse3FileType::Directory,
@@ -71,9 +78,9 @@ pub fn proto_to_fuse3_attr(attrs: &FileAttrs) -> FileAttr {
     FileAttr {
         size: attrs.size,
         blocks: attrs.size.div_ceil(512),
-        atime: mtime, // TODO(v1): propagate atime from server
+        atime: mtime,
         mtime,
-        ctime: mtime, // TODO(v1): propagate ctime from server
+        ctime: mtime,
         kind,
         perm: (attrs.mode & 0o7777) as u16,
         nlink: attrs.nlinks.max(1),
@@ -104,21 +111,17 @@ fn to_errno(e: anyhow::Error) -> Errno {
 // ---------------------------------------------------------------------------
 
 /// FUSE filesystem backed by a Rift server.
-///
-/// Implements `fuse3::path::PathFilesystem` using native Rust async traits
-/// (no `async_trait` macro needed).  All methods call [`FsClient`] directly —
-/// no `block_on`, no runtime handle, no inode map.
-pub struct RiftFilesystem {
-    client: Arc<dyn FsClient>,
+pub struct RiftFilesystem<F: RemoteShare> {
+    client: Arc<F>,
 }
 
-impl RiftFilesystem {
-    pub fn new(client: Arc<dyn FsClient>) -> Self {
+impl<F: RemoteShare> RiftFilesystem<F> {
+    pub fn new(client: Arc<F>) -> Self {
         Self { client }
     }
 }
 
-impl PathFilesystem for RiftFilesystem {
+impl<F: RemoteShare + 'static> PathFilesystem for RiftFilesystem<F> {
     async fn init(&self, _req: Request) -> Fuse3Result<ReplyInit> {
         Ok(ReplyInit::new(NonZeroU32::new(16 * 1024 * 1024).unwrap()))
     }
@@ -132,9 +135,7 @@ impl PathFilesystem for RiftFilesystem {
         _fh: Option<u64>,
         _flags: u32,
     ) -> Fuse3Result<ReplyAttr> {
-        // `path` is None when the kernel queries attrs by file handle only.
-        // We don't track open file handles in the PoC, so return ENOSYS.
-        // TODO(v1): look up by fh once open/release are implemented.
+        tracing::info!(path = ?path, "FUSE getattr");
         let path = path.ok_or(Errno::from(libc::ENOSYS))?;
         let handle = path_to_handle(path);
         let attrs = self.client.stat(&handle).await.map_err(to_errno)?;
@@ -145,6 +146,7 @@ impl PathFilesystem for RiftFilesystem {
     }
 
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Fuse3Result<ReplyEntry> {
+        tracing::info!(parent = ?parent, name = ?name, "FUSE lookup");
         let parent_handle = path_to_handle(parent);
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
         let (_child_handle, attrs) = self
@@ -158,8 +160,8 @@ impl PathFilesystem for RiftFilesystem {
         })
     }
 
-    async fn opendir(&self, _req: Request, _path: &OsStr, _flags: u32) -> Fuse3Result<ReplyOpen> {
-        // TODO(v1): validate the path is a directory to fail fast.
+    async fn opendir(&self, _req: Request, path: &OsStr, _flags: u32) -> Fuse3Result<ReplyOpen> {
+        tracing::info!(path = ?path, "FUSE opendir");
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
@@ -171,23 +173,11 @@ impl PathFilesystem for RiftFilesystem {
         offset: i64,
     ) -> Fuse3Result<ReplyDirectory<impl Stream<Item = Fuse3Result<DirectoryEntry>> + Send + 'a>>
     {
+        tracing::info!(path = ?path, offset = offset, "FUSE readdir");
         let handle = path_to_handle(path);
         let entries: Vec<ReaddirEntry> = self.client.readdir(&handle).await.map_err(to_errno)?;
 
-        // Build full list: ".", "..", then real entries.
-        // Each entry's `offset` is the index of the *next* entry (FUSE pagination).
-        let mut all: Vec<Fuse3Result<DirectoryEntry>> = vec![
-            Ok(DirectoryEntry {
-                kind: Fuse3FileType::Directory,
-                name: OsString::from("."),
-                offset: 1,
-            }),
-            Ok(DirectoryEntry {
-                kind: Fuse3FileType::Directory,
-                name: OsString::from(".."),
-                offset: 2,
-            }),
-        ];
+        let mut all: Vec<Fuse3Result<DirectoryEntry>> = Vec::with_capacity(entries.len());
 
         for (i, entry) in entries.into_iter().enumerate() {
             let kind = match ProtoFileType::try_from(entry.file_type) {
@@ -198,7 +188,7 @@ impl PathFilesystem for RiftFilesystem {
             all.push(Ok(DirectoryEntry {
                 kind,
                 name: OsString::from(&entry.name),
-                offset: (i + 3) as i64,
+                offset: (i + 1) as i64, // Offset is 1-based index
             }));
         }
 

@@ -41,7 +41,7 @@ cargo test -- --nocapture
 PROPTEST_CASES=256 cargo test
 ```
 
-**Note on FUSE tests:** `rift-fuse` tests only run on Linux with libfuse3-dev installed. On other platforms, the crate builds successfully but all tests are conditionally compiled out (0 tests run). See `crates/rift-fuse/TESTING.md` for details.
+**Note on FUSE tests:** FUSE tests are part of the `rift-client` crate and require the `fuse` feature. They only run on Linux with libfuse3-dev installed. On other platforms, the feature is disabled and 0 tests run.
 
 ### Linting
 
@@ -81,14 +81,13 @@ rift/
 │   ├── rift-protocol/    # Protobuf messages + framing codec
 │   ├── rift-transport/   # QUIC/TLS abstraction
 │   ├── rift-server/      # Server binary + library
-│   ├── rift-client/      # Client binary + library
-│   └── rift-fuse/        # FUSE filesystem (excluded by default)
+│   ├── rift-client/      # Client binary + library (includes FUSE logic)
 ├── docs/                 # Design specifications (read-only)
 ├── Cargo.toml            # Workspace definition
 └── PROJECT-STATUS.md     # Development roadmap
 ```
 
-**Note:** `rift-fuse` is excluded from default builds (requires FUSE installed).
+**Note:** The FUSE implementation is part of `rift-client` and enabled by the `fuse` feature, which is on by default. It requires FUSE to be installed on the system.
 
 ## Code Style Guidelines
 

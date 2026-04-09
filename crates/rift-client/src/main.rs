@@ -49,8 +49,12 @@ async fn main() -> Result<()> {
                 anyhow::bail!("mount is only supported on Linux");
             }
 
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "fuse"))]
             {
+                use rift_client::fuse::RiftFilesystem;
+                use fuse3::path::Session;
+                use fuse3::MountOptions;
+
                 let addr: SocketAddr = server
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid server address: {server}"))?;
@@ -63,13 +67,20 @@ async fn main() -> Result<()> {
                 );
 
                 let client = rift_client::client::RiftClient::connect(addr, &share).await?;
-
+                
                 println!(
                     "Connected — server fingerprint: {}",
                     &client.server_fingerprint()
                 );
 
-                let mut mount_handle = rift_client::mount::mount(Box::new(client), &path).await?;
+                let mut options = MountOptions::default();
+                options.fs_name("rift");
+
+                let fs = RiftFilesystem::new(std::sync::Arc::new(client));
+                let mut mount_handle = Session::new(options)
+                    .mount_with_unprivileged(fs, &path)
+                    .await?;
+
                 let handle = &mut mount_handle;
 
                 println!("Mounted '{}' at {}", share, path.display());

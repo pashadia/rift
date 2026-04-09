@@ -4,5 +4,5 @@
 
 pub mod client;
 
-#[cfg(target_os = "linux")]
-pub mod mount;
+#[cfg(all(target_os = "linux", feature = "fuse"))]
+pub mod fuse;

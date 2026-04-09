@@ -233,17 +233,16 @@ impl RiftClient {
 }
 
 // ---------------------------------------------------------------------------
-// FsClient impl (Linux only)
+// RemoteShare impl (Linux only)
 // ---------------------------------------------------------------------------
 
-/// Implement `rift_fuse::FsClient` so `RiftClient` can be boxed and passed
-/// directly to `rift_fuse::mount()`.
+/// Implement `crate::fuse::RemoteShare` so `RiftClient` can be boxed and passed
+/// directly to the FUSE mount function.
 ///
 /// The async methods simply delegate to the corresponding `RiftClient` methods.
-/// fuse3 uses native Rust async traits (no `async_trait` macro needed).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "fuse"))]
 #[async_trait::async_trait]
-impl rift_fuse::FsClient for RiftClient {
+impl crate::fuse::RemoteShare for RiftClient {
     async fn stat(&self, handle: &[u8]) -> Result<FileAttrs> {
         self.stat(handle).await
     }

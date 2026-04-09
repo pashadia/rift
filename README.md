@@ -48,8 +48,7 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the current development roadmap a
 - `rift-protocol` - Protobuf messages + framing codec
 - `rift-transport` - QUIC/TLS abstraction
 - `rift-server` - Server binary
-- `rift-client` - Client binary
-- `rift-fuse` - FUSE filesystem implementation (optional)
+- `rift-client` - Client binary (includes optional FUSE implementation)
 
 ## Documentation
 

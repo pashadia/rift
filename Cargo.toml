@@ -6,7 +6,6 @@ members = [
     "crates/rift-transport",
     "crates/rift-server",
     "crates/rift-client",
-    "crates/rift-fuse",
 ]
 
 # rift-fuse is Linux-only and requires FUSE to be installed

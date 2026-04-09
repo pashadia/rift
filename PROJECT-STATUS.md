@@ -426,7 +426,7 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 
 ---
 
-### Phase 8: `rift-fuse`
+### Phase 8: FUSE Integration
 
 **Goal:** FUSE filesystem that mounts a Rift share as a local directory.
 
@@ -462,7 +462,7 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 **Estimated duration:** 2-3 weeks
 
 **Tasks:**
-- [ ] Implement `rift-fuse`:
+- [ ] Implement FUSE logic in `rift-client`:
   - [ ] Implement `fuser::Filesystem` trait
   - [ ] Map FUSE operations to `rift-client` calls
   - [ ] File handle management (map FUSE fh to Rift handles)
@@ -609,7 +609,7 @@ See `docs/05-implementation/crate-architecture.md` for the complete crate archit
 - `rift-client` - Client binary (includes client logic)  
 - `rift-protocol` - Protobuf messages + framing (merged `rift-wire`)
 - `rift-transport` - QUIC/TLS abstraction
-- `rift-fuse` - FUSE filesystem implementation
+- `rift-client` - Client binary (includes optional FUSE implementation)
 - `rift-common` - Shared types, config, utilities, crypto (merged `rift-crypto`)
 
 **Next immediate task:**
