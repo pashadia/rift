@@ -1,8 +1,4 @@
 //! FUSE integration tests for the rift-client.
-//!
-//! This combines tests from the old `rift-fuse` crate's
-//! `basic_mount.rs` and `filesystem.rs`.
-
 #![cfg(all(target_os = "linux", feature = "fuse"))]
 
 use std::collections::HashMap;
@@ -19,33 +15,25 @@ use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 
 // ---------------------------------------------------------------------------
-// MockFsClient (from rift-fuse/tests/filesystem.rs)
+// MockRemoteShare
 // ---------------------------------------------------------------------------
 
-struct MockFsClient {
+struct MockRemoteShare {
     stats: HashMap<Vec<u8>, FileAttrs>,
-    stat_errors: HashMap<Vec<u8>, FsError>,
     lookups: HashMap<(Vec<u8>, String), (Vec<u8>, FileAttrs)>,
-    dirs: HashMap<Vec<u8>, Vec<ReaddirEntry>>,
-    dir_errors: HashMap<Vec<u8>, FsError>,
+    dirplus: HashMap<Vec<u8>, Vec<(ReaddirEntry, FileAttrs)>>,
 }
 
-impl MockFsClient {
+impl MockRemoteShare {
     fn new() -> Self {
         Self {
             stats: HashMap::new(),
-            stat_errors: HashMap::new(),
             lookups: HashMap::new(),
-            dirs: HashMap::new(),
-            dir_errors: HashMap::new(),
+            dirplus: HashMap::new(),
         }
     }
     fn with_stat(mut self, handle: &[u8], attrs: FileAttrs) -> Self {
         self.stats.insert(handle.to_vec(), attrs);
-        self
-    }
-    fn with_stat_error(mut self, handle: &[u8], err: FsError) -> Self {
-        self.stat_errors.insert(handle.to_vec(), err);
         self
     }
     fn with_lookup(mut self, parent: &[u8], name: &str, child: &[u8], attrs: FileAttrs) -> Self {
@@ -53,12 +41,8 @@ impl MockFsClient {
             .insert((parent.to_vec(), name.to_string()), (child.to_vec(), attrs));
         self
     }
-    fn with_dir(mut self, handle: &[u8], entries: Vec<ReaddirEntry>) -> Self {
-        self.dirs.insert(handle.to_vec(), entries);
-        self
-    }
-    fn with_dir_error(mut self, handle: &[u8], err: FsError) -> Self {
-        self.dir_errors.insert(handle.to_vec(), err);
+    fn with_dirplus(mut self, handle: &[u8], entries: Vec<(ReaddirEntry, FileAttrs)>) -> Self {
+        self.dirplus.insert(handle.to_vec(), entries);
         self
     }
     fn dir_attrs() -> FileAttrs {
@@ -92,11 +76,8 @@ impl MockFsClient {
 }
 
 #[async_trait]
-impl RemoteShare for MockFsClient {
+impl RemoteShare for MockRemoteShare {
     async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs> {
-        if let Some(e) = self.stat_errors.get(handle) {
-            return Err(anyhow::Error::from(e.clone()));
-        }
         self.stats
             .get(handle)
             .cloned()
@@ -108,11 +89,11 @@ impl RemoteShare for MockFsClient {
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
     }
-    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
-        if let Some(e) = self.dir_errors.get(handle) {
-            return Err(anyhow::Error::from(e.clone()));
-        }
-        self.dirs
+    async fn readdir(&self, _handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
+        unimplemented!("readdir is not used in these tests")
+    }
+    async fn readdirplus(&self, handle: &[u8]) -> anyhow::Result<Vec<(ReaddirEntry, FileAttrs)>> {
+        self.dirplus
             .get(handle)
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
@@ -120,7 +101,7 @@ impl RemoteShare for MockFsClient {
 }
 
 // ---------------------------------------------------------------------------
-// Pure helper tests (from rift-fuse/tests/filesystem.rs)
+// Pure helper tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -134,39 +115,7 @@ fn path_to_handle_strips_leading_slash() {
 }
 
 // ---------------------------------------------------------------------------
-// RiftFilesystem method tests (from rift-fuse/tests/filesystem.rs)
-// ---------------------------------------------------------------------------
-
-fn make_fs<F: RemoteShare>(client: F) -> RiftFilesystem<F> {
-    RiftFilesystem::new(std::sync::Arc::new(client))
-}
-
-fn req() -> fuse3::raw::prelude::Request {
-    fuse3::raw::prelude::Request {
-        unique: 1,
-        uid: 0,
-        gid: 0,
-        pid: 0,
-    }
-}
-
-use fuse3::path::PathFilesystem as _;
-
-#[tokio::test]
-async fn getattr_root_returns_directory() {
-    let client = MockFsClient::new().with_stat(b".", MockFsClient::dir_attrs());
-    let fs = make_fs(client);
-    let reply = fs
-        .getattr(req(), Some(OsStr::new("/")), None, 0)
-        .await
-        .unwrap();
-    assert_eq!(reply.attr.kind, fuse3::FileType::Directory);
-}
-
-// ... other pure and method tests from filesystem.rs ...
-
-// ---------------------------------------------------------------------------
-// Mount Fixture and Helpers (from rift-fuse/tests/basic_mount.rs)
+// Mount Fixture and Helpers
 // ---------------------------------------------------------------------------
 
 /// Mounts a filesystem with the given RemoteShare implementation.
@@ -215,13 +164,13 @@ impl MountFixture {
 }
 
 // ---------------------------------------------------------------------------
-// Integration Tests (from rift-fuse/tests/basic_mount.rs, adapted)
+// Integration Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mount_point_is_directory() {
     let _guard = MOUNT_LOCK.lock().await;
-    let client = MockFsClient::new().with_stat(b".", MockFsClient::dir_attrs());
+    let client = MockRemoteShare::new().with_stat(b".", MockRemoteShare::dir_attrs());
     let fixture = MountFixture::new(client).await;
     let metadata = fs::metadata(fixture.path()).expect("metadata failed");
     assert!(metadata.is_dir());
@@ -230,7 +179,7 @@ async fn test_mount_point_is_directory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lookup_nonexistent_file() {
     let _guard = MOUNT_LOCK.lock().await;
-    let client = MockFsClient::new().with_stat(b".", MockFsClient::dir_attrs());
+    let client = MockRemoteShare::new().with_stat(b".", MockRemoteShare::dir_attrs());
     let fixture = MountFixture::new(client).await;
     let path = fixture.path().join("does_not_exist.txt");
     let err_kind = fs::metadata(&path).unwrap_err().kind();
@@ -238,7 +187,7 @@ async fn test_lookup_nonexistent_file() {
 }
 
 // ---------------------------------------------------------------------------
-// NEW Test to fix the `ls` bug
+// Directory Listing and Traversal Tests
 // ---------------------------------------------------------------------------
 
 fn init_logging() {
@@ -248,25 +197,88 @@ fn init_logging() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_list_root_directory_succeeds() {
+async fn test_list_directory_long_format_succeeds() {
     init_logging();
     let _guard = MOUNT_LOCK.lock().await;
 
-    let file_attrs = MockFsClient::file_attrs(123);
-    let dir_attrs = MockFsClient::dir_attrs();
+    let file_attrs = MockRemoteShare::file_attrs(123);
+    let dir_attrs = MockRemoteShare::dir_attrs();
 
-    let client = MockFsClient::new()
-        // getattr for /
+    let client = MockRemoteShare::new()
         .with_stat(b".", dir_attrs.clone())
-        // readdir for /
-        .with_dir(
+        .with_dirplus(
             b".",
-            vec![MockFsClient::entry("file1.txt", FileType::Regular)],
+            vec![(
+                MockRemoteShare::entry("file1.txt", FileType::Regular),
+                file_attrs,
+            )],
+        );
+
+    let fixture = MountFixture::new(client).await;
+    let path = fixture.path().to_path_buf();
+
+    let output =
+        tokio::task::spawn_blocking(move || Command::new("ls").arg("-l").arg(&path).output())
+            .await
+            .unwrap()
+            .expect("ls command failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("ls -l output:\n{}", stdout);
+
+    assert!(output.status.success(), "ls -l command failed");
+    assert!(stdout.contains("file1.txt"));
+    assert!(stdout.contains("-rw-r--r--"));
+    assert!(stdout.contains("123"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_subdirectory() {
+    init_logging();
+    let _guard = MOUNT_LOCK.lock().await;
+
+    let fixture = MountFixture::new(mock_for_subdirectory()).await;
+    let path = fixture.path().join("subdir");
+
+    let output =
+        tokio::task::spawn_blocking(move || Command::new("ls").arg("-l").arg(&path).output())
+            .await
+            .unwrap()
+            .expect("ls command failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("ls -l subdir output:\n{}", stdout);
+
+    assert!(output.status.success(), "ls -l on subdir failed");
+    assert!(stdout.contains("nested.txt"));
+}
+
+fn mock_for_subdirectory() -> MockRemoteShare {
+    let root_attrs = MockRemoteShare::dir_attrs();
+    let subdir_attrs = MockRemoteShare::dir_attrs();
+    let nested_file_attrs = MockRemoteShare::file_attrs(42);
+
+    MockRemoteShare::new()
+        .with_stat(b".", root_attrs)
+        .with_lookup(b".", "subdir", b"subdir", subdir_attrs.clone())
+        .with_stat(b"subdir", subdir_attrs)
+        .with_dirplus(
+            b"subdir",
+            vec![(
+                MockRemoteShare::entry("nested.txt", FileType::Regular),
+                nested_file_attrs,
+            )],
         )
-        // ls -la will also stat file1.txt
-        .with_lookup(b".", "file1.txt", b"file1.txt", file_attrs.clone())
-        // read_dir's iterator may also trigger getattr on the full path
-        .with_stat(b"file1.txt", file_attrs);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_empty_directory() {
+    init_logging();
+    let _guard = MOUNT_LOCK.lock().await;
+
+    let client = MockRemoteShare::new()
+        .with_stat(b".", MockRemoteShare::dir_attrs())
+        .with_dirplus(b".", vec![]);
 
     let fixture = MountFixture::new(client).await;
     let path = fixture.path().to_path_buf();
@@ -278,11 +290,27 @@ async fn test_list_root_directory_succeeds() {
             .expect("ls command failed to execute");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("ls output:\n{}", stdout);
+    println!("ls -la empty output:\n{}", stdout);
+    assert!(output.status.success());
+    assert!(!stdout.contains("nested.txt"));
+}
 
-    assert!(output.status.success(), "ls command failed");
-    assert!(
-        stdout.contains("file1.txt"),
-        "ls output should contain file1.txt"
-    );
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_nonexistent_directory() {
+    init_logging();
+    let _guard = MOUNT_LOCK.lock().await;
+
+    let client = MockRemoteShare::new().with_stat(b".", MockRemoteShare::dir_attrs());
+    let fixture = MountFixture::new(client).await;
+    let path = fixture.path().join("nonexistent_dir");
+
+    let output =
+        tokio::task::spawn_blocking(move || Command::new("ls").arg("-l").arg(&path).output())
+            .await
+            .unwrap()
+            .expect("ls command failed to execute");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No such file or directory"));
 }

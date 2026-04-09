@@ -3,8 +3,6 @@
 //! This module is feature-gated and only compiled when the `fuse`
 //! feature is enabled.
 
-// This is a combination of rift-fuse/src/lib.rs and rift-fuse/src/filesystem.rs
-
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -33,14 +31,11 @@ pub trait RemoteShare: Send + Sync + 'static {
 
     /// List the contents of the directory identified by `handle`.
     async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>>;
+    async fn readdirplus(&self, handle: &[u8]) -> anyhow::Result<Vec<(ReaddirEntry, FileAttrs)>>;
 }
 
 /// Attribute TTL: how long the kernel may cache attrs before rechecking.
 const TTL: Duration = Duration::from_secs(1);
-
-// ---------------------------------------------------------------------------
-// Public helpers
-// ---------------------------------------------------------------------------
 
 /// Convert a fuse3 absolute POSIX path (e.g. `/subdir/file.txt`) to the
 /// relative server handle used by [`FsClient`] (e.g. `b"subdir/file.txt"`).
@@ -91,10 +86,6 @@ pub fn proto_to_fuse3_attr(attrs: &FileAttrs) -> FileAttr {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error mapping
-// ---------------------------------------------------------------------------
-
 /// Map an `anyhow::Error` from `FsClient` to a `fuse3::Errno`.
 ///
 /// Errors that wrap `FsError` are mapped precisely; all others → EIO.
@@ -105,10 +96,6 @@ fn to_errno(e: anyhow::Error) -> Errno {
         .unwrap_or(libc::EIO);
     Errno::from(raw)
 }
-
-// ---------------------------------------------------------------------------
-// RiftFilesystem
-// ---------------------------------------------------------------------------
 
 /// FUSE filesystem backed by a Rift server.
 pub struct RiftFilesystem<F: RemoteShare> {
@@ -206,5 +193,38 @@ impl<F: RemoteShare + 'static> PathFilesystem for RiftFilesystem<F> {
         _flags: u32,
     ) -> Fuse3Result<()> {
         Ok(())
+    }
+
+    async fn readdirplus<'a>(
+        &'a self,
+        _req: Request,
+        path: &'a OsStr,
+        _fh: u64,
+        offset: u64,
+        _flags: u64,
+    ) -> Fuse3Result<
+        ReplyDirectoryPlus<impl Stream<Item = Fuse3Result<DirectoryEntryPlus>> + Send + 'a>,
+    > {
+        tracing::info!(path = ?path, offset = offset, "FUSE readdirplus");
+        let handle = path_to_handle(path);
+        let entries = self.client.readdirplus(&handle).await.map_err(to_errno)?;
+
+        let mut all = Vec::with_capacity(entries.len());
+        for (i, (entry, attrs)) in entries.into_iter().enumerate() {
+            let fuse_attrs = proto_to_fuse3_attr(&attrs);
+            all.push(Ok(DirectoryEntryPlus {
+                kind: fuse_attrs.kind,
+                name: OsString::from(entry.name),
+                offset: (i + 1) as i64,
+                attr: fuse_attrs,
+                entry_ttl: TTL,
+                attr_ttl: TTL,
+            }));
+        }
+
+        let skipped: Vec<_> = all.into_iter().skip(offset as usize).collect();
+        Ok(ReplyDirectoryPlus {
+            entries: stream::iter(skipped),
+        })
     }
 }

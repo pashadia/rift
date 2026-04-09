@@ -254,6 +254,25 @@ impl crate::fuse::RemoteShare for RiftClient {
     async fn readdir(&self, handle: &[u8]) -> Result<Vec<ReaddirEntry>> {
         self.readdir(handle).await
     }
+
+    async fn readdirplus(
+        &self,
+        handle: &[u8],
+    ) -> anyhow::Result<Vec<(ReaddirEntry, FileAttrs)>> {
+        // TODO: Implement this properly on the server side with a new message type.
+        // For now, we simulate it by calling readdir and then looking up each entry.
+        // This is inefficient but gets the FUSE logic working.
+        let entries = self.readdir(handle).await?;
+        let mut results = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // Note: `lookup` needs the parent handle, which we don't have here.
+            // This simulation will only work for flat directories where the entry's
+            // handle is its own name. This is a limitation we accept for now.
+            let (_child_handle, attrs) = self.lookup(handle, &entry.name).await?;
+            results.push((entry, attrs));
+        }
+        Ok(results)
+    }
 }
 
 // ---------------------------------------------------------------------------
