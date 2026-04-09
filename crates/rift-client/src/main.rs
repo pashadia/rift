@@ -69,13 +69,16 @@ async fn main() -> Result<()> {
                     &client.server_fingerprint()
                 );
 
-                let handle = rift_client::mount::mount(Box::new(client), &path).await?;
+                let mut mount_handle = rift_client::mount::mount(Box::new(client), &path).await?;
+                let handle = &mut mount_handle;
 
                 println!("Mounted '{}' at {}", share, path.display());
                 println!("Press Ctrl-C to unmount.");
                 tokio::select! {
                     r = handle => { r.map_err(|e| anyhow::anyhow!("{e}"))? }
-                    _ = tokio::signal::ctrl_c() => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        mount_handle.unmount().await?;
+                    }
                 }
                 println!("\nUnmounting.");
             }
