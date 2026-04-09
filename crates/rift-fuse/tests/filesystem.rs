@@ -1,46 +1,37 @@
-//! Unit tests for the FUSE filesystem logic.
+//! Unit tests for the new fuse3-backed rift-fuse layer.
 //!
-//! These tests do NOT mount a real FUSE filesystem — they exercise the
-//! compute functions and data structures directly using a `MockFsClient`
-//! that returns pre-canned responses.  This keeps the tests fast, portable,
-//! and free of FUSE kernel driver dependencies.
+//! Tests are structured in three groups:
 //!
-//! The async compute functions (`compute_getattr`, `compute_lookup`,
-//! `compute_readdir`) are awaited directly since we are in an async test
-//! context; the FUSE layer calls the same functions via `rt.block_on(...)`.
+//! 1. **Pure helper tests** — `path_to_handle` and `proto_to_fuse3_attr`:
+//!    no async, no FUSE kernel, no server.
+//!
+//! 2. **`RiftFilesystem` method tests** — call `getattr`, `lookup`, `readdir`
+//!    as async functions directly, using `MockFsClient`.
+//!    No FUSE mount or kernel involvement required.
+//!
+//! 3. **Error mapping tests** — `FsError` → errno mapping.
 
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
 
-use rift_fuse::{FsClient, FsError, InodeMap};
+use rift_common::FsError;
+use rift_fuse::{path_to_handle, proto_to_fuse3_attr, FsClient, RiftFilesystem};
 use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 
 // ---------------------------------------------------------------------------
 // MockFsClient
 // ---------------------------------------------------------------------------
 
-/// A configurable test double for `FsClient`.
-///
-/// Supports both success responses (pre-registered data) and typed error
-/// injection via `FsError`.  This allows tests to verify that the FUSE layer
-/// maps specific server-side errors to the correct POSIX errno values.
 struct MockFsClient {
-    /// handle → FileAttrs (success)
     stats: HashMap<Vec<u8>, FileAttrs>,
-    /// handle → FsError (failure; takes priority over `stats`)
     stat_errors: HashMap<Vec<u8>, FsError>,
-
-    /// (parent, name) → (child_handle, FileAttrs)
     lookups: HashMap<(Vec<u8>, String), (Vec<u8>, FileAttrs)>,
-    /// (parent, name) → FsError
-    lookup_errors: HashMap<(Vec<u8>, String), FsError>,
-
-    /// handle → Vec<ReaddirEntry>
     dirs: HashMap<Vec<u8>, Vec<ReaddirEntry>>,
-    /// handle → FsError
     dir_errors: HashMap<Vec<u8>, FsError>,
 }
 
@@ -50,49 +41,37 @@ impl MockFsClient {
             stats: HashMap::new(),
             stat_errors: HashMap::new(),
             lookups: HashMap::new(),
-            lookup_errors: HashMap::new(),
             dirs: HashMap::new(),
             dir_errors: HashMap::new(),
         }
     }
-
     fn with_stat(mut self, handle: &[u8], attrs: FileAttrs) -> Self {
         self.stats.insert(handle.to_vec(), attrs);
         self
     }
-
-    /// Inject a typed error for `stat(handle)`.
     fn with_stat_error(mut self, handle: &[u8], err: FsError) -> Self {
         self.stat_errors.insert(handle.to_vec(), err);
         self
     }
-
     fn with_lookup(mut self, parent: &[u8], name: &str, child: &[u8], attrs: FileAttrs) -> Self {
         self.lookups
             .insert((parent.to_vec(), name.to_string()), (child.to_vec(), attrs));
         self
     }
-
     fn with_dir(mut self, handle: &[u8], entries: Vec<ReaddirEntry>) -> Self {
         self.dirs.insert(handle.to_vec(), entries);
         self
     }
-
-    /// Inject a typed error for `readdir(handle)`.
     fn with_dir_error(mut self, handle: &[u8], err: FsError) -> Self {
         self.dir_errors.insert(handle.to_vec(), err);
         self
     }
-
-    // --- Attribute helpers ---
-
     fn dir_attrs() -> FileAttrs {
         FileAttrs {
             file_type: FileType::Directory as i32,
             ..Default::default()
         }
     }
-
     fn file_attrs(size: u64) -> FileAttrs {
         FileAttrs {
             file_type: FileType::Regular as i32,
@@ -100,8 +79,7 @@ impl MockFsClient {
             ..Default::default()
         }
     }
-
-    fn dir_entry(name: &str, handle: &[u8]) -> ReaddirEntry {
+    fn entry(name: &str, handle: &[u8]) -> ReaddirEntry {
         ReaddirEntry {
             name: name.to_string(),
             file_type: FileType::Regular as i32,
@@ -113,29 +91,23 @@ impl MockFsClient {
 #[async_trait]
 impl FsClient for MockFsClient {
     async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs> {
-        if let Some(err) = self.stat_errors.get(handle) {
-            return Err(anyhow::Error::from(err.clone()));
+        if let Some(e) = self.stat_errors.get(handle) {
+            return Err(anyhow::Error::from(e.clone()));
         }
         self.stats
             .get(handle)
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
     }
-
     async fn lookup(&self, parent: &[u8], name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)> {
-        let key = (parent.to_vec(), name.to_string());
-        if let Some(err) = self.lookup_errors.get(&key) {
-            return Err(anyhow::Error::from(err.clone()));
-        }
         self.lookups
-            .get(&key)
+            .get(&(parent.to_vec(), name.to_string()))
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
     }
-
     async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
-        if let Some(err) = self.dir_errors.get(handle) {
-            return Err(anyhow::Error::from(err.clone()));
+        if let Some(e) = self.dir_errors.get(handle) {
+            return Err(anyhow::Error::from(e.clone()));
         }
         self.dirs
             .get(handle)
@@ -145,354 +117,322 @@ impl FsClient for MockFsClient {
 }
 
 // ---------------------------------------------------------------------------
-// InodeMap tests
+// 1. Pure helper tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn inode_map_root_is_inode_1() {
-    let map = InodeMap::new(b".".to_vec());
-    assert_eq!(map.handle(1), Some(&b".".to_vec()));
+fn path_to_handle_root_gives_dot() {
+    assert_eq!(path_to_handle(OsStr::new("/")), b".");
 }
 
 #[test]
-fn inode_map_get_or_insert_assigns_new_inode() {
-    let mut map = InodeMap::new(b".".to_vec());
-    let ino = map.get_or_insert(b"hello.txt".to_vec());
-    assert!(ino >= 2, "new inodes start at 2");
-    assert_eq!(map.handle(ino), Some(&b"hello.txt".to_vec()));
+fn path_to_handle_strips_leading_slash() {
+    assert_eq!(path_to_handle(OsStr::new("/hello.txt")), b"hello.txt");
 }
 
 #[test]
-fn inode_map_same_handle_gets_same_inode() {
-    let mut map = InodeMap::new(b".".to_vec());
-    let ino1 = map.get_or_insert(b"file.txt".to_vec());
-    let ino2 = map.get_or_insert(b"file.txt".to_vec());
-    assert_eq!(ino1, ino2, "same handle must map to the same inode");
+fn path_to_handle_preserves_nested_path() {
+    assert_eq!(path_to_handle(OsStr::new("/a/b/c.txt")), b"a/b/c.txt");
 }
 
 #[test]
-fn inode_map_different_handles_get_different_inodes() {
-    let mut map = InodeMap::new(b".".to_vec());
-    let ino_a = map.get_or_insert(b"a.txt".to_vec());
-    let ino_b = map.get_or_insert(b"b.txt".to_vec());
-    assert_ne!(ino_a, ino_b);
+fn path_to_handle_empty_gives_dot() {
+    assert_eq!(path_to_handle(OsStr::new("")), b".");
 }
 
 #[test]
-fn inode_map_unknown_inode_returns_none() {
-    let map = InodeMap::new(b".".to_vec());
-    assert!(map.handle(999).is_none());
-}
-
-// ---------------------------------------------------------------------------
-// proto_to_fuse_attr tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn proto_to_fuse_attr_regular_file() {
+fn proto_to_fuse3_attr_regular_file() {
     let attrs = MockFsClient::file_attrs(1024);
-    let fuse_attr = rift_fuse::proto_to_fuse_attr(42, &attrs);
-    assert_eq!(fuse_attr.ino, 42);
+    let fuse_attr = proto_to_fuse3_attr(&attrs);
+    assert_eq!(fuse_attr.kind, fuse3::FileType::RegularFile);
     assert_eq!(fuse_attr.size, 1024);
-    assert_eq!(fuse_attr.kind, fuser::FileType::RegularFile);
 }
 
 #[test]
-fn proto_to_fuse_attr_directory() {
+fn proto_to_fuse3_attr_directory() {
     let attrs = MockFsClient::dir_attrs();
-    let fuse_attr = rift_fuse::proto_to_fuse_attr(1, &attrs);
-    assert_eq!(fuse_attr.kind, fuser::FileType::Directory);
+    let fuse_attr = proto_to_fuse3_attr(&attrs);
+    assert_eq!(fuse_attr.kind, fuse3::FileType::Directory);
+}
+
+#[test]
+fn proto_to_fuse3_attr_preserves_size() {
+    let attrs = MockFsClient::file_attrs(42_000);
+    let fuse_attr = proto_to_fuse3_attr(&attrs);
+    assert_eq!(fuse_attr.size, 42_000);
 }
 
 // ---------------------------------------------------------------------------
-// compute_getattr tests
+// 2. RiftFilesystem method tests
 // ---------------------------------------------------------------------------
 
+fn make_fs(client: MockFsClient) -> RiftFilesystem {
+    RiftFilesystem::new(std::sync::Arc::new(client))
+}
+
+fn req() -> fuse3::raw::prelude::Request {
+    fuse3::raw::prelude::Request {
+        unique: 1,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    }
+}
+
+use fuse3::path::PathFilesystem as _;
+
 #[tokio::test]
-async fn compute_getattr_root_returns_directory_attr() {
+async fn getattr_root_returns_directory() {
     let client = MockFsClient::new().with_stat(b".", MockFsClient::dir_attrs());
-    let inodes = InodeMap::new(b".".to_vec());
-
-    let (attr, _ttl) = rift_fuse::compute_getattr(1, &inodes, &client)
+    let fs = make_fs(client);
+    let reply = fs
+        .getattr(req(), Some(OsStr::new("/")), None, 0)
         .await
-        .expect("compute_getattr failed");
-
-    assert_eq!(attr.ino, 1);
-    assert_eq!(attr.kind, fuser::FileType::Directory);
+        .unwrap();
+    assert_eq!(reply.attr.kind, fuse3::FileType::Directory);
 }
 
 #[tokio::test]
-async fn compute_getattr_file_returns_correct_size() {
+async fn getattr_file_returns_correct_attrs() {
+    let client = MockFsClient::new().with_stat(b"hello.txt", MockFsClient::file_attrs(99));
+    let fs = make_fs(client);
+    let reply = fs
+        .getattr(req(), Some(OsStr::new("/hello.txt")), None, 0)
+        .await
+        .unwrap();
+    assert_eq!(reply.attr.kind, fuse3::FileType::RegularFile);
+    assert_eq!(reply.attr.size, 99);
+}
+
+#[tokio::test]
+async fn getattr_not_found_returns_enoent() {
+    let client = MockFsClient::new();
+    let fs = make_fs(client);
+    let err = fs
+        .getattr(req(), Some(OsStr::new("/gone.txt")), None, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, fuse3::Errno::from(libc::ENOENT));
+}
+
+#[tokio::test]
+async fn getattr_permission_denied_returns_eacces() {
+    let client = MockFsClient::new().with_stat_error(b"secret", FsError::PermissionDenied);
+    let fs = make_fs(client);
+    let err = fs
+        .getattr(req(), Some(OsStr::new("/secret")), None, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, fuse3::Errno::from(libc::EACCES));
+}
+
+#[tokio::test]
+async fn getattr_io_error_returns_eio() {
+    let client = MockFsClient::new().with_stat_error(b"broken", FsError::Io);
+    let fs = make_fs(client);
+    let err = fs
+        .getattr(req(), Some(OsStr::new("/broken")), None, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, fuse3::Errno::from(libc::EIO));
+}
+
+#[tokio::test]
+async fn getattr_with_no_path_returns_enosys() {
+    // When FUSE calls getattr with only a file handle (no path), we return ENOSYS
+    // because open/release are not yet implemented.
+    let client = MockFsClient::new().with_stat(b".", MockFsClient::dir_attrs());
+    let fs = make_fs(client);
+    let err = fs.getattr(req(), None, Some(42), 0).await.unwrap_err();
+    assert_eq!(err, fuse3::Errno::from(libc::ENOSYS));
+}
+
+#[tokio::test]
+async fn lookup_returns_child_entry_and_attrs() {
     let client = MockFsClient::new()
         .with_stat(b".", MockFsClient::dir_attrs())
-        .with_stat(b"hello.txt", MockFsClient::file_attrs(42));
-    let mut inodes = InodeMap::new(b".".to_vec());
-    let file_ino = inodes.get_or_insert(b"hello.txt".to_vec());
-
-    let (attr, _ttl) = rift_fuse::compute_getattr(file_ino, &inodes, &client)
+        .with_lookup(b".", "file.txt", b"file.txt", MockFsClient::file_attrs(10));
+    let fs = make_fs(client);
+    let reply = fs
+        .lookup(req(), OsStr::new("/"), OsStr::new("file.txt"))
         .await
-        .expect("compute_getattr failed");
-
-    assert_eq!(attr.size, 42);
-    assert_eq!(attr.kind, fuser::FileType::RegularFile);
+        .unwrap();
+    assert_eq!(reply.attr.kind, fuse3::FileType::RegularFile);
+    assert_eq!(reply.attr.size, 10);
 }
 
 #[tokio::test]
-async fn compute_getattr_unknown_inode_returns_enoent() {
+async fn lookup_missing_name_returns_enoent() {
     let client = MockFsClient::new();
-    let inodes = InodeMap::new(b".".to_vec());
-
-    let result = rift_fuse::compute_getattr(999, &inodes, &client).await;
-
-    assert!(
-        matches!(result, Err(e) if e == libc::ENOENT),
-        "unknown inode must yield ENOENT"
-    );
+    let fs = make_fs(client);
+    let err = fs
+        .lookup(req(), OsStr::new("/"), OsStr::new("nope.txt"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, fuse3::Errno::from(libc::ENOENT));
 }
 
+/// The same lookup for the same name must always produce the same result
+/// (fuse3 caches by path internally; we must not return conflicting attrs).
 #[tokio::test]
-async fn compute_getattr_not_found_returns_enoent() {
-    // Inode maps to a handle, but the client says it doesn't exist.
-    // FsError::NotFound must map to ENOENT, not EIO.
-    let client = MockFsClient::new(); // returns FsError::NotFound for everything
-    let mut inodes = InodeMap::new(b".".to_vec());
-    let ino = inodes.get_or_insert(b"gone.txt".to_vec());
-
-    let result = rift_fuse::compute_getattr(ino, &inodes, &client).await;
-
-    assert!(
-        matches!(result, Err(e) if e == libc::ENOENT),
-        "FsError::NotFound must map to ENOENT, got {:?}",
-        result
-    );
-}
-
-#[tokio::test]
-async fn compute_getattr_permission_denied_returns_eacces() {
-    // A handle the client can't access due to permissions.
-    // FsError::PermissionDenied must map to EACCES, not EIO.
-    let client = MockFsClient::new().with_stat_error(b"secret.txt", FsError::PermissionDenied);
-    let mut inodes = InodeMap::new(b".".to_vec());
-    let ino = inodes.get_or_insert(b"secret.txt".to_vec());
-
-    let result = rift_fuse::compute_getattr(ino, &inodes, &client).await;
-
-    assert!(
-        matches!(result, Err(e) if e == libc::EACCES),
-        "FsError::PermissionDenied must map to EACCES, got {:?}",
-        result
-    );
-}
-
-#[tokio::test]
-async fn compute_getattr_io_error_returns_eio() {
-    // A transport/unexpected error maps to EIO.
-    let client = MockFsClient::new().with_stat_error(b"broken.txt", FsError::Io);
-    let mut inodes = InodeMap::new(b".".to_vec());
-    let ino = inodes.get_or_insert(b"broken.txt".to_vec());
-
-    let result = rift_fuse::compute_getattr(ino, &inodes, &client).await;
-
-    assert!(
-        matches!(result, Err(e) if e == libc::EIO),
-        "FsError::Io must map to EIO, got {:?}",
-        result
-    );
-}
-
-// ---------------------------------------------------------------------------
-// compute_lookup tests
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn compute_lookup_assigns_inode_for_new_entry() {
-    use std::ffi::OsStr;
-    let child_attrs = MockFsClient::file_attrs(10);
-    let client = MockFsClient::new().with_lookup(b".", "hello.txt", b"hello.txt", child_attrs);
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let (ino, attr, _ttl) =
-        rift_fuse::compute_lookup(1, OsStr::new("hello.txt"), &mut inodes, &client)
-            .await
-            .expect("compute_lookup failed");
-
-    assert!(ino >= 2);
-    assert_eq!(attr.size, 10);
-    // Looking up the same name again must return the SAME inode.
-    let (ino2, _, _) = rift_fuse::compute_lookup(1, OsStr::new("hello.txt"), &mut inodes, &client)
+async fn lookup_same_name_returns_consistent_attrs() {
+    let client =
+        MockFsClient::new().with_lookup(b".", "file.txt", b"file.txt", MockFsClient::file_attrs(7));
+    let fs = std::sync::Arc::new(make_fs(client));
+    let r1 = fs
+        .lookup(req(), OsStr::new("/"), OsStr::new("file.txt"))
+        .await
+        .unwrap();
+    let r2 = fs
+        .lookup(req(), OsStr::new("/"), OsStr::new("file.txt"))
         .await
         .unwrap();
     assert_eq!(
-        ino, ino2,
-        "repeated lookup of same name must yield same inode"
+        r1.attr.size, r2.attr.size,
+        "same path must always return same attrs"
     );
+    assert_eq!(r1.attr.kind, r2.attr.kind);
 }
 
 #[tokio::test]
-async fn compute_lookup_unknown_parent_returns_enoent() {
-    use std::ffi::OsStr;
-    let client = MockFsClient::new();
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let result = rift_fuse::compute_lookup(999, OsStr::new("file.txt"), &mut inodes, &client).await;
-
-    assert!(matches!(result, Err(e) if e == libc::ENOENT));
-}
-
-#[tokio::test]
-async fn compute_lookup_missing_name_returns_enoent() {
-    use std::ffi::OsStr;
-    let client = MockFsClient::new(); // no lookups registered
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let result = rift_fuse::compute_lookup(1, OsStr::new("nope.txt"), &mut inodes, &client).await;
-
-    assert!(matches!(result, Err(e) if e == libc::ENOENT));
-}
-
-// ---------------------------------------------------------------------------
-// compute_readdir tests
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn compute_readdir_lists_entries_with_dot_and_dotdot() {
-    let entries = vec![
-        MockFsClient::dir_entry("file_a.txt", b"file_a.txt"),
-        MockFsClient::dir_entry("file_b.txt", b"file_b.txt"),
-    ];
-    let client = MockFsClient::new().with_dir(b".", entries);
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let result = rift_fuse::compute_readdir(1, 0, &mut inodes, &client)
-        .await
-        .expect("compute_readdir failed");
-
-    let names: Vec<&str> = result.iter().map(|(_, _, _, n)| n.as_str()).collect();
-    assert!(names.contains(&"."), ". must always be present");
-    assert!(names.contains(&".."), ".. must always be present");
-    assert!(names.contains(&"file_a.txt"));
-    assert!(names.contains(&"file_b.txt"));
-}
-
-#[tokio::test]
-async fn compute_readdir_offset_skips_leading_entries() {
-    let entries = vec![
-        MockFsClient::dir_entry("a.txt", b"a.txt"),
-        MockFsClient::dir_entry("b.txt", b"b.txt"),
-    ];
-    let client = MockFsClient::new().with_dir(b".", entries);
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    // Get the full list first so we know the total count (including . and ..).
-    let all = rift_fuse::compute_readdir(1, 0, &mut inodes, &client)
-        .await
-        .unwrap();
-    let total = all.len() as i64;
-
-    // Requesting with offset = total must return nothing.
-    let empty = rift_fuse::compute_readdir(1, total, &mut inodes, &client)
-        .await
-        .unwrap();
-    assert!(empty.is_empty(), "offset past end must return empty list");
-}
-
-#[tokio::test]
-async fn compute_readdir_unknown_inode_returns_enoent() {
-    let client = MockFsClient::new();
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let result = rift_fuse::compute_readdir(999, 0, &mut inodes, &client).await;
-
-    assert!(matches!(result, Err(e) if e == libc::ENOENT));
-}
-
-#[tokio::test]
-async fn compute_readdir_not_found_returns_enoent() {
-    // FsError::NotFound from the client → ENOENT, not EIO.
-    let client = MockFsClient::new(); // no dirs registered → NotFound
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let result = rift_fuse::compute_readdir(1, 0, &mut inodes, &client).await;
-
-    assert!(
-        matches!(result, Err(e) if e == libc::ENOENT),
-        "FsError::NotFound on readdir must yield ENOENT"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Must-fix: error code mapping — ENOTDIR
-//
-// FUSE may call `readdir` on any inode.  If the server reports that the
-// handle is not a directory, the FUSE layer must return ENOTDIR (not EIO).
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn compute_readdir_on_file_returns_enotdir() {
-    // The client reports that this handle is not a directory.
-    let client = MockFsClient::new().with_dir_error(b"file.txt", FsError::NotADirectory);
-    let mut inodes = InodeMap::new(b".".to_vec());
-    let file_ino = inodes.get_or_insert(b"file.txt".to_vec());
-
-    let result = rift_fuse::compute_readdir(file_ino, 0, &mut inodes, &client).await;
-
-    assert!(
-        matches!(result, Err(e) if e == libc::ENOTDIR),
-        "FsError::NotADirectory must map to ENOTDIR, got {:?}",
-        result
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Must-fix: inode assignment idempotency under concurrent access
-//
-// The inode map is protected by a Mutex inside RiftFilesystem.  The property
-// we need is: any number of lookups for the same (parent, name) pair must
-// always yield the same inode number, regardless of order.  We test this by
-// performing multiple sequential lookups and asserting stability.  The
-// concurrency safety is provided by the Mutex; this test verifies correctness.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn compute_lookup_is_stable_across_repeated_calls() {
-    use std::ffi::OsStr;
-    let client =
-        MockFsClient::new().with_lookup(b".", "file.txt", b"file.txt", MockFsClient::file_attrs(1));
-    let mut inodes = InodeMap::new(b".".to_vec());
-
-    let (ino1, _, _) = rift_fuse::compute_lookup(1, OsStr::new("file.txt"), &mut inodes, &client)
-        .await
-        .unwrap();
-    let (ino2, _, _) = rift_fuse::compute_lookup(1, OsStr::new("file.txt"), &mut inodes, &client)
-        .await
-        .unwrap();
-    let (ino3, _, _) = rift_fuse::compute_lookup(1, OsStr::new("file.txt"), &mut inodes, &client)
-        .await
-        .unwrap();
-
-    assert_eq!(ino1, ino2, "second lookup must return the same inode");
-    assert_eq!(ino2, ino3, "third lookup must return the same inode");
-    assert!(ino1 >= 2, "assigned inode must not collide with root (1)");
-}
-
-/// Different entries under the same parent must get distinct inodes.
-/// This guards against a hash collision or off-by-one in the map.
-#[tokio::test]
-async fn compute_lookup_different_names_get_distinct_inodes() {
-    use std::ffi::OsStr;
+async fn readdir_includes_dot_and_dotdot() {
     let client = MockFsClient::new()
-        .with_lookup(b".", "a.txt", b"a.txt", MockFsClient::file_attrs(1))
-        .with_lookup(b".", "b.txt", b"b.txt", MockFsClient::file_attrs(2));
-    let mut inodes = InodeMap::new(b".".to_vec());
+        .with_stat(b".", MockFsClient::dir_attrs())
+        .with_dir(b".", vec![MockFsClient::entry("file.txt", b"file.txt")]);
+    let fs = make_fs(client);
+    let reply = fs.readdir(req(), OsStr::new("/"), 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.collect().await;
+    let names: Vec<_> = entries
+        .iter()
+        .map(|e| e.as_ref().unwrap().name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&".".to_string()), ". missing: {names:?}");
+    assert!(names.contains(&"..".to_string()), ".. missing: {names:?}");
+}
 
-    let (ino_a, _, _) = rift_fuse::compute_lookup(1, OsStr::new("a.txt"), &mut inodes, &client)
-        .await
-        .unwrap();
-    let (ino_b, _, _) = rift_fuse::compute_lookup(1, OsStr::new("b.txt"), &mut inodes, &client)
-        .await
-        .unwrap();
+#[tokio::test]
+async fn readdir_lists_real_entries() {
+    let client = MockFsClient::new()
+        .with_stat(b".", MockFsClient::dir_attrs())
+        .with_dir(
+            b".",
+            vec![
+                MockFsClient::entry("a.txt", b"a.txt"),
+                MockFsClient::entry("b.txt", b"b.txt"),
+            ],
+        );
+    let fs = make_fs(client);
+    let reply = fs.readdir(req(), OsStr::new("/"), 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.collect().await;
+    let names: Vec<_> = entries
+        .iter()
+        .map(|e| e.as_ref().unwrap().name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"a.txt".to_string()));
+    assert!(names.contains(&"b.txt".to_string()));
+}
 
-    assert_ne!(ino_a, ino_b, "distinct entries must get distinct inodes");
-    assert_ne!(ino_a, 1u64, "assigned inode must not collide with root");
-    assert_ne!(ino_b, 1u64, "assigned inode must not collide with root");
+#[tokio::test]
+async fn readdir_offset_skips_entries() {
+    let client = MockFsClient::new()
+        .with_stat(b".", MockFsClient::dir_attrs())
+        .with_dir(b".", vec![MockFsClient::entry("a.txt", b"a.txt")]);
+    let fs = make_fs(client);
+
+    let all = fs.readdir(req(), OsStr::new("/"), 0, 0).await.unwrap();
+    let total = all.entries.collect::<Vec<_>>().await.len() as i64;
+
+    let empty = fs.readdir(req(), OsStr::new("/"), 0, total).await.unwrap();
+    let count = empty.entries.collect::<Vec<_>>().await.len();
+    assert_eq!(count, 0, "offset past end must yield empty stream");
+}
+
+// Readdir error tests use match because ReplyDirectory<impl Stream> doesn't
+// implement Debug, so .unwrap_err() cannot format the Ok branch for its panic.
+
+// Readdir error tests use a helper that erases the Ok type (stream) before
+// returning, which avoids the `'a` borrow of `fs` escaping into the result.
+// Directly holding a `ReplyDirectory<impl Stream + 'a>` in a match arm keeps
+// the `'a` borrow alive longer than the compiler can prove is safe.
+
+async fn readdir_err(fs: &RiftFilesystem, path: &str) -> fuse3::Errno {
+    let p = OsStr::new(path);
+    match fs.readdir(req(), p, 0, 0).await {
+        Err(e) => e,
+        Ok(_) => panic!("expected an error from readdir"),
+    }
+}
+
+#[tokio::test]
+async fn readdir_not_found_returns_enoent() {
+    let client = MockFsClient::new();
+    let fs = make_fs(client);
+    assert_eq!(
+        readdir_err(&fs, "/gone").await,
+        fuse3::Errno::from(libc::ENOENT)
+    );
+}
+
+#[tokio::test]
+async fn readdir_on_file_returns_enotdir() {
+    let client = MockFsClient::new().with_dir_error(b"file.txt", FsError::NotADirectory);
+    let fs = make_fs(client);
+    assert_eq!(
+        readdir_err(&fs, "/file.txt").await,
+        fuse3::Errno::from(libc::ENOTDIR)
+    );
+}
+
+#[tokio::test]
+async fn readdir_io_error_returns_eio() {
+    let client = MockFsClient::new().with_dir_error(b".", FsError::Io);
+    let fs = make_fs(client);
+    assert_eq!(readdir_err(&fs, "/").await, fuse3::Errno::from(libc::EIO));
+}
+
+#[tokio::test]
+async fn concurrent_getattr_calls_are_independent() {
+    use std::sync::Arc;
+    let client = MockFsClient::new()
+        .with_stat(b".", MockFsClient::dir_attrs())
+        .with_stat(b"a.txt", MockFsClient::file_attrs(1))
+        .with_stat(b"b.txt", MockFsClient::file_attrs(2))
+        .with_stat(b"c.txt", MockFsClient::file_attrs(3));
+    let fs = Arc::new(make_fs(client));
+
+    let handles: Vec<_> = ["/", "/a.txt", "/b.txt", "/c.txt"]
+        .iter()
+        .map(|p| {
+            let fs = Arc::clone(&fs);
+            let p = p.to_string();
+            tokio::spawn(async move { fs.getattr(req(), Some(OsStr::new(&p)), None, 0).await })
+        })
+        .collect();
+    for h in handles {
+        h.await.expect("task panicked").expect("getattr failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. FsError → errno mapping
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fserror_not_found_maps_to_enoent() {
+    assert_eq!(FsError::NotFound.to_errno(), libc::ENOENT);
+}
+
+#[test]
+fn fserror_not_a_directory_maps_to_enotdir() {
+    assert_eq!(FsError::NotADirectory.to_errno(), libc::ENOTDIR);
+}
+
+#[test]
+fn fserror_permission_denied_maps_to_eacces() {
+    assert_eq!(FsError::PermissionDenied.to_errno(), libc::EACCES);
+}
+
+#[test]
+fn fserror_io_maps_to_eio() {
+    assert_eq!(FsError::Io.to_errno(), libc::EIO);
 }

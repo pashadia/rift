@@ -28,7 +28,7 @@ rift-transport = { path = "../rift-transport" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rift-fuse = { path = "../rift-fuse" }
-fuser = { workspace = true }
+fuse3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

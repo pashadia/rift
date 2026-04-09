@@ -55,8 +55,6 @@ pub struct RiftClient {
     conn: QuicConnection,
     /// Opaque handle for the share root (from `RiftWelcome.root_handle`).
     root_handle: Vec<u8>,
-    /// Tokio runtime handle for driving async calls from sync FUSE callbacks.
-    rt: tokio::runtime::Handle,
 }
 
 impl RiftClient {
@@ -90,7 +88,6 @@ impl RiftClient {
         Ok(Self {
             conn,
             root_handle: welcome.root_handle,
-            rt: tokio::runtime::Handle::current(),
         })
     }
 
@@ -228,33 +225,6 @@ impl RiftClient {
             None => Err(anyhow::Error::from(FsError::Io)),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Sync wrappers (for fuser's OS threads)
-    // -----------------------------------------------------------------------
-
-    /// Synchronous `stat` for use from `fuser` OS threads.
-    ///
-    /// Uses `tokio::task::block_in_place` so this can be called safely from
-    /// both plain OS threads (fuser's thread pool) and from within a tokio
-    /// multi-thread runtime — in both cases the current thread is used to
-    /// drive the async I/O without deadlocking the executor.
-    ///
-    /// **Do not call this from a `current_thread` tokio runtime** — use
-    /// `.stat(handle).await` there instead.
-    pub fn stat_sync(&self, handle: &[u8]) -> Result<FileAttrs> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.stat(handle)))
-    }
-
-    /// Synchronous `lookup` for use from `fuser` OS threads.
-    pub fn lookup_sync(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.lookup(parent, name)))
-    }
-
-    /// Synchronous `readdir` for use from `fuser` OS threads.
-    pub fn readdir_sync(&self, handle: &[u8]) -> Result<Vec<ReaddirEntry>> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.readdir(handle)))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +235,7 @@ impl RiftClient {
 /// directly to `rift_fuse::mount()`.
 ///
 /// The async methods simply delegate to the corresponding `RiftClient` methods.
+/// fuse3 uses native Rust async traits (no `async_trait` macro needed).
 #[cfg(target_os = "linux")]
 #[async_trait::async_trait]
 impl rift_fuse::FsClient for RiftClient {

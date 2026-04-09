@@ -64,20 +64,17 @@ async fn main() -> Result<()> {
 
                 let client = rift_client::client::RiftClient::connect(addr, &share).await?;
 
-                println!(
-                    "Connected — server fingerprint: {}",
-                    // TODO(v1): surface server fingerprint from welcome/TLS
-                    "(see server stdout)"
-                );
+                // TODO(v1): surface server fingerprint from welcome/TLS
+                println!("Connected — server fingerprint: (see server stdout)");
 
-                let root_handle = client.root_handle().to_vec();
-                let rt = tokio::runtime::Handle::current();
-
-                let _session = rift_client::mount::mount(Box::new(client), root_handle, rt, &path)?;
+                let handle = rift_client::mount::mount(Box::new(client), &path).await?;
 
                 println!("Mounted '{}' at {}", share, path.display());
                 println!("Press Ctrl-C to unmount.");
-                tokio::signal::ctrl_c().await?;
+                tokio::select! {
+                    r = handle => { r.map_err(|e| anyhow::anyhow!("{e}"))? }
+                    _ = tokio::signal::ctrl_c() => {}
+                }
                 println!("\nUnmounting.");
             }
         }

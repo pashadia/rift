@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["Rift Contributors"]
 repository = "https://github.com/yourusername/rift"
@@ -35,8 +35,9 @@ prost = "0.13"
 prost-types = "0.13"
 prost-build = "0.13"
 
-# FUSE
-fuser = "0.14"
+# FUSE (git dependency — 0.9.0 on master fixes a docs.rs build issue)
+fuse3 = { git = "https://github.com/Sherlock-Holo/fuse3", features = ["tokio-runtime", "unprivileged"] }
+futures = "0.3"
 
 # Hashing and CDC
 blake3 = "1"

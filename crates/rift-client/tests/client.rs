@@ -203,48 +203,8 @@ async fn client_readdir_empty_subdir_returns_no_entries() {
     assert!(entries.is_empty(), "empty dir must return no entries");
 }
 
-// ---------------------------------------------------------------------------
-// FsClient sync wrappers (used by FUSE layer)
-// ---------------------------------------------------------------------------
-//
-// These verify that the sync wrappers correctly delegate to the async methods
-// without deadlocking.
-
-// multi_thread flavor required: block_in_place needs at least two worker
-// threads so the I/O callbacks can run while the calling thread is blocked.
-#[tokio::test(flavor = "multi_thread")]
-async fn fsclient_sync_stat_returns_attrs() {
-    #[cfg(target_os = "linux")]
-    {
-        use rift_protocol::messages::FileType;
-
-        let (_dir, root) = helpers::make_share();
-        let addr = helpers::start_server(root).await;
-        let client = rift_client::client::RiftClient::connect(addr, "demo")
-            .await
-            .unwrap();
-
-        // The sync wrapper must not deadlock inside a tokio multi-thread runtime.
-        let attrs = client.stat_sync(b".").expect("sync stat failed");
-        assert_eq!(attrs.file_type, FileType::Directory as i32);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn fsclient_sync_readdir_returns_entries() {
-    #[cfg(target_os = "linux")]
-    {
-        let (_dir, root) = helpers::make_share();
-        let addr = helpers::start_server(root).await;
-        let client = rift_client::client::RiftClient::connect(addr, "demo")
-            .await
-            .unwrap();
-
-        let entries = client.readdir_sync(b".").expect("sync readdir failed");
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"hello.txt"));
-    }
-}
+// (sync wrapper tests removed: fuse3 uses native async callbacks, so
+// RiftClient no longer needs stat_sync/readdir_sync/lookup_sync methods)
 
 // ---------------------------------------------------------------------------
 // Important: error code propagation
@@ -333,41 +293,5 @@ async fn client_operations_fail_after_connection_drops() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Important: sync wrappers must not deadlock when called from a std thread
-//
-// The FUSE library (`fuser`) calls Filesystem methods from non-tokio OS
-// threads.  The sync wrappers use `Handle::block_on` to drive async work.
-// If they were accidentally called from within a tokio worker thread they
-// would panic; but from a plain `std::thread` they must work correctly.
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn fsclient_sync_stat_works_from_std_thread() {
-    #[cfg(target_os = "linux")]
-    {
-        use rift_protocol::messages::FileType;
-        use std::sync::Arc;
-
-        let (_dir, root) = helpers::make_share();
-        let addr = helpers::start_server(root).await;
-        let client = Arc::new(
-            rift_client::client::RiftClient::connect(addr, "demo")
-                .await
-                .unwrap(),
-        );
-
-        // Spawn a plain OS thread — the same context fuser uses — and call the
-        // sync wrapper.  A panic here means `block_on` was incorrectly called
-        // from within an async context, or the Handle lifetime was wrong.
-        let client_clone = Arc::clone(&client);
-        std::thread::spawn(move || {
-            let attrs = client_clone
-                .stat_sync(b".")
-                .expect("stat_sync from std::thread failed");
-            assert_eq!(attrs.file_type, FileType::Directory as i32);
-        })
-        .join()
-        .expect("std::thread panicked — likely a nested-runtime or Handle issue");
-    }
-}
+// (std::thread sync wrapper test removed: fuse3 calls our async Filesystem
+// methods directly from tokio tasks — no OS thread blocking needed)
