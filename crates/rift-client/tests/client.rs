@@ -5,48 +5,16 @@
 //! mocking.  This verifies that the client correctly encodes requests, parses
 //! responses, and surfaces errors.
 
+mod common;
+use common as helpers;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 
-use rift_transport::RiftListener;
 use rift_common::FsError;
-
-// ---------------------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------------------
-
-mod helpers {
-    use super::*;
-    use rcgen::generate_simple_self_signed;
-
-    pub fn gen_cert(cn: &str) -> (Vec<u8>, Vec<u8>) {
-        let cert = generate_simple_self_signed(vec![cn.to_string()]).unwrap();
-        (cert.cert.der().to_vec(), cert.key_pair.serialize_der())
-    }
-
-    /// Populate a temp directory:
-    ///   <root>/hello.txt  (content "hello rift")
-    ///   <root>/subdir/
-    pub fn make_share() -> (TempDir, PathBuf) {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("hello.txt"), b"hello rift").unwrap();
-        std::fs::create_dir(root.join("subdir")).unwrap();
-        (dir, root)
-    }
-
-    /// Start a rift-server in a background task; return the bound address.
-    pub async fn start_server(share: PathBuf) -> SocketAddr {
-        let (cert, key) = gen_cert("rift-test-server");
-        let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
-            .expect("server_endpoint failed");
-        let addr = listener.local_addr();
-        tokio::spawn(rift_server::server::accept_loop(listener, share));
-        addr
-    }
-}
+use rift_transport::RiftListener;
 
 // ---------------------------------------------------------------------------
 // RiftClient construction
@@ -256,9 +224,7 @@ async fn client_lookup_not_found_is_fserror_not_found() {
         .lookup(client.root_handle(), "no_such_entry")
         .await
         .expect_err("lookup of missing entry must fail");
-    let fs_err = err
-        .downcast_ref::<FsError>()
-        .expect("must be FsError");
+    let fs_err = err.downcast_ref::<FsError>().expect("must be FsError");
     assert!(matches!(fs_err, FsError::NotFound));
 }
 

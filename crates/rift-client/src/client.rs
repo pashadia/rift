@@ -242,11 +242,7 @@ impl RiftClient {
 /// The async methods simply delegate to the corresponding `RiftClient` methods.
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 #[async_trait::async_trait]
-impl crate::fuse::RemoteShare for RiftClient {
-    async fn stat(&self, handle: &[u8]) -> Result<FileAttrs> {
-        self.stat(handle).await
-    }
-
+impl crate::remote::RemoteShare for RiftClient {
     async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
         self.lookup(parent, name).await
     }
@@ -255,21 +251,22 @@ impl crate::fuse::RemoteShare for RiftClient {
         self.readdir(handle).await
     }
 
-    async fn readdirplus(
+    async fn stat_batch(
         &self,
-        handle: &[u8],
-    ) -> anyhow::Result<Vec<(ReaddirEntry, FileAttrs)>> {
-        // TODO: Implement this properly on the server side with a new message type.
-        // For now, we simulate it by calling readdir and then looking up each entry.
-        // This is inefficient but gets the FUSE logic working.
-        let entries = self.readdir(handle).await?;
-        let mut results = Vec::with_capacity(entries.len());
-        for entry in entries {
-            // Note: `lookup` needs the parent handle, which we don't have here.
-            // This simulation will only work for flat directories where the entry's
-            // handle is its own name. This is a limitation we accept for now.
-            let (_child_handle, attrs) = self.lookup(handle, &entry.name).await?;
-            results.push((entry, attrs));
+        handles: Vec<Vec<u8>>,
+    ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
+        // This is a temporary implementation that makes N calls.
+        // TODO: Implement a real batch STAT message in the protocol.
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let result = self.stat(&handle).await;
+            match result {
+                Ok(attrs) => results.push(Ok(attrs)),
+                Err(e) => {
+                    let fs_error = e.downcast::<FsError>().unwrap_or(FsError::Io);
+                    results.push(Err(fs_error));
+                }
+            }
         }
         Ok(results)
     }

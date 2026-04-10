@@ -51,9 +51,9 @@ async fn main() -> Result<()> {
 
             #[cfg(all(target_os = "linux", feature = "fuse"))]
             {
-                use rift_client::fuse::RiftFilesystem;
                 use fuse3::path::Session;
                 use fuse3::MountOptions;
+                use rift_client::fuse::RiftFilesystem;
 
                 let addr: SocketAddr = server
                     .parse()
@@ -67,16 +67,17 @@ async fn main() -> Result<()> {
                 );
 
                 let client = rift_client::client::RiftClient::connect(addr, &share).await?;
-                
+                let view = rift_client::view::RiftShareView::new(std::sync::Arc::new(client));
+
                 println!(
                     "Connected — server fingerprint: {}",
-                    &client.server_fingerprint()
+                    "todo" // This needs to be exposed on the view or client
                 );
 
                 let mut options = MountOptions::default();
                 options.fs_name("rift");
 
-                let fs = RiftFilesystem::new(std::sync::Arc::new(client));
+                let fs = RiftFilesystem::new(std::sync::Arc::new(view));
                 let mut mount_handle = Session::new(options)
                     .mount_with_unprivileged(fs, &path)
                     .await?;

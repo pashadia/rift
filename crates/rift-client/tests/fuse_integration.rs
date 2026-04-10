@@ -5,12 +5,16 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::TempDir;
+use tokio::runtime::Handle;
 
-use rift_client::fuse::{path_to_handle, RemoteShare, RiftFilesystem};
+use rift_client::fuse::{path_to_handle, RiftFilesystem};
+use rift_client::remote::RemoteShare;
+use rift_client::view::{RiftShareView, ShareView};
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 
@@ -21,7 +25,7 @@ use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 struct MockRemoteShare {
     stats: HashMap<Vec<u8>, FileAttrs>,
     lookups: HashMap<(Vec<u8>, String), (Vec<u8>, FileAttrs)>,
-    dirplus: HashMap<Vec<u8>, Vec<(ReaddirEntry, FileAttrs)>>,
+    dirs: HashMap<Vec<u8>, Vec<ReaddirEntry>>,
 }
 
 impl MockRemoteShare {
@@ -29,7 +33,7 @@ impl MockRemoteShare {
         Self {
             stats: HashMap::new(),
             lookups: HashMap::new(),
-            dirplus: HashMap::new(),
+            dirs: HashMap::new(),
         }
     }
     fn with_stat(mut self, handle: &[u8], attrs: FileAttrs) -> Self {
@@ -41,15 +45,15 @@ impl MockRemoteShare {
             .insert((parent.to_vec(), name.to_string()), (child.to_vec(), attrs));
         self
     }
-    fn with_dirplus(mut self, handle: &[u8], entries: Vec<(ReaddirEntry, FileAttrs)>) -> Self {
-        self.dirplus.insert(handle.to_vec(), entries);
+    fn with_dir(mut self, handle: &[u8], entries: Vec<ReaddirEntry>) -> Self {
+        self.dirs.insert(handle.to_vec(), entries);
         self
     }
     fn dir_attrs() -> FileAttrs {
         FileAttrs {
             file_type: FileType::Directory as i32,
             nlinks: 2,
-            mode: 0o755, // rwxr-xr-x
+            mode: 0o755,
             uid: 1000,
             gid: 1000,
             ..Default::default()
@@ -60,7 +64,7 @@ impl MockRemoteShare {
             file_type: FileType::Regular as i32,
             size,
             nlinks: 1,
-            mode: 0o644, // rw-r--r--
+            mode: 0o644,
             uid: 1000,
             gid: 1000,
             ..Default::default()
@@ -77,26 +81,30 @@ impl MockRemoteShare {
 
 #[async_trait]
 impl RemoteShare for MockRemoteShare {
-    async fn stat(&self, handle: &[u8]) -> anyhow::Result<FileAttrs> {
-        self.stats
-            .get(handle)
-            .cloned()
-            .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
-    }
     async fn lookup(&self, parent: &[u8], name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)> {
         self.lookups
             .get(&(parent.to_vec(), name.to_string()))
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
     }
-    async fn readdir(&self, _handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
-        unimplemented!("readdir is not used in these tests")
-    }
-    async fn readdirplus(&self, handle: &[u8]) -> anyhow::Result<Vec<(ReaddirEntry, FileAttrs)>> {
-        self.dirplus
+    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
+        self.dirs
             .get(handle)
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
+    }
+    async fn stat_batch(
+        &self,
+        handles: Vec<Vec<u8>>,
+    ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
+        let mut results = Vec::new();
+        for handle in handles {
+            match self.stats.get(&handle) {
+                Some(attrs) => results.push(Ok(attrs.clone())),
+                None => results.push(Err(FsError::NotFound)),
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -118,9 +126,8 @@ fn path_to_handle_strips_leading_slash() {
 // Mount Fixture and Helpers
 // ---------------------------------------------------------------------------
 
-/// Mounts a filesystem with the given RemoteShare implementation.
-async fn mount<F: RemoteShare + 'static>(
-    client: F,
+async fn mount<V: ShareView + 'static>(
+    view: V,
     mountpoint: &std::path::Path,
 ) -> anyhow::Result<fuse3::raw::MountHandle> {
     use fuse3::path::Session;
@@ -129,14 +136,13 @@ async fn mount<F: RemoteShare + 'static>(
     let mut options = MountOptions::default();
     options.fs_name("rift");
 
-    let fs = RiftFilesystem::new(std::sync::Arc::new(client));
+    let fs = RiftFilesystem::new(Arc::new(view));
     let handle = Session::new(options)
         .mount_with_unprivileged(fs, mountpoint)
         .await?;
     Ok(handle)
 }
 
-/// Serialise mount tests to avoid fusermount3 fd-inheritance races.
 static MOUNT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct MountFixture {
@@ -145,12 +151,12 @@ struct MountFixture {
 }
 
 impl MountFixture {
-    async fn new<F: RemoteShare + 'static>(client: F) -> Self {
+    async fn new<R: RemoteShare + 'static>(remote: R) -> Self {
+        let view = RiftShareView::new(Arc::new(remote));
         let mount_point = TempDir::new().expect("Failed to create temp mount point");
-        let handle = mount(client, mount_point.path())
+        let handle = mount(view, mount_point.path())
             .await
             .expect("Failed to mount filesystem");
-        // Give FUSE time to initialize
         tokio::time::sleep(Duration::from_millis(100)).await;
         Self {
             mount_point,
@@ -189,7 +195,6 @@ async fn test_lookup_nonexistent_file() {
 // ---------------------------------------------------------------------------
 // Directory Listing and Traversal Tests
 // ---------------------------------------------------------------------------
-
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("rift_client::fuse=info")
@@ -206,13 +211,11 @@ async fn test_list_directory_long_format_succeeds() {
 
     let client = MockRemoteShare::new()
         .with_stat(b".", dir_attrs.clone())
-        .with_dirplus(
+        .with_dir(
             b".",
-            vec![(
-                MockRemoteShare::entry("file1.txt", FileType::Regular),
-                file_attrs,
-            )],
-        );
+            vec![MockRemoteShare::entry("file1.txt", FileType::Regular)],
+        )
+        .with_stat(b"file1.txt", file_attrs);
 
     let fixture = MountFixture::new(client).await;
     let path = fixture.path().to_path_buf();
@@ -262,13 +265,11 @@ fn mock_for_subdirectory() -> MockRemoteShare {
         .with_stat(b".", root_attrs)
         .with_lookup(b".", "subdir", b"subdir", subdir_attrs.clone())
         .with_stat(b"subdir", subdir_attrs)
-        .with_dirplus(
+        .with_dir(
             b"subdir",
-            vec![(
-                MockRemoteShare::entry("nested.txt", FileType::Regular),
-                nested_file_attrs,
-            )],
+            vec![MockRemoteShare::entry("nested.txt", FileType::Regular)],
         )
+        .with_stat(b"nested.txt", nested_file_attrs)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -278,7 +279,7 @@ async fn test_list_empty_directory() {
 
     let client = MockRemoteShare::new()
         .with_stat(b".", MockRemoteShare::dir_attrs())
-        .with_dirplus(b".", vec![]);
+        .with_dir(b".", vec![]);
 
     let fixture = MountFixture::new(client).await;
     let path = fixture.path().to_path_buf();
@@ -307,10 +308,9 @@ async fn test_list_nonexistent_directory() {
     let output =
         tokio::task::spawn_blocking(move || Command::new("ls").arg("-l").arg(&path).output())
             .await
-            .unwrap()
-            .expect("ls command failed to execute");
+            .unwrap();
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.as_ref().unwrap().status.success());
+    let stderr = String::from_utf8_lossy(&output.as_ref().unwrap().stderr);
     assert!(stderr.contains("No such file or directory"));
 }
