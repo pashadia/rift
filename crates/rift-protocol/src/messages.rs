@@ -4,6 +4,15 @@
 include!(concat!(env!("OUT_DIR"), "/rift.rs"));
 
 /// Message type ID constants — must match the type IDs in the framing codec.
+///
+/// These are plain `u8` constants with no compile-time link to their
+/// corresponding protobuf message types.  Nothing prevents passing a
+/// `StatRequest` payload with `LOOKUP_REQUEST` as the type ID, or vice versa;
+/// the mismatch will only surface as a decode error at the receiver.
+///
+/// TODO: Replace with a typed wrapper (e.g. a sealed `Frame<M: Message>` type
+/// or a `MessageType` enum with an associated `Message` type) so that
+/// `send_frame` can enforce the correct pairing at compile time.
 pub mod msg {
     // Handshake
     pub const RIFT_HELLO: u8 = 0x01;

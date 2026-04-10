@@ -37,6 +37,14 @@ use rift_protocol::messages::{
 ///   - Direct `..` traversal (`../../etc/passwd`).
 ///   - Absolute handles (`/etc/passwd` — `Path::join` replaces the base).
 ///   - Intermediate symlinks pointing outside the share.
+///
+/// # TODO(handles)
+///
+/// This function exists because handles are currently relative path strings
+/// (e.g. `b"subdir/file.txt"`).  Once handles become server-assigned opaque
+/// tokens, resolution will be a lookup in a server-side handle table rather
+/// than a filesystem path join.  The security invariants enforced here will
+/// move into the handle-issuance logic instead.
 pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
     if handle.contains(&0) {
         anyhow::bail!("null byte in handle");
@@ -183,6 +191,9 @@ pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
     };
 
     // The handle is the path relative to the share root (e.g. "subdir/file.txt").
+    // TODO(handles): Replace with a server-assigned opaque handle.  Path-based
+    // handles are invalidated by renames and expose filesystem structure to the
+    // client.  See docs/02-protocol-design/handle-design.md.
     let handle = child_canonical
         .strip_prefix(&share_canonical)
         .map(|rel| rel.to_string_lossy().into_owned().into_bytes())
@@ -222,6 +233,10 @@ pub fn readdir_response(payload: &[u8], share: &Path) -> ReaddirResponse {
         Err(e) => return readdir_error(io_err_kind_to_code(e.kind())),
     };
 
+    // TODO: This collects the entire directory into memory before pagination.
+    // For large directories this is wasteful and can hit the 16 MB codec limit.
+    // Future work: stream entries directly, or maintain a server-side cursor
+    // keyed by the `offset` field so only the requested window is materialised.
     let mut entries: Vec<ReaddirEntry> = read_dir
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -234,8 +249,11 @@ pub fn readdir_response(payload: &[u8], share: &Path) -> ReaddirResponse {
                 FileType::Regular as i32
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Handle is relative to the share root so the client can use it
-            // directly in subsequent stat/lookup/readdir calls.
+            // TODO(handles): Replace with a server-assigned opaque handle.
+            // Currently the handle is the path relative to the share root so
+            // the client can use it in subsequent calls.  Path-based handles
+            // are invalidated by renames and leak filesystem structure.
+            // See docs/02-protocol-design/handle-design.md.
             let handle = entry
                 .path()
                 .strip_prefix(&share_canonical)

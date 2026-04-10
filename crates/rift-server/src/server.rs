@@ -114,6 +114,9 @@ async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result
             let welcome = RiftWelcome {
                 protocol_version: RIFT_PROTOCOL_VERSION,
                 active_capabilities: vec![],
+                // TODO(handles): Issue a server-assigned opaque root handle instead of
+                // the literal `b"."`.  Until then the handle leaks path structure and
+                // is invalidated by any rename of the share root.
                 root_handle: b".".to_vec(),
                 max_concurrent_streams: 128,
                 share: Some(ShareInfo {
