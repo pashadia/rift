@@ -300,13 +300,9 @@ All core functionality to demonstrate the concept works:
 │  ┌─────────────────────┐  ┌────────────────────┐│
 │  │  rift-server crate  │  │  rift-client crate ││
 │  │  (authorization,    │  │  (operations,      ││
-│  │   share serving)    │  │   caching)         ││
-│  └─────────────────────┘  └─────────┬──────────┘│
-│                              ┌───────▼──────────┐│
-│                              │  rift-fuse crate ││
-│                              │  (FUSE mount,    ││
-│                              │   POSIX adapter) ││
-│                              └──────────────────┘│
+│  │   share serving)    │  │   caching,         ││
+│  └─────────────────────┘  │   FUSE mount)      ││
+│                            └────────────────────┘│
 └────────────┬──────────────────────────────────┬─┘
              │                                  │
 ┌────────────▼──────────────────────────────────▼─┐
@@ -343,31 +339,22 @@ All core functionality to demonstrate the concept works:
 - High performance (critical for filesystem operations)
 - Strong concurrency primitives (tokio async runtime)
 
-**Workspace structure (10 crates):**
+**Workspace structure (5 crates):**
 
 **Binaries:**
-- `riftd` - Server daemon
-- `rift` - Client CLI
+- `rift-server` - Server binary
+- `rift-client` - Client binary (includes optional FUSE mount via the `fuse` feature)
 
-**High-level libraries:**
-- `rift-server` - Authorization, shares, persistence
-- `rift-client` - High-level API for client operations
-- `rift-fuse` - FUSE mount implementation
-
-**Protocol layer:**
-- `rift-protocol` - Protobuf message types
-- `rift-wire` - Message framing
-- `rift-transport` - QUIC/TLS abstraction
-
-**Foundation:**
-- `rift-crypto` - BLAKE3, FastCDC, Merkle tree operations
+**Libraries:**
 - `rift-common` - Shared types, config parsing
+- `rift-protocol` - Protobuf message types + framing
+- `rift-transport` - QUIC/TLS abstraction
 
 **Key dependencies:**
 - `quinn` - QUIC implementation
 - `rustls` - TLS 1.3
 - `prost` - Protocol buffers
-- `fuser` - FUSE bindings
+- `fuse3` - FUSE bindings (Linux only, optional)
 - `blake3` - Hashing
 - `tokio` - Async runtime
 
@@ -394,7 +381,7 @@ cat /mnt/rift/data.txt
 ```
 
 **What happens:**
-1. Kernel FUSE layer → rift-fuse → rift-client
+1. Kernel FUSE layer → rift-client (FUSE module)
 2. Client sends `READ_REQUEST` over QUIC
 3. Server streams `BLOCK_HEADER + BLOCK_DATA` messages
 4. Client:
@@ -411,7 +398,7 @@ echo "new content" > /mnt/rift/config.toml
 ```
 
 **What happens:**
-1. rift-fuse receives `write()` call
+1. rift-client receives `write()` call via FUSE
 2. rift-client builds list of CDC chunks from new content
 3. Client sends `WRITE_REQUEST` with:
    - `expected_root_hash` (hash of old version)

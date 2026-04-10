@@ -216,7 +216,7 @@ message StatResult {
 - [ ] Implement `stat(handles: Vec<Handle>) -> Vec<StatResult>`
 - [ ] Helper: `stat_single(handle) -> FileAttrs` (wraps stat with 1 handle)
 
-### FUSE (rift-fuse crate)
+### FUSE (rift-client fuse module)
 - [ ] `readdir()`: Call client.readdir(), return names
 - [ ] `getattr()`: Call client.stat([handle])
 - [ ] Optimization: Cache handles from readdir for subsequent getattr calls

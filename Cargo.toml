@@ -8,9 +8,10 @@ members = [
     "crates/rift-client",
 ]
 
-# rift-fuse is Linux-only and requires FUSE to be installed
+# FUSE support is part of rift-client (enabled by the "fuse" feature, on by default).
+# It is Linux-only and requires FUSE to be installed:
 # Linux: sudo apt install libfuse3-dev (Ubuntu/Debian) or sudo dnf install fuse3-devel (Fedora/RHEL)
-# The crate will build on other platforms but all code is conditionally compiled out
+# On other platforms the feature is silently disabled and no FUSE code is compiled.
 
 [workspace.package]
 version = "0.1.0"

@@ -8,10 +8,10 @@
 
 ## Overview
 
-Rift uses a modular workspace architecture with 10 crates organized into 4 layers:
+Rift uses a modular workspace architecture with 9 crates organized into 4 layers:
 
 1. **Binary layer** (applications)
-2. **High-level library layer** (reusable business logic)
+2. **High-level library layer** (reusable business logic, including FUSE)
 3. **Protocol/transport layer** (wire protocol, network)
 4. **Foundation layer** (crypto, utilities)
 
@@ -35,7 +35,7 @@ rift/
 ├── rift/                   # Client CLI
 
 # High-level library crates (thiserror for errors)
-├── rift-client/            # High-level client API
+├── rift-client/            # High-level client API + FUSE (optional "fuse" feature, Linux only)
 ├── rift-server/            # Server business logic
 
 # Protocol layer (thiserror)
@@ -45,15 +45,14 @@ rift/
 # Transport layer (thiserror)
 ├── rift-transport/         # QUIC/TLS abstraction
 
-# Filesystem layer (thiserror)
-├── rift-fuse/              # FUSE implementation
-
 # Foundation layer (thiserror)
 ├── rift-crypto/            # BLAKE3, CDC, Merkle trees
 ├── rift-common/            # Shared types, config, utilities
 ```
 
-**Total:** 10 crates (2 binaries, 8 libraries)
+**Total:** 9 crates (2 binaries, 7 libraries)
+
+> **Note:** FUSE was previously a separate `rift-fuse` crate. It has been integrated into `rift-client` as an optional feature (`fuse`, on by default) that is only compiled on Linux. This simplifies the dependency graph and removes an unnecessary layer of indirection.
 
 ---
 
@@ -84,17 +83,13 @@ rift/
                     │ rift │ (binary)
                     └───┬──┘
                         │
-            ┌───────────┴───────────┐
-            │                       │
-       ┌────▼──────┐          ┌────▼─────┐
-       │rift-client│          │rift-fuse │
-       └────┬──────┘          └────┬─────┘
-            │                      │
-            └──────────┬───────────┘
-                       │
-        ┌──────────────┼──────────────┐
-        │              │              │
-   ┌────▼─────┐  ┌────▼────┐  ┌─────▼──────┐
+                   ┌────▼──────┐
+                   │rift-client│ (includes FUSE module when fuse feature enabled)
+                   └────┬──────┘
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+   ┌────▼─────┐  ┌─────▼───┐  ┌───────▼────┐
    │rift-wire│  │rift-    │  │rift-crypto│
    │          │  │transport│  │            │
    └────┬─────┘  └─────────┘  └────────────┘
@@ -186,13 +181,12 @@ async fn main() -> Result<()> {
 - Interactive prompts (TOFU confirmation, etc.)
 - Output formatting (table, JSON)
 - Certificate management commands
-- Thin wrapper around `rift-client` and `rift-fuse`
+- Thin wrapper around `rift-client` (which includes the FUSE module)
 
 **Dependencies:**
 ```toml
 [dependencies]
 rift-client.workspace = true
-rift-fuse.workspace = true
 rift-common.workspace = true
 tokio.workspace = true
 clap.workspace = true
@@ -238,9 +232,9 @@ async fn main() -> Result<()> {
 
 ### High-Level Library Crates
 
-#### `rift-client/` - High-Level Client API
+#### `rift-client/` - High-Level Client API + FUSE
 
-**Purpose:** Provides ergonomic client operations for both CLI and FUSE.
+**Purpose:** Provides ergonomic client operations for the CLI, and (on Linux) the FUSE filesystem implementation.
 
 **Responsibilities:**
 - Connect to server (using `rift-transport`)
@@ -253,6 +247,7 @@ async fn main() -> Result<()> {
 - Handle retries, timeouts
 - Manage connection pool
 - Session state management
+- **FUSE mount** (when `fuse` feature is enabled, Linux only): translate FUSE ops to client calls, manage the `fuse3` session
 
 **Dependencies:**
 ```toml
@@ -265,6 +260,15 @@ rift-common.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuse3 = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["fuse"]
+fuse = ["dep:fuse3", "dep:futures", "dep:libc"]
 ```
 
 **Error handling:** `thiserror` with `ClientError` enum
@@ -283,9 +287,15 @@ impl RiftClient {
     pub async fn list_dir(&self, share: &str, path: &Path) -> Result<Vec<DirEntry>, ClientError>;
     // ... more operations
 }
+
+// Linux only, requires "fuse" feature
+pub mod fuse {
+    pub struct RiftFilesystem<F: RemoteShare> { /* ... */ }
+    pub trait RemoteShare { /* async stat, lookup, readdir, readdirplus */ }
+}
 ```
 
-**Why separate:** Both `rift` CLI and `rift-fuse` need these operations. Future GUI client can use this directly.
+**Why combined:** The FUSE layer is tightly coupled to the client operations. Keeping it as a feature of `rift-client` avoids an unnecessary adapter crate and lets the client implement the `RemoteShare` trait directly. Future GUI clients can still use `rift-client` directly.
 
 ---
 
@@ -527,56 +537,6 @@ impl ClientCertVerifier for AcceptAnyCertVerifier {
 - Transport logic is independent of protocol
 - Could be reused for other QUIC-based tools
 - Isolates `quinn` API changes (easier to migrate to `quiche` later)
-
----
-
-### Filesystem Layer
-
-#### `rift-fuse/` - FUSE Implementation
-
-**Purpose:** Translate FUSE operations to Rift client operations.
-
-**Responsibilities:**
-- Implement `fuser::Filesystem` trait
-- Translate FUSE ops to `rift-client` calls
-- File handle management
-- Metadata caching (optional, for performance)
-- Inode number generation
-
-**Dependencies:**
-```toml
-[dependencies]
-rift-client.workspace = true
-rift-common.workspace = true
-fuser.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-```
-
-**Error handling:** `thiserror` with `FuseError` enum
-
-**Public API:**
-```rust
-pub struct RiftFilesystem { /* ... */ }
-
-impl RiftFilesystem {
-    pub fn new(client: RiftClient, share: String) -> Self;
-    pub fn mount(&self, mountpoint: &Path) -> Result<(), FuseError>;
-}
-
-impl fuser::Filesystem for RiftFilesystem {
-    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry);
-    fn getattr(&mut self, req: &Request, ino: u64, reply: ReplyAttr);
-    fn read(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, size: u32, flags: i32, lock_owner: Option<u64>, reply: ReplyData);
-    fn write(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, data: &[u8], write_flags: u32, flags: i32, lock_owner: Option<u64>, reply: ReplyWrite);
-    // ... more FUSE operations
-}
-```
-
-**Why separate:**
-- FUSE is only needed by client
-- Isolates FUSE-specific logic from general client logic
-- Could be used by other tools (e.g., custom mount daemon)
 
 ---
 
@@ -846,7 +806,6 @@ members = [
     "rift-protocol",
     "rift-wire",
     "rift-transport",
-    "rift-fuse",
     "rift-crypto",
     "rift-common",
 ]
@@ -871,8 +830,9 @@ rustls = "0.23"
 prost = "0.12"
 serde = { version = "1", features = ["derive"] }
 
-# FUSE
-fuser = "0.14"
+# FUSE (Linux only, optional — used by rift-client's "fuse" feature)
+fuse3 = { git = "https://github.com/Sherlock-Holo/fuse3", features = ["tokio-runtime", "unprivileged"] }
+futures = "0.3"
 
 # Crypto
 blake3 = "1"
@@ -900,7 +860,6 @@ rift-crypto = { path = "rift-crypto" }
 rift-common = { path = "rift-common" }
 rift-client = { path = "rift-client" }
 rift-server = { path = "rift-server" }
-rift-fuse = { path = "rift-fuse" }
 
 [workspace.dependencies.prost-build]
 version = "0.12"
@@ -1174,17 +1133,14 @@ async fn test_with_temp_config() {
 - `rift-wire`: ~8s (depends on both)
 
 **Layer 4 - High-level (parallel after wire):**
-- `rift-client`: ~10s
+- `rift-client`: ~10s (includes FUSE module compilation on Linux)
 - `rift-server`: ~10s
 
-**Layer 5 - Filesystem (after client):**
-- `rift-fuse`: ~8s (`fuser`)
-
-**Layer 6 - Binaries (parallel after high-level):**
+**Layer 5 - Binaries (parallel after high-level):**
 - `rift`: ~5s (minimal additional code)
 - `riftd`: ~5s (minimal additional code)
 
-**Total clean build: ~40-50s** (with 8-core CPU, parallel compilation enabled)
+**Total clean build: ~35-45s** (with 8-core CPU, parallel compilation enabled)
 
 ### Incremental Build Examples
 
@@ -1201,7 +1157,7 @@ async fn test_with_temp_config() {
 **Modify protocol definition (`.proto` file):**
 - Recompile: `rift-protocol`, `rift-wire`, `rift-client`, `rift-server`, `rift`, `riftd`
 - Time: ~15-20s
-- No recompilation: `rift-crypto`, `rift-common`, `rift-transport`, `rift-fuse`
+- No recompilation: `rift-crypto`, `rift-common`, `rift-transport`
 
 **Modify crypto function (`rift-crypto`):**
 - Recompile: `rift-crypto`, `rift-client`, `rift-server`, `rift`, `riftd`
@@ -1222,7 +1178,7 @@ async fn test_with_temp_config() {
 - Easy to reason about where code belongs
 
 **2. Compilation times:**
-- Changing server logic doesn't recompile client FUSE code
+- Changing server logic doesn't recompile client code
 - Changing CLI UX doesn't recompile protocol definitions
 - Protocol and crypto crates are stable (rarely recompile)
 - Parallel compilation of independent crates
@@ -1239,12 +1195,12 @@ async fn test_with_temp_config() {
 - `rift-transport` can be used for other QUIC projects
 
 **5. Future flexibility:**
-- Can swap FUSE for NFSv4 kernel module without touching protocol
+- Can replace FUSE with an NFSv4 kernel module without touching protocol or transport
 - Can swap wire format (e.g., add encryption) without changing protocol types
 - Can embed server (`rift-server`) in other applications
 
 **6. Dependency isolation:**
-- FUSE dependency only in `rift-fuse` (not pulled by server)
+- FUSE dependency only in `rift-client` (optional, not pulled by server)
 - `quinn` and `rustls` isolated in `rift-transport` (easier to swap)
 - Protobuf codegen isolated in `rift-protocol`
 
@@ -1450,28 +1406,29 @@ Separate crates for:
 
 ### Phase 4: Filesystem (Week 5)
 
-8. **`rift-fuse`** (mount command)
-   - FUSE filesystem implementation
-   - File handle management
-   - Integrate with `rift-client`
+8. **`rift-client` FUSE module** (mount command, `fuse` feature)
+   - FUSE filesystem implementation (`fuse3` path interface)
+   - `RemoteShare` trait + `RiftFilesystem` implementation
+   - Already integrated into `rift-client` (no separate crate needed)
 
 ---
 
 ## Summary
 
 **Final crate structure:**
-- ✅ 10 crates (2 binaries, 8 libraries)
+- ✅ 9 crates (2 binaries, 7 libraries)
+- ✅ FUSE integrated into `rift-client` as an optional feature (no separate crate)
 - ✅ Clear layering (foundation → protocol → high-level → binary)
 - ✅ No circular dependencies
 - ✅ Modular, testable, reusable
-- ✅ ~40-50s clean builds, ~2-5s incremental builds
+- ✅ ~35-45s clean builds, ~2-5s incremental builds
 - ✅ Error handling: `thiserror` for libraries, `anyhow` for binaries
 
 **Benefits:**
 - Fast incremental compilation (change server, don't recompile client)
 - Isolated testing (test each component independently)
 - Reusability (libraries can be used by future tools)
-- Future flexibility (swap FUSE, wire format, etc.)
+- Future flexibility (swap FUSE module, wire format, etc.)
 
 **Risks:**
 - Workspace overhead (10 `Cargo.toml` files)
@@ -1490,4 +1447,4 @@ Separate crates for:
 4. Implement foundation layer (`rift-common`, `rift-protocol`, `rift-crypto`)
 5. Implement transport layer (`rift-transport`, `rift-wire`)
 6. Implement business logic (`rift-server`, `rift-client`)
-7. Implement applications (`riftd`, `rift`, `rift-fuse`)
+7. Implement applications (`riftd`, `rift`)

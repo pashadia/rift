@@ -101,9 +101,9 @@ Rift uses a simpler two-component architecture:
 clients. No replication in PoC. The server is stateful (it tracks write
 locks and active sessions), but does not maintain per-client cache state.
 
-**rift + rift-fuse** (client): A user-space client library that communicates
-with the server over QUIC, plus a FUSE driver that exposes the share as a
-POSIX mount. Client-side state (Merkle trees, chunk cache) is stored in
+**rift-client** (client): A user-space client that communicates with the
+server over QUIC and exposes the share as a POSIX mount via an integrated
+FUSE driver (Linux, optional `fuse` feature). Client-side state (Merkle trees, chunk cache) is stored in
 `/var/lib/rift/`. The client handles delta sync, integrity verification,
 and resumable transfers.
 

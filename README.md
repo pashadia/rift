@@ -32,11 +32,7 @@ cargo test
 cargo build --release
 ```
 
-**Note:** The `rift-fuse` crate is excluded by default as it requires FUSE to be installed:
-- **macOS:** Install [macFUSE](https://osxfuse.github.io/)
-- **Linux:** Install `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
-
-To include `rift-fuse` in the build, uncomment it in the root `Cargo.toml`.
+**Note:** FUSE support is built into `rift-client` and enabled by the `fuse` feature (on by default). It is Linux-only and requires `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL). On other platforms the feature is silently disabled.
 
 ## Project Status
 

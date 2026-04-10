@@ -19,8 +19,8 @@ Every filesystem operation through FUSE follows this path:
 
 ```
 Application → syscall → VFS → FUSE kernel driver → /dev/fuse →
-  context switch to userspace → rift-fuse daemon → QUIC → network →
-  QUIC → rift-fuse daemon → /dev/fuse → context switch to kernel →
+  context switch to userspace → rift-client (FUSE) → QUIC → network →
+  QUIC → rift-client (FUSE) → /dev/fuse → context switch to kernel →
   FUSE kernel driver → VFS → Application
 ```
 

@@ -114,8 +114,8 @@ Rift's current architecture (v1.0):
 per-file Merkle trees, and enforces authorization via client TLS
 certificates.
 
-**rift-client + rift-fuse**: Client library and FUSE driver that mount a
-server's share as a POSIX filesystem. Client handles CDC chunking, Merkle
+**rift-client**: Client binary with an integrated FUSE driver (Linux, optional
+`fuse` feature) that mounts a server's share as a POSIX filesystem. Client handles CDC chunking, Merkle
 tree construction, and delta sync.
 
 **No multi-server support** in v1.0. If the server is unreachable, the

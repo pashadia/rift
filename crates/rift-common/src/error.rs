@@ -9,7 +9,7 @@
 //! - **`FsError`** — filesystem-operation failures that map directly to POSIX
 //!   errno values.  Used by `FsClient` implementations (in `rift-client`) to
 //!   express why an operation failed, and consumed by the FUSE layer (in
-//!   `rift-fuse`) to reply with the correct errno.  Unit variants: no message
+//!   `rift-client`'s `fuse` module) to reply with the correct errno.  Unit variants: no message
 //!   needed because the errno is the communication channel to the kernel.
 //!
 //! Keeping them separate prevents the application error type from growing POSIX
@@ -122,6 +122,6 @@ mod tests {
     }
 
     // NOTE: the anyhow downcast pattern (anyhow::Error::from(FsError::NotFound)
-    // followed by err.downcast_ref::<FsError>()) is tested in rift-fuse where
-    // anyhow is a direct dependency.
+    // followed by err.downcast_ref::<FsError>()) is tested in rift-client's fuse
+    // integration tests where anyhow is a direct dependency.
 }

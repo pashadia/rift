@@ -316,16 +316,17 @@ rift/
 ├── rift-protocol/      # Protocol message types (library)
 ├── rift-wire/          # Message framing, stream handling (library)
 
-# Transport and filesystem
+# Transport
 ├── rift-transport/     # QUIC/TLS abstraction (library)
-├── rift-fuse/          # FUSE client implementation (library)
 
 # Foundation
 ├── rift-crypto/        # BLAKE3, CDC, Merkle trees (library)
 └── rift-common/        # Shared utilities (library)
 ```
 
-**Total:** 10 crates (2 binaries, 8 libraries)
+Note: FUSE is part of `rift-client` (optional `fuse` feature, Linux only) rather than a separate crate.
+
+**Total:** 9 crates (2 binaries, 7 libraries)
 
 **Error handling by crate:**
 - Libraries (rift-protocol, rift-crypto, etc.): `thiserror`
@@ -403,7 +404,6 @@ members = [
     "rift-protocol",
     "rift-crypto",
     "rift-transport",
-    "rift-fuse",
     "rift-common",
 ]
 resolver = "2"
