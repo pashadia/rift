@@ -67,12 +67,10 @@ async fn main() -> Result<()> {
                 );
 
                 let client = rift_client::client::RiftClient::connect(addr, &share).await?;
+                let fingerprint = client.server_fingerprint().to_string();
                 let view = rift_client::view::RiftShareView::new(std::sync::Arc::new(client));
 
-                println!(
-                    "Connected — server fingerprint: {}",
-                    "todo" // This needs to be exposed on the view or client
-                );
+                println!("Connected — server fingerprint: {fingerprint}");
 
                 let mut options = MountOptions::default();
                 options.fs_name("rift");

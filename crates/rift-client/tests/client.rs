@@ -8,13 +8,7 @@
 mod common;
 use common as helpers;
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-
-use tempfile::TempDir;
-
 use rift_common::FsError;
-use rift_transport::RiftListener;
 
 // ---------------------------------------------------------------------------
 // RiftClient construction

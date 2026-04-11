@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use tokio::runtime::Handle;
 
 use rift_client::fuse::{path_to_handle, RiftFilesystem};
 use rift_client::remote::RemoteShare;
@@ -100,7 +99,7 @@ impl RemoteShare for MockRemoteShare {
         let mut results = Vec::new();
         for handle in handles {
             match self.stats.get(&handle) {
-                Some(attrs) => results.push(Ok(attrs.clone())),
+                Some(attrs) => results.push(Ok(*attrs)),
                 None => results.push(Err(FsError::NotFound)),
             }
         }
@@ -210,7 +209,7 @@ async fn test_list_directory_long_format_succeeds() {
     let dir_attrs = MockRemoteShare::dir_attrs();
 
     let client = MockRemoteShare::new()
-        .with_stat(b".", dir_attrs.clone())
+        .with_stat(b".", dir_attrs)
         .with_dir(
             b".",
             vec![MockRemoteShare::entry("file1.txt", FileType::Regular)],
@@ -263,8 +262,8 @@ fn mock_for_subdirectory() -> MockRemoteShare {
 
     MockRemoteShare::new()
         .with_stat(b".", root_attrs)
-        .with_lookup(b".", "subdir", b"subdir", subdir_attrs.clone())
-        .with_stat(b"subdir", subdir_attrs)
+        .with_lookup(b".", "subdir", b"subdir", subdir_attrs)
+        .with_stat(b"subdir", MockRemoteShare::dir_attrs())
         .with_dir(
             b"subdir",
             vec![MockRemoteShare::entry("nested.txt", FileType::Regular)],

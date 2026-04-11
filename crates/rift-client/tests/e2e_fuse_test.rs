@@ -32,7 +32,7 @@ async fn test_ls_on_real_server_succeeds() {
     // 3. Mount the filesystem
     let mount_point = TempDir::new().expect("Failed to create temp mount point");
     let session = fuse3::path::Session::new(fuse3::MountOptions::default());
-    let mut mount_handle = session
+    let mount_handle = session
         .mount_with_unprivileged(fs, mount_point.path())
         .await
         .expect("mount failed");
