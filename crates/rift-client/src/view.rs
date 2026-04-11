@@ -41,7 +41,7 @@ impl<R: RemoteShare> RiftShareView<R> {
 
 #[async_trait]
 impl<R: RemoteShare> ShareView for RiftShareView<R> {
-    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
+    #[instrument(skip(self), fields(handle_len = handle.len()))]
     async fn getattr(&self, handle: &[u8]) -> Result<FileAttrs, FsError> {
         self.remote
             .stat_batch(vec![handle.to_vec()])
@@ -50,7 +50,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .remove(0)
     }
 
-    #[instrument(skip(self), fields(parent_len = parent.len(), name = %name), err)]
+    #[instrument(skip(self), fields(parent_len = parent.len(), name = %name))]
     async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs), FsError> {
         self.remote
             .lookup(parent, name)
@@ -58,7 +58,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))
     }
 
-    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
+    #[instrument(skip(self), fields(handle_len = handle.len()))]
     async fn readdirplus(&self, handle: &[u8]) -> Result<Vec<(ReaddirEntry, FileAttrs)>, FsError> {
         let entries = self
             .remote

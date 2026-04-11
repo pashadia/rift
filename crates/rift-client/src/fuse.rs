@@ -92,7 +92,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     #[instrument(skip(self), level = "debug")]
     async fn destroy(&self, _req: Request) {}
 
-    #[instrument(skip(self), fields(path = ?path), level = "debug", err)]
+    #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn getattr(
         &self,
         _req: Request,
@@ -109,7 +109,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
-    #[instrument(skip(self), fields(parent = ?parent, name = ?name), level = "debug", err)]
+    #[instrument(skip(self), fields(parent = ?parent, name = ?name), level = "debug")]
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Fuse3Result<ReplyEntry> {
         let parent_handle = path_to_handle(parent);
         let name_str = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
@@ -124,12 +124,12 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
-    #[instrument(skip(self), fields(path = ?path), level = "debug", err)]
+    #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn opendir(&self, _req: Request, path: &OsStr, _flags: u32) -> Fuse3Result<ReplyOpen> {
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
-    #[instrument(skip(self), fields(path = ?path, offset = offset), level = "debug", err)]
+    #[instrument(skip(self), fields(path = ?path, offset = offset), level = "debug")]
     async fn readdir<'a>(
         &'a self,
         _req: Request,
@@ -157,7 +157,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
-    #[instrument(skip(self), fields(path = ?path, offset = offset), level = "debug", err)]
+    #[instrument(skip(self), fields(path = ?path, offset = offset), level = "debug")]
     async fn readdirplus<'a>(
         &'a self,
         _req: Request,
@@ -190,7 +190,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
-    #[instrument(skip(self), fields(path = ?path), level = "debug", err)]
+    #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn releasedir(
         &self,
         _req: Request,

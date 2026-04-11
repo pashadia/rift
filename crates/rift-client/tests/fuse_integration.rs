@@ -196,7 +196,7 @@ async fn test_lookup_nonexistent_file() {
 // ---------------------------------------------------------------------------
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("rift_client::fuse=info")
+        .with_env_filter("rift_client=warn")
         .try_init();
 }
 
