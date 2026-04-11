@@ -14,6 +14,7 @@ use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::instrument;
 
 /// Attribute TTL: how long the kernel may cache attrs before rechecking.
 const TTL: Duration = Duration::from_secs(1);
@@ -83,12 +84,15 @@ impl<V: ShareView> RiftFilesystem<V> {
 }
 
 impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
+    #[instrument(skip(self), level = "debug")]
     async fn init(&self, _req: Request) -> Fuse3Result<ReplyInit> {
         Ok(ReplyInit::new(NonZeroU32::new(16 * 1024 * 1024).unwrap()))
     }
 
+    #[instrument(skip(self), level = "debug")]
     async fn destroy(&self, _req: Request) {}
 
+    #[instrument(skip(self), fields(path = ?path), level = "debug", err)]
     async fn getattr(
         &self,
         _req: Request,
@@ -96,7 +100,6 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         _fh: Option<u64>,
         _flags: u32,
     ) -> Fuse3Result<ReplyAttr> {
-        tracing::info!(path = ?path, "FUSE getattr");
         let path = path.ok_or_else(|| Errno::from(libc::ENOSYS))?;
         let handle = path_to_handle(path);
         let attrs = self.view.getattr(&handle).await.map_err(to_errno)?;
@@ -106,8 +109,8 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
+    #[instrument(skip(self), fields(parent = ?parent, name = ?name), level = "debug", err)]
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Fuse3Result<ReplyEntry> {
-        tracing::info!(parent = ?parent, name = ?name, "FUSE lookup");
         let parent_handle = path_to_handle(parent);
         let name_str = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
         let (_child_handle, attrs) = self
@@ -121,10 +124,12 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
-    async fn opendir(&self, _req: Request, _path: &OsStr, _flags: u32) -> Fuse3Result<ReplyOpen> {
+    #[instrument(skip(self), fields(path = ?path), level = "debug", err)]
+    async fn opendir(&self, _req: Request, path: &OsStr, _flags: u32) -> Fuse3Result<ReplyOpen> {
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
+    #[instrument(skip(self), fields(path = ?path, offset = offset), level = "debug", err)]
     async fn readdir<'a>(
         &'a self,
         _req: Request,
@@ -133,7 +138,6 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         offset: i64,
     ) -> Fuse3Result<ReplyDirectory<impl Stream<Item = Fuse3Result<DirectoryEntry>> + Send + 'a>>
     {
-        tracing::info!(path = ?path, offset = offset, "FUSE readdir");
         let handle = path_to_handle(path);
         let entries = self.view.readdirplus(&handle).await.map_err(to_errno)?;
 
@@ -153,6 +157,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
+    #[instrument(skip(self), fields(path = ?path, offset = offset), level = "debug", err)]
     async fn readdirplus<'a>(
         &'a self,
         _req: Request,
@@ -163,7 +168,6 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     ) -> Fuse3Result<
         ReplyDirectoryPlus<impl Stream<Item = Fuse3Result<DirectoryEntryPlus>> + Send + 'a>,
     > {
-        tracing::info!(path = ?path, offset = offset, "FUSE readdirplus");
         let handle = path_to_handle(path);
         let entries = self.view.readdirplus(&handle).await.map_err(to_errno)?;
 
@@ -186,10 +190,11 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
+    #[instrument(skip(self), fields(path = ?path), level = "debug", err)]
     async fn releasedir(
         &self,
         _req: Request,
-        _path: &OsStr,
+        path: &OsStr,
         _fh: u64,
         _flags: u32,
     ) -> Fuse3Result<()> {

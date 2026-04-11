@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tracing::instrument;
 
 use crate::TransportError;
 
@@ -122,6 +123,7 @@ impl InMemoryConnection {
 impl RiftConnection for InMemoryConnection {
     type Stream = InMemoryStream;
 
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()), err)]
     async fn open_stream(&self) -> Result<InMemoryStream, TransportError> {
         if self.is_closed() {
             return Err(TransportError::ConnectionClosed);
@@ -140,6 +142,7 @@ impl RiftConnection for InMemoryConnection {
         })
     }
 
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()), err)]
     async fn accept_stream(&self) -> Result<InMemoryStream, TransportError> {
         let mut rx = self.stream_rx.lock().await;
         let (tx, rx_frames) = rx.recv().await.ok_or(TransportError::ConnectionClosed)?;
@@ -166,6 +169,7 @@ pub struct InMemoryStream {
 
 #[async_trait]
 impl RiftStream for InMemoryStream {
+    #[instrument(skip(self), fields(type_id = type_id, payload_len = payload.len()), err)]
     async fn send_frame(&mut self, type_id: u8, payload: &[u8]) -> Result<(), TransportError> {
         self.tx
             .as_ref()
@@ -174,12 +178,14 @@ impl RiftStream for InMemoryStream {
             .map_err(|_| TransportError::StreamClosed)
     }
 
+    #[instrument(skip(self), err)]
     async fn recv_frame(&mut self) -> Result<Option<(u8, Bytes)>, TransportError> {
         Ok(self.rx.recv().await)
     }
 
     /// Drop the sender half to half-close the send side, mirroring QUIC semantics:
     /// the remote's `recv_frame` will return `None` once the channel drains.
+    #[instrument(skip(self))]
     async fn finish_send(&mut self) -> Result<(), TransportError> {
         self.tx = None;
         Ok(())

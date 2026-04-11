@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tracing::instrument;
 
 use crate::connection::{InMemoryConnection, RiftConnection};
 use crate::TransportError;
@@ -87,6 +88,7 @@ impl InMemoryListener {
 impl RiftListener for InMemoryListener {
     type Connection = InMemoryConnection;
 
+    #[instrument(skip(self), fields(addr = %self.local_addr()), err)]
     async fn accept(&self) -> Result<InMemoryConnection, TransportError> {
         let mut rx = self.rx.lock().await;
         rx.recv().await.ok_or(TransportError::ConnectionClosed)
@@ -105,6 +107,7 @@ impl InMemoryConnector {
     ///
     /// Returns `Err(TransportError::ConnectionClosed)` if the listener has
     /// been dropped.
+    #[instrument(skip(self), fields(server_fp = %self.server_fingerprint), err)]
     pub fn connect(&self) -> Result<InMemoryConnection, TransportError> {
         let (client, server) = InMemoryConnection::pair_with_fingerprints(
             &self.server_fingerprint,

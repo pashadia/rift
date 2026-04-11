@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use tracing::instrument;
 
 use rift_protocol::codec;
 
@@ -31,6 +32,7 @@ pub struct QuicListener {
 impl RiftListener for QuicListener {
     type Connection = QuicConnection;
 
+    #[instrument(skip(self), fields(local_addr = %self.local_addr()), err)]
     async fn accept(&self) -> Result<QuicConnection, TransportError> {
         let incoming = self
             .endpoint
@@ -74,6 +76,7 @@ impl QuicConnection {
     ///
     /// Any in-flight streams will be reset.  Pending `open_stream` or
     /// `accept_stream` calls will return `TransportError::ConnectionClosed`.
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint))]
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.inner.close(0u32.into(), b"closed by client");
@@ -94,11 +97,13 @@ impl Clone for QuicConnection {
 impl RiftConnection for QuicConnection {
     type Stream = QuicStream;
 
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()), err)]
     async fn open_stream(&self) -> Result<QuicStream, TransportError> {
         let (send, recv) = self.inner.open_bi().await?;
         Ok(QuicStream::new(send, recv))
     }
 
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()), err)]
     async fn accept_stream(&self) -> Result<QuicStream, TransportError> {
         let (send, recv) = self
             .inner
@@ -141,6 +146,7 @@ impl QuicStream {
 
 #[async_trait]
 impl RiftStream for QuicStream {
+    #[instrument(skip(self), fields(type_id = type_id, payload_len = payload.len()), err)]
     async fn send_frame(&mut self, type_id: u8, payload: &[u8]) -> Result<(), TransportError> {
         let mut buf = BytesMut::new();
         codec::encode_message(type_id, payload, &mut buf)?;
@@ -148,10 +154,16 @@ impl RiftStream for QuicStream {
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     async fn recv_frame(&mut self) -> Result<Option<(u8, Bytes)>, TransportError> {
         loop {
             // Try to decode a complete frame from the already-buffered bytes.
             if let Some((type_id, payload)) = codec::decode_message(&mut self.read_buf)? {
+                tracing::debug!(
+                    type_id = type_id,
+                    payload_len = payload.len(),
+                    "decoded frame from buffer"
+                );
                 return Ok(Some((type_id, Bytes::from(payload))));
             }
 
@@ -175,6 +187,7 @@ impl RiftStream for QuicStream {
     }
 
     /// Half-close the send side.  The receive side remains open.
+    #[instrument(skip(self))]
     async fn finish_send(&mut self) -> Result<(), TransportError> {
         // `finish()` returns Err(ClosedStream) only if already finished — ignore.
         let _ = self.send.finish();
@@ -190,6 +203,7 @@ impl RiftStream for QuicStream {
 ///
 /// In quinn 0.11 with rustls 0.23, `peer_identity()` returns the peer cert
 /// chain as `Box<dyn Any>` which downcasts to `Vec<CertificateDer<'static>>`.
+#[instrument(skip(conn), level = "debug")]
 pub(crate) fn extract_peer_fingerprint(conn: &quinn::Connection) -> Result<String, TransportError> {
     use rustls::pki_types::CertificateDer;
 

@@ -19,6 +19,7 @@
 //! ```
 
 use prost::Message as _;
+use tracing::instrument;
 
 use rift_protocol::messages::msg;
 pub use rift_protocol::messages::{RiftHello, RiftWelcome};
@@ -38,6 +39,7 @@ pub const RIFT_PROTOCOL_VERSION: u32 = 1;
 /// This is the complete client-side handshake in one call.
 /// `capabilities` is the list of optional capability enum values (as `i32`)
 /// the client wishes to negotiate; pass `&[]` for none.
+#[instrument(skip(stream), fields(share_name = %share_name, capabilities_len = capabilities.len()), err)]
 pub async fn client_handshake<S: RiftStream>(
     stream: &mut S,
     share_name: &str,
@@ -81,6 +83,7 @@ pub async fn client_handshake<S: RiftStream>(
 ///
 /// Returns `Err` if the first frame is not `RIFT_HELLO` or the payload cannot
 /// be decoded.
+#[instrument(skip(stream), err)]
 pub async fn recv_hello<S: RiftStream>(stream: &mut S) -> Result<RiftHello, TransportError> {
     match stream.recv_frame().await? {
         None => Err(TransportError::Codec(rift_protocol::codec::CodecError::Io(
@@ -105,6 +108,7 @@ pub async fn recv_hello<S: RiftStream>(stream: &mut S) -> Result<RiftHello, Tran
 ///
 /// Called by the server after it has validated the `RiftHello` and decided
 /// what capabilities and root handle to offer.
+#[instrument(skip(stream), fields(root_handle_len = welcome.root_handle.len()), err)]
 pub async fn send_welcome<S: RiftStream>(
     stream: &mut S,
     welcome: RiftWelcome,

@@ -19,6 +19,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::ClientCertVerified;
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use tracing::instrument;
 
 use crate::fingerprint::cert_fingerprint;
 use crate::policy::FingerprintPolicy;
@@ -223,6 +224,7 @@ pub fn client_endpoint_no_cert() -> Result<ClientEndpoint, TransportError> {
 
 /// Establish a QUIC connection to a Rift server, verifying the server cert
 /// using `policy`.
+#[instrument(skip(endpoint), fields(addr = %server_addr, server_name = %server_name), err)]
 pub async fn connect<P>(
     endpoint: &ClientEndpoint,
     server_addr: SocketAddr,

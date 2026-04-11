@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use prost::Message as _;
+use tracing::instrument;
 
 use rift_protocol::messages::{
     lookup_response, readdir_response, stat_result, ErrorCode, ErrorDetail, FileAttrs, FileType,
@@ -45,11 +46,14 @@ use rift_protocol::messages::{
 /// tokens, resolution will be a lookup in a server-side handle table rather
 /// than a filesystem path join.  The security invariants enforced here will
 /// move into the handle-issuance logic instead.
+#[instrument(skip(share), fields(share = %share.display(), handle = ?handle), level = "debug")]
 pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
     if handle.contains(&0) {
+        tracing::warn!(handle = ?handle, "rejecting null byte in handle");
         anyhow::bail!("null byte in handle");
     }
     if handle.is_empty() {
+        tracing::warn!("rejecting empty handle");
         anyhow::bail!("empty handle");
     }
 
@@ -73,6 +77,7 @@ pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("path does not exist: {handle_str}"))?;
 
     if !canonical.starts_with(&share_canonical) {
+        tracing::warn!(path = %canonical.display(), "path escapes share root");
         anyhow::bail!("path escapes share root: {handle_str}");
     }
 
@@ -124,6 +129,7 @@ pub fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
 /// `StatResult` per handle (success or error).
 ///
 /// Malformed payloads return an empty result list rather than panicking.
+#[instrument(skip(share), fields(share = %share.display()), level = "debug")]
 pub fn stat_response(payload: &[u8], share: &Path) -> StatResponse {
     let req = match StatRequest::decode(payload) {
         Ok(r) => r,
@@ -152,6 +158,7 @@ pub fn stat_response(payload: &[u8], share: &Path) -> StatResponse {
 /// handle and its attributes.
 ///
 /// Returns `ErrorNotFound` if either the parent or the child does not exist.
+#[instrument(skip(share), fields(share = %share.display()), level = "debug")]
 pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
     let req = match LookupRequest::decode(payload) {
         Ok(r) => r,
@@ -212,6 +219,7 @@ pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
 ///
 /// Entries are returned in alphabetical order for determinism.
 /// Malformed payloads return an error response rather than panicking.
+#[instrument(skip(share), fields(share = %share.display()), level = "debug")]
 pub fn readdir_response(payload: &[u8], share: &Path) -> ReaddirResponse {
     let req = match ReaddirRequest::decode(payload) {
         Ok(r) => r,

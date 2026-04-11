@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 
 use prost::Message as _;
+use tracing::{debug, debug_span, instrument, warn, Instrument};
 
 use rift_protocol::messages::{msg, RiftHello, RiftWelcome, ShareInfo};
 use rift_transport::{
@@ -38,16 +39,24 @@ use crate::handler;
 ///
 /// Returns when the listener is closed.  Individual connection or stream
 /// errors are logged and do not terminate the loop.
+#[instrument(skip(listener), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
 pub async fn accept_loop(listener: QuicListener, share: PathBuf) -> anyhow::Result<()> {
     loop {
         match listener.accept().await {
             Ok(conn) => {
                 let share = share.clone();
-                tokio::spawn(serve_connection(conn, share));
+                let peer = conn.peer_fingerprint().to_string();
+                let conn_span = debug_span!("server.connection", peer = %peer);
+                tokio::spawn(
+                    async move {
+                        serve_connection(conn, share).await;
+                    }
+                    .instrument(conn_span),
+                );
             }
             Err(TransportError::ConnectionClosed) => break,
             Err(e) => {
-                tracing::warn!("accept error: {e}");
+                warn!("accept error: {e}");
             }
         }
     }
@@ -58,9 +67,9 @@ pub async fn accept_loop(listener: QuicListener, share: PathBuf) -> anyhow::Resu
 // Per-connection loop
 // ---------------------------------------------------------------------------
 
+#[instrument(skip(conn, share), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
 async fn serve_connection(conn: QuicConnection, share: PathBuf) {
-    let peer = conn.peer_fingerprint().to_string();
-    tracing::debug!(peer = %peer, "connection established");
+    debug!("connection established");
 
     // TODO(v1): authorise peer fingerprint against per-share permission files
     // before accepting any streams.
@@ -69,14 +78,18 @@ async fn serve_connection(conn: QuicConnection, share: PathBuf) {
         match conn.accept_stream().await {
             Ok(stream) => {
                 let share = share.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_stream(stream, share).await {
-                        tracing::debug!("stream error: {e}");
+                let stream_span = debug_span!("server.stream", share = %share.display());
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = handle_stream(stream, share).await {
+                            debug!("stream error: {}", e);
+                        }
                     }
-                });
+                    .instrument(stream_span),
+                );
             }
             Err(_) => {
-                tracing::debug!(peer = %peer, "connection closed");
+                debug!("connection closed");
                 break;
             }
         }
@@ -87,11 +100,25 @@ async fn serve_connection(conn: QuicConnection, share: PathBuf) {
 // Per-stream dispatch
 // ---------------------------------------------------------------------------
 
+#[instrument(skip_all, fields(share = %share.display()), err)]
 async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result<()> {
-    let (type_id, payload) = match stream.recv_frame().await? {
-        Some(f) => f,
-        None => return Ok(()), // empty stream — ignore
+    let (type_id, payload) = match stream.recv_frame().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            debug!("empty stream — ignoring");
+            return Ok(());
+        }
+        Err(e) => {
+            debug!(error = %e, "recv_frame failed");
+            return Err(e.into());
+        }
     };
+
+    debug!(
+        type_id = type_id,
+        payload_len = payload.len(),
+        "received request"
+    );
 
     match type_id {
         // ------------------------------------------------------------------
@@ -126,7 +153,7 @@ async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result
                 }),
             };
 
-            tracing::debug!(share = %hello.share_name, "handshake complete");
+            debug!(share = %hello.share_name, "handshake complete");
             send_welcome(&mut stream, welcome).await?;
         }
 
@@ -162,7 +189,7 @@ async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result
         // ------------------------------------------------------------------
         other => {
             // TODO(v1): send ERROR_RESPONSE so clients surface a real error.
-            tracing::debug!("unknown message type 0x{other:02X} — closing stream");
+            debug!("unknown message type 0x{other:02X} — closing stream");
         }
     }
 

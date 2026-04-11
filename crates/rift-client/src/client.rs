@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use prost::Message as _;
+use tracing::instrument;
 
 use rift_common::FsError;
 use rift_protocol::messages::{
@@ -68,6 +69,7 @@ impl RiftClient {
     ///   admin's permission files continue to authorise the client.
     /// - `TODO(v1)`: use [`rift_transport::TofuPolicy`] loaded from
     ///   `~/.config/rift/known-servers.toml` instead of [`AcceptAnyPolicy`].
+    #[instrument(fields(addr = %addr, share_name = %share_name), err)]
     pub async fn connect(addr: SocketAddr, share_name: &str) -> Result<Self> {
         let (cert, key) = generate_client_cert()?;
         let ep = client_endpoint(&cert, &key)?;
@@ -120,6 +122,7 @@ impl RiftClient {
     ///
     /// Server `ErrorCode` values are mapped to [`FsError`] variants so the
     /// FUSE layer can produce the correct POSIX errno.
+    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
     pub async fn stat(&self, handle: &[u8]) -> Result<FileAttrs> {
         let mut stream = self
             .conn
@@ -159,6 +162,7 @@ impl RiftClient {
     /// Resolve `name` within the directory identified by `parent`.
     ///
     /// Returns `(child_handle, child_attrs)`.
+    #[instrument(skip(self), fields(parent_len = parent.len(), name = %name), err)]
     pub async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
         let mut stream = self
             .conn
@@ -199,6 +203,7 @@ impl RiftClient {
     ///
     /// Returns all entries (no client-side pagination).  FUSE-level
     /// offset/pagination is handled by [`rift_fuse::compute_readdir`].
+    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
     pub async fn readdir(&self, handle: &[u8]) -> Result<Vec<ReaddirEntry>> {
         let mut stream = self
             .conn
