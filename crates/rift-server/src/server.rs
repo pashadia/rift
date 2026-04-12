@@ -207,6 +207,13 @@ async fn handle_stream(
                 .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
         }
 
+        msg::MERKLE_DRILL => {
+            let db_ref = db.as_ref().as_ref();
+            handler::merkle_drill_response(&mut stream, &payload, &share, db_ref)
+                .await
+                .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
+        }
+
         // ------------------------------------------------------------------
         // Unknown
         // ------------------------------------------------------------------

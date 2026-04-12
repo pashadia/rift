@@ -18,8 +18,8 @@ use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
     ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
-    ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest, ReaddirResponse,
-    ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
+    MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest,
+    ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
 };
 use rift_transport::RiftStream;
 
@@ -596,6 +596,120 @@ pub async fn read_response<S: RiftStream>(
     };
     stream
         .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MerkleDrill handler
+// ---------------------------------------------------------------------------
+
+#[instrument(skip_all, fields(share = %share.display()), level = "debug")]
+pub async fn merkle_drill_response<S: RiftStream>(
+    stream: &mut S,
+    payload: &[u8],
+    share: &Path,
+    db: Option<&Database>,
+) -> anyhow::Result<()> {
+    let req = match MerkleDrill::decode(payload) {
+        Ok(r) => r,
+        Err(_) => {
+            let response = MerkleLevelResponse {
+                level: 0,
+                hashes: vec![],
+                subtree_bytes: vec![],
+            };
+            stream
+                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    let canonical = match resolve(share, &req.handle) {
+        Ok(p) => p,
+        Err(_) => {
+            let response = MerkleLevelResponse {
+                level: req.level,
+                hashes: vec![],
+                subtree_bytes: vec![],
+            };
+            stream
+                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    let content = match std::fs::read(&canonical) {
+        Ok(c) => c,
+        Err(_) => {
+            let response = MerkleLevelResponse {
+                level: req.level,
+                hashes: vec![],
+                subtree_bytes: vec![],
+            };
+            stream
+                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    use rift_common::crypto::{Chunker, MerkleTree};
+    let chunker = Chunker::default();
+    let chunk_boundaries = chunker.chunk(&content);
+
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| {
+            let chunk_data = &content[*offset..*offset + length];
+            Blake3Hash::new(chunk_data)
+        })
+        .collect();
+
+    let merkle = MerkleTree::default();
+    let root = merkle.build(&leaf_hashes);
+
+    // Level 0 = root hash only
+    if req.level == 0 {
+        let response = MerkleLevelResponse {
+            level: 0,
+            hashes: vec![root.as_bytes().to_vec()],
+            subtree_bytes: vec![content.len() as u64],
+        };
+        stream
+            .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        // Cache if we have a database
+        if let Some(database) = db {
+            if let Ok(meta) = std::fs::metadata(&canonical) {
+                let mtime_ns = meta
+                    .modified()
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0))
+                    .unwrap_or(0);
+                let _ = database.put_merkle(&canonical, mtime_ns, meta.len(), &root, &leaf_hashes);
+            }
+        }
+
+        return Ok(());
+    }
+
+    // For now, return empty for other levels (simplified implementation)
+    let response = MerkleLevelResponse {
+        level: req.level,
+        hashes: vec![],
+        subtree_bytes: vec![],
+    };
+    stream
+        .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
         .await?;
     stream.finish_send().await?;
 

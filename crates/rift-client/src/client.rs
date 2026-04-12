@@ -34,8 +34,8 @@ use tracing::instrument;
 use rift_common::FsError;
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ErrorCode,
-    FileAttrs, LookupRequest, LookupResponse, ReadRequest, ReadResponse, ReaddirEntry,
-    ReaddirRequest, ReaddirResponse, StatRequest, StatResponse, TransferComplete,
+    FileAttrs, LookupRequest, LookupResponse, MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse,
+    ReaddirEntry, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse, TransferComplete,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
@@ -354,6 +354,51 @@ impl RiftClient {
             chunks,
             merkle_root: transfer_complete.merkle_root,
         })
+    }
+
+    // ---------------------------------------------------------------------------
+    // MerkleDrill
+    // ---------------------------------------------------------------------------
+
+    /// Fetch Merkle tree levels from the server.
+    ///
+    /// - `handle`: The file handle
+    /// - `level`: Which level to fetch (0 = root only)
+    /// - `subtrees`: Specific subtree indices to fetch (empty = all at this level)
+    ///
+    /// Returns `MerkleLevelResponse` with hashes and subtree byte counts.
+    #[instrument(skip(self), fields(handle_len = handle.len(), level, subtrees_len = subtrees.len()), err)]
+    pub async fn merkle_drill(
+        &self,
+        handle: &[u8],
+        level: u32,
+        subtrees: &[u32],
+    ) -> Result<MerkleLevelResponse> {
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("merkle_drill: open stream: {e}"))?;
+
+        let req = MerkleDrill {
+            handle: handle.to_vec(),
+            level,
+            subtrees: subtrees.to_vec(),
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        let (_, payload) = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("merkle_drill: server closed stream without response"))?;
+
+        let response =
+            MerkleLevelResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
+
+        Ok(response)
     }
 }
 

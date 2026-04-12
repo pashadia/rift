@@ -314,3 +314,20 @@ async fn client_read_chunks_returns_error_for_invalid_handle() {
     let result = client.read_chunks(b"nonexistent.txt", 0, 1).await;
     assert!(result.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// MerkleDrill
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_merkle_drill_fetches_root_level() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
+
+    let result = client.merkle_drill(b"hello.txt", 0, &[]).await.expect("merkle_drill failed");
+    assert!(!result.hashes.is_empty());
+    assert_eq!(result.hashes[0].len(), 32);
+}
