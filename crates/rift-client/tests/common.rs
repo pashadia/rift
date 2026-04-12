@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rcgen::generate_simple_self_signed;
 use tempfile::TempDir;
@@ -32,6 +33,7 @@ pub async fn start_server(share: PathBuf) -> SocketAddr {
     let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
         .expect("server_endpoint failed");
     let addr = listener.local_addr();
-    tokio::spawn(rift_server::server::accept_loop(listener, share));
+    let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
+    tokio::spawn(rift_server::server::accept_loop(listener, share, db));
     addr
 }

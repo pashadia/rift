@@ -190,6 +190,25 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
+    #[instrument(skip(self), fields(path = ?path, offset = offset, size = size), level = "debug")]
+    async fn read(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        _fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Fuse3Result<ReplyData> {
+        let handle = path.map(path_to_handle);
+
+        tracing::debug!(?handle, offset, size, "read request for file");
+
+        // TODO: Implement actual file reading via network protocol
+        // For now, return empty data since READ_REQUEST is not implemented
+        tracing::warn!("read not implemented - returning empty data");
+        Err(Errno::from(libc::ENOSYS))
+    }
+
     #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn releasedir(
         &self,
