@@ -14,6 +14,7 @@ use anyhow::Context as _;
 use prost::Message as _;
 use tracing::instrument;
 
+use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
     lookup_response, readdir_response, stat_result, ErrorCode, ErrorDetail, FileAttrs, FileType,
     LookupRequest, LookupResponse, LookupResult, ReaddirEntry, ReaddirRequest, ReaddirResponse,
@@ -92,6 +93,14 @@ pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
 ///
 /// Uses Unix-specific metadata fields (`mode`, `uid`, `gid`, `nlink`).
 pub fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
+    build_attrs(meta, None)
+}
+
+/// Build `FileAttrs` from filesystem metadata and optional Merkle root hash.
+///
+/// When `root_hash` is `Some`, the root_hash field is populated in the response.
+/// This is used by the delta sync protocol to identify file versions.
+pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Option<&Blake3Hash>) -> FileAttrs {
     use std::os::unix::fs::MetadataExt as _;
 
     let file_type = if meta.is_dir() {
@@ -118,6 +127,7 @@ pub fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
         uid: meta.uid(),
         gid: meta.gid(),
         nlinks: meta.nlink() as u32,
+        root_hash: root_hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
     }
 }
 
@@ -144,7 +154,7 @@ pub fn stat_response(payload: &[u8], share: &Path) -> StatResponse {
                 .and_then(|p| std::fs::metadata(&p).map_err(anyhow::Error::from))
             {
                 Ok(meta) => StatResult {
-                    result: Some(stat_result::Result::Attrs(metadata_to_attrs(&meta))),
+                    result: Some(stat_result::Result::Attrs(build_attrs(&meta, None))),
                 },
                 Err(_) => stat_error(io_error_code(&handle, share)),
             }
@@ -209,7 +219,7 @@ pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
             handle,
-            attrs: Some(metadata_to_attrs(&meta)),
+            attrs: Some(build_attrs(&meta, None)),
         })),
     }
 }

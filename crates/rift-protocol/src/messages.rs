@@ -206,6 +206,7 @@ mod tests {
                     uid: 1000,
                     gid: 1000,
                     nlinks: 1,
+                    root_hash: vec![],
                 }),
             })),
         };
@@ -498,6 +499,7 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 nlinks: 1,
+                root_hash: vec![],
             }),
             changed_chunks: vec![ChunkInfo {
                 index: 3,

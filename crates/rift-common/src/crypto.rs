@@ -16,6 +16,16 @@ impl Blake3Hash {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, &'static str> {
+        if slice.len() == 32 {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(slice);
+            Ok(Self(hash))
+        } else {
+            Err("Blake3Hash requires exactly 32 bytes")
+        }
+    }
 }
 
 impl AsRef<[u8]> for Blake3Hash {
@@ -113,6 +123,33 @@ impl MerkleTree {
         }
 
         current_level.into_iter().next().unwrap()
+    }
+
+    /// Serialize leaf hashes into a packed byte array for storage.
+    ///
+    /// Each 32-byte hash is stored contiguously. No additional framing.
+    pub fn serialize_leaves(&self, leaves: &[Blake3Hash]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(leaves.len() * 32);
+        for leaf in leaves {
+            bytes.extend_from_slice(leaf.as_bytes());
+        }
+        bytes
+    }
+
+    /// Deserialize leaf hashes from a packed byte array.
+    ///
+    /// Returns `Err` if the byte length is not divisible by 32.
+    pub fn deserialize_leaves(&self, bytes: &[u8]) -> Result<Vec<Blake3Hash>, &'static str> {
+        if !bytes.len().is_multiple_of(32) {
+            return Err("Leaf hash bytes must be a multiple of 32");
+        }
+
+        let count = bytes.len() / 32;
+        let mut leaves = Vec::with_capacity(count);
+        for chunk in bytes.chunks_exact(32) {
+            leaves.push(Blake3Hash::from_slice(chunk).unwrap());
+        }
+        Ok(leaves)
     }
 }
 
@@ -278,5 +315,201 @@ mod proptests {
             let root = tree.build(&[]);
             prop_assert_eq!(root.as_bytes().len(), 32);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for Merkle tree extensions (serialization, root_hash support)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod merkle_ext_tests {
+    use super::*;
+
+    // =======================================================================
+    // Blake3Hash::from_slice tests
+    // =======================================================================
+
+    #[test]
+    fn blake3_hash_from_slice_success() {
+        let bytes = [0x01u8; 32];
+        let hash = Blake3Hash::from_slice(&bytes);
+        assert!(hash.is_ok());
+        assert_eq!(hash.unwrap().as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn blake3_hash_from_slice_wrong_length() {
+        let bytes = [0x01u8; 31];
+        let hash = Blake3Hash::from_slice(&bytes);
+        assert!(hash.is_err());
+    }
+
+    #[test]
+    fn blake3_hash_from_slice_empty() {
+        let bytes: [u8; 0] = [];
+        let hash = Blake3Hash::from_slice(&bytes);
+        assert!(hash.is_err());
+    }
+
+    // =======================================================================
+    // Chunker chunk positions tests
+    // =======================================================================
+
+    #[test]
+    fn chunker_positions_are_contiguous() {
+        let data = vec![0u8; 100_000];
+        let chunker = Chunker::default();
+        let chunks = chunker.chunk(&data);
+
+        let mut expected_offset = 0;
+        for (offset, length) in &chunks {
+            assert_eq!(*offset, expected_offset);
+            expected_offset += length;
+        }
+    }
+
+    #[test]
+    fn chunker_covers_full_file() {
+        let data = vec![0u8; 100_000];
+        let chunker = Chunker::default();
+        let chunks = chunker.chunk(&data);
+
+        let total: usize = chunks.iter().map(|(_, l)| l).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn chunker_single_chunk_small_file() {
+        let data = vec![0u8; 1024];
+        let chunker = Chunker::default();
+        let chunks = chunker.chunk(&data);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, 0);
+        assert_eq!(chunks[0].1, 1024);
+    }
+
+    #[test]
+    fn chunker_empty_file_has_no_chunks() {
+        let data: Vec<u8> = vec![];
+        let chunker = Chunker::default();
+        let chunks = chunker.chunk(&data);
+
+        assert!(chunks.is_empty());
+    }
+
+    // =======================================================================
+    // MerkleTree serialization tests
+    // =======================================================================
+
+    #[test]
+    fn serialize_leaves_roundtrip() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<Blake3Hash> = (0u8..4).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let serialized = tree.serialize_leaves(&leaves);
+        let deserialized = tree.deserialize_leaves(&serialized);
+
+        assert!(deserialized.is_ok());
+        assert_eq!(leaves, deserialized.unwrap());
+    }
+
+    #[test]
+    fn serialize_leaves_empty() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<Blake3Hash> = vec![];
+
+        let serialized = tree.serialize_leaves(&leaves);
+        assert!(serialized.is_empty());
+
+        let deserialized = tree.deserialize_leaves(&serialized);
+        assert!(deserialized.is_ok());
+        assert!(deserialized.unwrap().is_empty());
+    }
+
+    #[test]
+    fn serialize_leaves_single_element() {
+        let tree = MerkleTree::default();
+        let leaf = Blake3Hash::new(b"test");
+        let leaves = vec![leaf.clone()];
+
+        let serialized = tree.serialize_leaves(&leaves);
+        assert_eq!(serialized.len(), 32);
+
+        let deserialized = tree.deserialize_leaves(&serialized);
+        assert_eq!(leaves, deserialized.unwrap());
+    }
+
+    #[test]
+    fn deserialize_leaves_invalid_length() {
+        let tree = MerkleTree::default();
+        let bytes = vec![0u8; 100];
+
+        let result = tree.deserialize_leaves(&bytes);
+        assert!(result.is_err());
+    }
+
+    // =======================================================================
+    // MerkleTree build from serialized leaves
+    // =======================================================================
+
+    #[test]
+    fn build_from_serialized_leaves_roundtrips() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<Blake3Hash> = (0u8..10).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let serialized = tree.serialize_leaves(&leaves);
+        let restored = tree.deserialize_leaves(&serialized).unwrap();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&restored);
+
+        assert_eq!(root1, root2);
+    }
+
+    // =======================================================================
+    // Single chunk file root is its hash
+    // =======================================================================
+
+    #[test]
+    fn merkle_root_single_chunk_is_leaf_hash() {
+        let tree = MerkleTree::default();
+        let data = b"hello world".to_vec();
+
+        // For single chunk, root = leaf hash
+        let leaf_hash = Blake3Hash::new(&data);
+        let root = tree.build(std::slice::from_ref(&leaf_hash));
+
+        assert_eq!(root, leaf_hash);
+    }
+
+    // =======================================================================
+    // Merkle root changes on content change
+    // =======================================================================
+
+    #[test]
+    fn merkle_root_changes_on_content_change() {
+        let tree = MerkleTree::default();
+
+        let hash1 = tree.build(&[Blake3Hash::new(b"original")]);
+        let hash2 = tree.build(&[Blake3Hash::new(b"modified")]);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    // =======================================================================
+    // Merkle root is stable
+    // =======================================================================
+
+    #[test]
+    fn merkle_root_stable_across_builds() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<Blake3Hash> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&leaves);
+
+        assert_eq!(root1, root2);
     }
 }

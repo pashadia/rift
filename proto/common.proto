@@ -33,6 +33,10 @@ message FileAttrs {
   uint32                    uid       = 5;
   uint32                    gid       = 6;
   uint32                    nlinks    = 7;
+  // Merkle root hash for the file's content.
+  // Always present for regular files (32 bytes).
+  // Empty for directories and special files.
+  bytes                     root_hash = 8;
 }
 
 message ChunkInfo {
