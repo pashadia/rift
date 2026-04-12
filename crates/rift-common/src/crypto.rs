@@ -13,6 +13,10 @@ impl Blake3Hash {
         Self(*hash.as_bytes())
     }
 
+    pub const fn from_array(arr: [u8; 32]) -> Self {
+        Self(arr)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
