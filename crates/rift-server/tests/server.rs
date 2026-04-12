@@ -1107,7 +1107,7 @@ async fn server_read_single_chunk_returns_correct_data() {
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
 
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
