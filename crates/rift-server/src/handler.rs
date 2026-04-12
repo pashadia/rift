@@ -16,10 +16,12 @@ use tracing::instrument;
 
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
-    lookup_response, readdir_response, stat_result, ErrorCode, ErrorDetail, FileAttrs, FileType,
-    LookupRequest, LookupResponse, LookupResult, ReaddirEntry, ReaddirRequest, ReaddirResponse,
-    ReaddirSuccess, StatRequest, StatResponse, StatResult,
+    lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
+    ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
+    ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest, ReaddirResponse,
+    ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
 };
+use rift_transport::RiftStream;
 
 use crate::metadata::db::Database;
 
@@ -444,4 +446,158 @@ fn io_err_kind_to_code(kind: std::io::ErrorKind) -> ErrorCode {
         std::io::ErrorKind::PermissionDenied => ErrorCode::ErrorPermissionDenied,
         _ => ErrorCode::ErrorNotFound,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Read handler
+// ---------------------------------------------------------------------------
+
+#[instrument(skip_all, fields(share = %share.display()), level = "debug")]
+pub async fn read_response<S: RiftStream>(
+    stream: &mut S,
+    payload: &[u8],
+    share: &Path,
+    db: Option<&Database>,
+) -> anyhow::Result<()> {
+    let req = match ReadRequest::decode(payload) {
+        Ok(r) => r,
+        Err(_) => {
+            let response = ReadResponse {
+                result: Some(read_response::Result::Error(ErrorDetail {
+                    code: ErrorCode::ErrorUnsupported as i32,
+                    message: "invalid request".to_string(),
+                    metadata: None,
+                })),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    let canonical = match resolve(share, &req.handle) {
+        Ok(p) => p,
+        Err(_) => {
+            let response = ReadResponse {
+                result: Some(read_response::Result::Error(ErrorDetail {
+                    code: ErrorCode::ErrorNotFound as i32,
+                    message: "file not found".to_string(),
+                    metadata: None,
+                })),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    let content = match std::fs::read(&canonical) {
+        Ok(c) => c,
+        Err(e) => {
+            let response = ReadResponse {
+                result: Some(read_response::Result::Error(ErrorDetail {
+                    code: io_err_kind_to_code(e.kind()) as i32,
+                    message: e.to_string(),
+                    metadata: None,
+                })),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    use rift_common::crypto::{Chunker, MerkleTree};
+    let chunker = Chunker::default();
+    let chunk_boundaries = chunker.chunk(&content);
+
+    let start = req.start_chunk as usize;
+    let count = if req.chunk_count == 0 {
+        chunk_boundaries.len().saturating_sub(start)
+    } else {
+        req.chunk_count as usize
+    };
+
+    let chunks_to_read: Vec<_> = chunk_boundaries
+        .iter()
+        .skip(start)
+        .take(count)
+        .enumerate()
+        .map(|(i, (offset, length))| {
+            let chunk_data = &content[*offset..*offset + length];
+            let hash = Blake3Hash::new(chunk_data);
+            (start + i, *length, hash)
+        })
+        .collect();
+
+    let chunk_count = chunks_to_read.len() as u32;
+
+    let response = ReadResponse {
+        result: Some(read_response::Result::Ok(ReadSuccess { chunk_count })),
+    };
+    stream
+        .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+        .await?;
+
+    for (idx, length, hash) in chunks_to_read {
+        let index = idx as u32;
+        let start_offset = chunk_boundaries[0..idx]
+            .iter()
+            .map(|(_, l)| *l)
+            .sum::<usize>();
+        let chunk_data = &content[start_offset..start_offset + length];
+
+        let block_header = BlockHeader {
+            chunk: Some(ChunkInfo {
+                index,
+                length: length as u64,
+                hash: hash.as_bytes().to_vec(),
+            }),
+        };
+        stream
+            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+            .await?;
+
+        stream.send_frame(msg::BLOCK_DATA, chunk_data).await?;
+    }
+
+    let merkle = MerkleTree::default();
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| {
+            let chunk_data = &content[*offset..*offset + length];
+            Blake3Hash::new(chunk_data)
+        })
+        .collect();
+    let root = merkle.build(&leaf_hashes);
+
+    if let Some(database) = db {
+        if let Ok(file_meta) = std::fs::metadata(&canonical) {
+            let mtime_ns = match file_meta.modified() {
+                Ok(t) => t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+            let file_size = file_meta.len();
+            let _ = database.put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes);
+        }
+    }
+
+    let transfer_complete = TransferComplete {
+        merkle_root: root.as_bytes().to_vec(),
+    };
+    stream
+        .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
+
+    Ok(())
 }

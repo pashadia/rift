@@ -198,6 +198,16 @@ async fn handle_stream(
         }
 
         // ------------------------------------------------------------------
+        // Data operations
+        // ------------------------------------------------------------------
+        msg::READ_REQUEST => {
+            let db_ref = db.as_ref().as_ref();
+            handler::read_response(&mut stream, &payload, &share, db_ref)
+                .await
+                .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
+        }
+
+        // ------------------------------------------------------------------
         // Unknown
         // ------------------------------------------------------------------
         other => {
