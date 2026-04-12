@@ -33,8 +33,9 @@ use tracing::instrument;
 
 use rift_common::FsError;
 use rift_protocol::messages::{
-    lookup_response, msg, readdir_response, stat_result, ErrorCode, FileAttrs, LookupRequest,
-    LookupResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
+    lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ErrorCode,
+    FileAttrs, LookupRequest, LookupResponse, ReadRequest, ReadResponse, ReaddirEntry,
+    ReaddirRequest, ReaddirResponse, StatRequest, StatResponse, TransferComplete,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
@@ -56,6 +57,21 @@ pub struct RiftClient {
     conn: QuicConnection,
     /// Opaque handle for the share root (from `RiftWelcome.root_handle`).
     root_handle: Vec<u8>,
+}
+
+/// Result of a read_chunks operation, containing the fetched chunk data and Merkle root.
+pub struct ChunkReadResult {
+    pub chunks: Vec<ChunkData>,
+    pub merkle_root: Vec<u8>,
+}
+
+/// A single chunk's data.
+#[derive(Debug)]
+pub struct ChunkData {
+    pub index: u32,
+    pub length: u64,
+    pub hash: [u8; 32],
+    pub data: Vec<u8>,
 }
 
 impl RiftClient {
@@ -234,6 +250,110 @@ impl RiftClient {
             Some(readdir_response::Result::Error(e)) => Err(map_proto_error(e.code)),
             None => Err(anyhow::Error::from(FsError::Io)),
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Read chunks
+    // ---------------------------------------------------------------------------
+
+    /// Read chunks from a file.
+    ///
+    /// - `handle`: The file handle
+    /// - `start_chunk`: First chunk index (0 = from beginning)
+    /// - `chunk_count`: Number of chunks to read (0 = all remaining)
+    ///
+    /// Returns `ChunkReadResult` with chunk data and the file's Merkle root.
+    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
+    pub async fn read_chunks(
+        &self,
+        handle: &[u8],
+        start_chunk: u32,
+        chunk_count: u32,
+    ) -> Result<ChunkReadResult> {
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("read_chunks: open stream: {e}"))?;
+
+        let req = ReadRequest {
+            handle: handle.to_vec(),
+            start_chunk,
+            chunk_count,
+        };
+        stream
+            .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        // Read response: ReadSuccess with chunk_count
+        let (_, payload) = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("read_chunks: server closed stream without response"))?;
+
+        let response =
+            ReadResponse::decode(payload.as_ref()).map_err(|_| anyhow::Error::from(FsError::Io))?;
+
+        let chunk_count = match response.result {
+            Some(read_response::Result::Ok(success)) => success.chunk_count,
+            Some(read_response::Result::Error(e)) => return Err(map_proto_error(e.code)),
+            None => return Err(anyhow::Error::from(FsError::Io)),
+        };
+
+        // Read each chunk: BLOCK_HEADER + BLOCK_DATA
+        let mut chunks = Vec::with_capacity(chunk_count as usize);
+        for _i in 0..chunk_count {
+            // BlockHeader
+            let header_frame = stream
+                .recv_frame()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("read_chunks: missing BLOCK_HEADER"))?;
+            let (_header_type, header_payload) = header_frame;
+
+            let block_header = BlockHeader::decode(header_payload.as_ref())
+                .map_err(|_| anyhow::Error::from(FsError::Io))?;
+            let chunk_info = block_header
+                .chunk
+                .ok_or_else(|| anyhow::anyhow!("read_chunks: missing ChunkInfo"))?;
+
+            let index = chunk_info.index;
+            let length = chunk_info.length;
+            let hash: [u8; 32] = chunk_info
+                .hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("read_chunks: invalid hash length"))?;
+
+            // BlockData (raw bytes)
+            let data_frame = stream
+                .recv_frame()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("read_chunks: missing BLOCK_DATA"))?;
+            let (_data_type, data_payload) = data_frame;
+
+            chunks.push(ChunkData {
+                index,
+                length,
+                hash,
+                data: data_payload.to_vec(),
+            });
+        }
+
+        // TransferComplete with Merkle root
+        let root_frame = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("read_chunks: missing TRANSFER_COMPLETE"))?;
+        let (_root_type, root_payload) = root_frame;
+
+        let transfer_complete =
+            TransferComplete::decode(root_payload.as_ref()).map_err(|_| FsError::Io)?;
+
+        Ok(ChunkReadResult {
+            chunks,
+            merkle_root: transfer_complete.merkle_root,
+        })
     }
 }
 

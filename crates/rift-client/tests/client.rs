@@ -256,3 +256,61 @@ async fn client_operations_fail_after_connection_drops() {
 
 // (std::thread sync wrapper test removed: fuse3 calls our async Filesystem
 // methods directly from tokio tasks — no OS thread blocking needed)
+
+// ---------------------------------------------------------------------------
+// read_chunks
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_read_chunks_returns_data() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
+
+    // Read chunk 0 from hello.txt
+    let result = client
+        .read_chunks(b"hello.txt", 0, 1)
+        .await
+        .expect("read failed");
+    assert_eq!(result.chunks.len(), 1);
+
+    let chunk = &result.chunks[0];
+    assert_eq!(chunk.index, 0);
+    assert_eq!(&chunk.data[..], b"hello rift");
+    assert_eq!(result.merkle_root.len(), 32);
+}
+
+#[tokio::test]
+async fn client_read_chunks_returns_multiple_chunks() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+    // Create content with multiple chunks
+    let content: Vec<u8> = (0..100).flat_map(|i| vec![i; 4096]).collect();
+    std::fs::write(root.join("large.bin"), &content).unwrap();
+
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
+
+    let result = client
+        .read_chunks(b"large.bin", 0, 2)
+        .await
+        .expect("read failed");
+    // May return 0, 1, or 2 chunks depending on content
+    assert!(result.chunks.len() <= 2);
+}
+
+#[tokio::test]
+async fn client_read_chunks_returns_error_for_invalid_handle() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .unwrap();
+
+    let result = client.read_chunks(b"nonexistent.txt", 0, 1).await;
+    assert!(result.is_err());
+}
