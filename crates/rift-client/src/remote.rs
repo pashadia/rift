@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, ReaddirEntry};
 
+use crate::client::{ChunkReadResult, MerkleDrillResult};
+
 /// The `RemoteShare` trait is a pure, 1:1 mapping of the network protocol's
 /// capabilities. It speaks in terms of handles and protocol-level operations.
 /// It is the boundary for all network communication.
@@ -24,4 +26,20 @@ pub trait RemoteShare: Send + Sync + 'static {
         &self,
         handles: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>>;
+
+    /// Reads chunks from a file.
+    async fn read_chunks(
+        &self,
+        handle: &[u8],
+        start_chunk: u32,
+        chunk_count: u32,
+    ) -> anyhow::Result<ChunkReadResult>;
+
+    /// Drills the Merkle tree to get hashes at a specific level.
+    async fn merkle_drill(
+        &self,
+        handle: &[u8],
+        level: u32,
+        parent_indices: &[u32],
+    ) -> anyhow::Result<MerkleDrillResult>;
 }

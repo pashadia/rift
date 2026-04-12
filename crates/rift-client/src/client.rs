@@ -406,6 +406,21 @@ impl RiftClient {
 // RemoteShare impl (Linux only)
 // ---------------------------------------------------------------------------
 
+/// Wrapper type for MerkleDrill results, simplifying the protocol response.
+pub struct MerkleDrillResult {
+    pub hashes: Vec<Vec<u8>>,
+    pub sizes: Vec<u64>,
+}
+
+impl From<MerkleLevelResponse> for MerkleDrillResult {
+    fn from(resp: MerkleLevelResponse) -> Self {
+        Self {
+            hashes: resp.hashes,
+            sizes: resp.subtree_bytes,
+        }
+    }
+}
+
 /// Implement `crate::fuse::RemoteShare` so `RiftClient` can be boxed and passed
 /// directly to the FUSE mount function.
 ///
@@ -425,8 +440,6 @@ impl crate::remote::RemoteShare for RiftClient {
         &self,
         handles: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
-        // This is a temporary implementation that makes N calls.
-        // TODO: Implement a real batch STAT message in the protocol.
         let mut results = Vec::with_capacity(handles.len());
         for handle in handles {
             let result = self.stat(&handle).await;
@@ -439,6 +452,25 @@ impl crate::remote::RemoteShare for RiftClient {
             }
         }
         Ok(results)
+    }
+
+    async fn read_chunks(
+        &self,
+        handle: &[u8],
+        start_chunk: u32,
+        chunk_count: u32,
+    ) -> anyhow::Result<ChunkReadResult> {
+        self.read_chunks(handle, start_chunk, chunk_count).await
+    }
+
+    async fn merkle_drill(
+        &self,
+        handle: &[u8],
+        level: u32,
+        subtrees: &[u32],
+    ) -> anyhow::Result<MerkleDrillResult> {
+        let resp = self.merkle_drill(handle, level, subtrees).await?;
+        Ok(resp.into())
     }
 }
 

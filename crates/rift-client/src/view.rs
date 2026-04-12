@@ -23,6 +23,23 @@ pub trait ShareView: Send + Sync + 'static {
 
     /// Reads directory entries with their attributes.
     async fn readdirplus(&self, handle: &[u8]) -> Result<Vec<(ReaddirEntry, FileAttrs)>, FsError>;
+
+    /// Reads a byte range from a file.
+    ///
+    /// This method handles all the complexity of Merkle tree-based reads:
+    /// - Fetches file attributes (including Merkle root)
+    /// - Validates against cached root hash if available
+    /// - On mismatch: drills the Merkle tree to determine needed chunks
+    /// - Fetches needed chunks from the server
+    /// - Assembles chunks into a contiguous byte buffer
+    /// - Returns the requested byte range [offset, offset + length)
+    async fn read(
+        &self,
+        handle: &[u8],
+        offset: u64,
+        length: u64,
+        cached_root_hash: Option<&[u8]>,
+    ) -> Result<Vec<u8>, FsError>;
 }
 
 /// The `RiftShareView` is the primary implementation of the `ShareView` trait.
@@ -83,5 +100,88 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .collect();
 
         Ok(combined)
+    }
+
+    #[instrument(skip(self), fields(handle_len = handle.len(), offset, length))]
+    async fn read(
+        &self,
+        handle: &[u8],
+        offset: u64,
+        length: u64,
+        cached_root_hash: Option<&[u8]>,
+    ) -> Result<Vec<u8>, FsError> {
+        let attrs = self
+            .remote
+            .stat_batch(vec![handle.to_vec()])
+            .await
+            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?
+            .remove(0)
+            ?;
+
+        let file_size = attrs.size;
+        if attrs.root_hash.is_empty() {
+            return Err(FsError::Io);
+        }
+        let merkle_root = attrs.root_hash;
+
+        if file_size == 0 {
+            return Ok(vec![]);
+        }
+
+        if let Some(cached) = cached_root_hash {
+            if cached == merkle_root.as_slice() {
+                tracing::debug!("root hash matches, reading from cache");
+                return Ok(vec![]);
+            }
+        }
+
+        let end = (offset + length).min(file_size);
+        let chunk_size = 128 * 1024u64;
+        let start_chunk = (offset / chunk_size) as u32;
+        let end_chunk = end.div_ceil(chunk_size) as u32;
+        let chunk_count = end_chunk - start_chunk;
+
+        let drill_result = self
+            .remote
+            .merkle_drill(handle, 1, &[])
+            .await
+            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+
+        let chunk_hashes = drill_result.hashes;
+        let mut needed_chunks = Vec::new();
+        for (i, hash) in chunk_hashes.iter().enumerate() {
+            if i >= start_chunk as usize && i < end_chunk as usize {
+                needed_chunks.push((i as u32, hash.clone()));
+            }
+        }
+
+        if needed_chunks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let read_result = self
+            .remote
+            .read_chunks(handle, start_chunk, chunk_count)
+            .await
+            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+
+        let mut all_data = Vec::new();
+        for chunk in read_result.chunks {
+            all_data.extend(chunk.data);
+        }
+
+        let start_offset = (offset % chunk_size) as usize;
+        let requested_length = (end - offset) as usize;
+        let result = all_data
+            .get(start_offset..start_offset + requested_length)
+            .map(|s| s.to_vec())
+            .unwrap_or_else(|| {
+                all_data
+                    .get(start_offset..)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default()
+            });
+
+        Ok(result)
     }
 }

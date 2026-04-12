@@ -4,6 +4,7 @@
 //! feature is enabled.
 
 use crate::view::ShareView;
+use prost::bytes::Bytes;
 use fuse3::path::prelude::*;
 use fuse3::{Errno, FileType as Fuse3FileType, Result as Fuse3Result};
 use futures::stream;
@@ -199,14 +200,17 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         offset: u64,
         size: u32,
     ) -> Fuse3Result<ReplyData> {
-        let handle = path.map(path_to_handle);
+        let handle = path.map(path_to_handle).ok_or_else(|| Errno::from(libc::ENOENT))?;
 
         tracing::debug!(?handle, offset, size, "read request for file");
 
-        // TODO: Implement actual file reading via network protocol
-        // For now, return empty data since READ_REQUEST is not implemented
-        tracing::warn!("read not implemented - returning empty data");
-        Err(Errno::from(libc::ENOSYS))
+        let data = self
+            .view
+            .read(&handle, offset, size as u64, None)
+            .await
+            .map_err(to_errno)?;
+
+        Ok(ReplyData { data: Bytes::from(data) })
     }
 
     #[instrument(skip(self), fields(path = ?path), level = "debug")]

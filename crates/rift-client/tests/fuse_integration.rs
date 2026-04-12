@@ -14,6 +14,7 @@ use tempfile::TempDir;
 use rift_client::fuse::{path_to_handle, RiftFilesystem};
 use rift_client::remote::RemoteShare;
 use rift_client::view::{RiftShareView, ShareView};
+use rift_client::client::{ChunkReadResult, MerkleDrillResult};
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 
@@ -104,6 +105,28 @@ impl RemoteShare for MockRemoteShare {
             }
         }
         Ok(results)
+    }
+    async fn read_chunks(
+        &self,
+        _handle: &[u8],
+        _start_chunk: u32,
+        _chunk_count: u32,
+    ) -> anyhow::Result<ChunkReadResult> {
+        Ok(ChunkReadResult {
+            chunks: vec![],
+            merkle_root: vec![],
+        })
+    }
+    async fn merkle_drill(
+        &self,
+        _handle: &[u8],
+        _level: u32,
+        _subtrees: &[u32],
+    ) -> anyhow::Result<MerkleDrillResult> {
+        Ok(MerkleDrillResult {
+            hashes: vec![],
+            sizes: vec![],
+        })
     }
 }
 
