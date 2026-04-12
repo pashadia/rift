@@ -21,6 +21,8 @@ use rift_protocol::messages::{
     ReaddirSuccess, StatRequest, StatResponse, StatResult,
 };
 
+use crate::metadata::db::Database;
+
 // ---------------------------------------------------------------------------
 // Path resolution (security-critical)
 // ---------------------------------------------------------------------------
@@ -89,18 +91,29 @@ pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
 // Attribute conversion
 // ---------------------------------------------------------------------------
 
+fn root_hash_for_type(is_dir: bool) -> Blake3Hash {
+    if is_dir {
+        Blake3Hash::new(b"<directory>")
+    } else {
+        Blake3Hash::new(b"<symlink>")
+    }
+}
+
 /// Convert `std::fs::Metadata` to a proto `FileAttrs` message.
 ///
 /// Uses Unix-specific metadata fields (`mode`, `uid`, `gid`, `nlink`).
+/// Uses constant hashes for directories and symlinks since they don't have content.
 pub fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
-    build_attrs(meta, None)
+    let root_hash = root_hash_for_type(meta.is_dir());
+    build_attrs(meta, root_hash)
 }
 
-/// Build `FileAttrs` from filesystem metadata and optional Merkle root hash.
+/// Build `FileAttrs` from filesystem metadata and Merkle root hash.
 ///
-/// When `root_hash` is `Some`, the root_hash field is populated in the response.
+/// The `root_hash` is always 32 bytes (blake3). For directories and symlinks,
+/// a constant hash is used since they don't have content.
 /// This is used by the delta sync protocol to identify file versions.
-pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Option<&Blake3Hash>) -> FileAttrs {
+pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs {
     use std::os::unix::fs::MetadataExt as _;
 
     let file_type = if meta.is_dir() {
@@ -127,7 +140,7 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Option<&Blake3Hash>) -> 
         uid: meta.uid(),
         gid: meta.gid(),
         nlinks: meta.nlink() as u32,
-        root_hash: root_hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
+        root_hash: root_hash.as_bytes().to_vec(),
     }
 }
 
@@ -139,8 +152,8 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Option<&Blake3Hash>) -> 
 /// `StatResult` per handle (success or error).
 ///
 /// Malformed payloads return an empty result list rather than panicking.
-#[instrument(skip(share), fields(share = %share.display()), level = "debug")]
-pub fn stat_response(payload: &[u8], share: &Path) -> StatResponse {
+#[instrument(skip(share, db), fields(share = %share.display()), level = "debug")]
+pub fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) -> StatResponse {
     let req = match StatRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => return StatResponse { results: vec![] },
@@ -150,13 +163,23 @@ pub fn stat_response(payload: &[u8], share: &Path) -> StatResponse {
         .handles
         .into_iter()
         .map(|handle| {
-            match resolve(share, &handle)
-                .and_then(|p| std::fs::metadata(&p).map_err(anyhow::Error::from))
-            {
-                Ok(meta) => StatResult {
-                    result: Some(stat_result::Result::Attrs(build_attrs(&meta, None))),
-                },
-                Err(_) => stat_error(io_error_code(&handle, share)),
+            let canonical = match resolve(share, &handle) {
+                Ok(p) => p,
+                Err(_) => {
+                    return stat_error(io_error_code(&handle, share));
+                }
+            };
+
+            let meta = match std::fs::metadata(&canonical) {
+                Ok(m) => m,
+                Err(_) => {
+                    return stat_error(io_error_code(&handle, share));
+                }
+            };
+
+            let root_hash = get_or_compute_merkle_root(&canonical, &meta, db);
+            StatResult {
+                result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
             }
         })
         .collect();
@@ -168,8 +191,8 @@ pub fn stat_response(payload: &[u8], share: &Path) -> StatResponse {
 /// handle and its attributes.
 ///
 /// Returns `ErrorNotFound` if either the parent or the child does not exist.
-#[instrument(skip(share), fields(share = %share.display()), level = "debug")]
-pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
+#[instrument(skip(share, db), fields(share = %share.display()), level = "debug")]
+pub fn lookup_response(payload: &[u8], share: &Path, db: Option<&Database>) -> LookupResponse {
     let req = match LookupRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
@@ -197,8 +220,8 @@ pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
 
-    // Security: child must still be within the share after symlink resolution.
-    if !child_canonical.starts_with(&share_canonical) {
+    let symlink_out_of_the_share = !child_canonical.starts_with(&share_canonical);
+    if symlink_out_of_the_share {
         return lookup_error(ErrorCode::ErrorNotFound);
     }
 
@@ -216,10 +239,12 @@ pub fn lookup_response(payload: &[u8], share: &Path) -> LookupResponse {
         .map(|rel| rel.to_string_lossy().into_owned().into_bytes())
         .unwrap_or_else(|_| req.name.into_bytes());
 
+    let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db);
+
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
             handle,
-            attrs: Some(build_attrs(&meta, None)),
+            attrs: Some(build_attrs(&meta, root_hash)),
         })),
     }
 }
@@ -350,6 +375,67 @@ fn io_error_code(handle: &[u8], share: &Path) -> ErrorCode {
         }
     }
     ErrorCode::ErrorNotFound
+}
+
+/// Get or compute the Merkle root hash for a file.
+///
+/// Always returns a 32-byte Blake3Hash:
+/// - For regular files: Merkle root computed from content (cached if possible)
+/// - For non-files (directories, etc.): uses a constant sentinel hash
+fn get_or_compute_merkle_root(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    db: Option<&Database>,
+) -> Blake3Hash {
+    use rift_common::crypto::{Chunker, MerkleTree};
+
+    if !meta.is_file() {
+        return root_hash_for_type(true);
+    }
+
+    if let Some(database) = db {
+        match database.get_merkle(path) {
+            Ok(Some(entry)) => return entry.root,
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+
+    let content = match std::fs::read(path) {
+        Ok(c) => c,
+        Err(_) => return root_hash_for_type(true),
+    };
+
+    let chunker = Chunker::default();
+    let chunk_boundaries = chunker.chunk(&content);
+
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| {
+            let chunk_data = &content[*offset..*offset + length];
+            Blake3Hash::new(chunk_data)
+        })
+        .collect();
+
+    let merkle = MerkleTree::default();
+    let root = merkle.build(&leaf_hashes);
+
+    if let Some(database) = db {
+        if let Ok(file_meta) = std::fs::metadata(path) {
+            let mtime_ns = match file_meta.modified() {
+                Ok(t) => t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+
+            let file_size = file_meta.len();
+            let _ = database.put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes);
+        }
+    }
+
+    root
 }
 
 fn io_err_kind_to_code(kind: std::io::ErrorKind) -> ErrorCode {

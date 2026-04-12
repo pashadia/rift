@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -21,7 +22,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    use tracing_subscriber::prelude::*;
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_target(true))
+        .with(tracing_subscriber::filter::LevelFilter::WARN)
+        .init();
 
     let args = Args::parse();
 
@@ -42,8 +48,10 @@ async fn main() -> Result<()> {
 
     let listener = rift_transport::server_endpoint(args.addr, &cert_der, &key_der)?;
 
+    let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
+
     tokio::select! {
-        result = rift_server::server::accept_loop(listener, args.share) => result,
+        result = rift_server::server::accept_loop(listener, args.share, db) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("\nShutting down.");
             Ok(())

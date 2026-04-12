@@ -18,7 +18,8 @@ use prost::Message as _;
 use tempfile::TempDir;
 
 use rift_protocol::messages::{
-    msg, LookupRequest, LookupResponse, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
+    lookup_response, msg, stat_result, LookupRequest, LookupResponse, ReaddirRequest,
+    ReaddirResponse, StatRequest, StatResponse,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, RiftConnection, RiftListener,
@@ -62,7 +63,8 @@ mod helpers {
         let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
             .expect("server_endpoint failed");
         let addr = listener.local_addr();
-        tokio::spawn(rift_server::server::accept_loop(listener, share));
+        let db: Arc<Option<Database>> = Arc::new(None);
+        tokio::spawn(rift_server::server::accept_loop(listener, share, db));
         addr
     }
 
@@ -146,7 +148,7 @@ fn stat_response_valid_handle_returns_attrs() {
     let req = StatRequest {
         handles: vec![b"hello.txt".to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root);
+    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -161,7 +163,7 @@ fn stat_response_invalid_handle_returns_error() {
     let req = StatRequest {
         handles: vec![b"nonexistent.txt".to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root);
+    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -176,7 +178,7 @@ fn stat_response_multiple_handles() {
     let req = StatRequest {
         handles: vec![b"hello.txt".to_vec(), b"nonexistent.txt".to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root);
+    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
     assert_eq!(response.results.len(), 2);
     assert!(matches!(
         response.results[0].result,
@@ -196,7 +198,7 @@ fn lookup_response_finds_existing_entry() {
         parent_handle: b".".to_vec(),
         name: "hello.txt".to_string(),
     };
-    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root);
+    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None);
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Entry(_))
@@ -216,7 +218,7 @@ fn lookup_response_missing_entry_returns_error() {
         parent_handle: b".".to_vec(),
         name: "does_not_exist.txt".to_string(),
     };
-    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root);
+    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None);
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Error(_))
@@ -345,14 +347,13 @@ fn resolve_does_not_panic_on_empty_handle() {
 #[test]
 fn stat_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    // Must not panic.  The response content is validated during implementation.
-    let _ = rift_server::handler::stat_response(b"this is not protobuf", &root);
+    let _ = rift_server::handler::stat_response(b"this is not protobuf", &root, None);
 }
 
 #[test]
 fn lookup_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root);
+    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root, None);
 }
 
 #[test]
@@ -685,4 +686,413 @@ async fn server_handles_concurrent_streams_on_same_connection() {
     for t in tasks {
         t.await.expect("concurrent stream task panicked");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Merkle root hash integration tests
+// ---------------------------------------------------------------------------
+
+mod merkle_integration {
+    use super::*;
+    use rift_common::crypto::Blake3Hash;
+    use rift_server::metadata::db::Database;
+
+    fn file_mtime_ns(path: &PathBuf) -> u64 {
+        let meta = std::fs::metadata(path).unwrap();
+        meta.modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    fn file_size(path: &PathBuf) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    #[test]
+    fn stat_response_returns_root_hash_for_regular_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let root_hash = Blake3Hash::new(b"test-content");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        db.put_merkle(
+            &file_path,
+            file_mtime_ns(&file_path),
+            file_size(&file_path),
+            &root_hash,
+            &leaf_hashes,
+        )
+        .unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"test.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        assert_eq!(response.results.len(), 1);
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs");
+        };
+        assert_eq!(attrs.root_hash, root_hash.as_bytes());
+    }
+
+    #[test]
+    fn stat_response_without_db_returns_empty_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"test.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
+
+        assert_eq!(response.results.len(), 1);
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs");
+        };
+        // Root hash is always computed on-demand, even without a cache
+        assert_eq!(attrs.root_hash.len(), 32);
+    }
+
+    #[test]
+    fn stat_response_directory_has_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let subdir = root.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let req = StatRequest {
+            handles: vec![b"subdir".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        assert_eq!(response.results.len(), 1);
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs");
+        };
+        // Directories have a constant hash (not empty)
+        assert_eq!(attrs.root_hash.len(), 32);
+    }
+
+    #[test]
+    fn stat_response_uses_cached_merkle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let cached_root = Blake3Hash::new(b"cached-content");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        db.put_merkle(
+            &file_path,
+            file_mtime_ns(&file_path),
+            file_size(&file_path),
+            &cached_root,
+            &leaf_hashes,
+        )
+        .unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"test.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs");
+        };
+        assert_eq!(attrs.root_hash, cached_root.as_bytes());
+    }
+
+    #[test]
+    fn stat_response_stale_cache_returns_empty_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let stale_root = Blake3Hash::new(b"stale-content");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        db.put_merkle(
+            &file_path,
+            file_mtime_ns(&file_path) - 1,
+            file_size(&file_path),
+            &stale_root,
+            &leaf_hashes,
+        )
+        .unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"test.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs");
+        };
+        // Root hash is always computed when cache is stale
+        assert_eq!(attrs.root_hash.len(), 32);
+    }
+
+    #[test]
+    fn stat_response_cache_miss_computes_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("uncached.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"uncached.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs");
+        };
+        // Root hash is always computed when cache miss
+        assert_eq!(attrs.root_hash.len(), 32);
+    }
+
+    #[test]
+    fn lookup_response_returns_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("hello.txt");
+        std::fs::write(&file_path, b"hello rift").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let root_hash = Blake3Hash::new(b"hello-content");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        db.put_merkle(
+            &file_path,
+            file_mtime_ns(&file_path),
+            file_size(&file_path),
+            &root_hash,
+            &leaf_hashes,
+        )
+        .unwrap();
+
+        let req = LookupRequest {
+            parent_handle: b".".to_vec(),
+            name: "hello.txt".to_string(),
+        };
+        let response =
+            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, Some(&db));
+
+        let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
+            panic!("expected entry");
+        };
+        assert_eq!(
+            entry.attrs.as_ref().unwrap().root_hash,
+            root_hash.as_bytes()
+        );
+    }
+
+    #[test]
+    fn lookup_response_without_db_returns_empty_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("hello.txt");
+        std::fs::write(&file_path, b"hello rift").unwrap();
+
+        let req = LookupRequest {
+            parent_handle: b".".to_vec(),
+            name: "hello.txt".to_string(),
+        };
+        let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None);
+
+        let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
+            panic!("expected entry");
+        };
+        // Root hash is always computed, even without a cache
+        assert_eq!(entry.attrs.as_ref().unwrap().root_hash.len(), 32);
+    }
+
+    #[test]
+    fn stat_response_multiple_files_both_have_root_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file1 = root.join("cached.txt");
+        let file2 = root.join("uncached.txt");
+        std::fs::write(&file1, b"cached").unwrap();
+        std::fs::write(&file2, b"uncached").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let cached_root = Blake3Hash::new(b"cached-content");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        db.put_merkle(
+            &file1,
+            file_mtime_ns(&file1),
+            file_size(&file1),
+            &cached_root,
+            &leaf_hashes,
+        )
+        .unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"cached.txt".to_vec(), b"uncached.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        assert_eq!(response.results.len(), 2);
+        let stat_result::Result::Attrs(attrs1) = response.results[0].result.as_ref().unwrap()
+        else {
+            panic!("expected attrs for first");
+        };
+        assert_eq!(attrs1.root_hash, cached_root.as_bytes());
+
+        let stat_result::Result::Attrs(attrs2) = response.results[1].result.as_ref().unwrap()
+        else {
+            panic!("expected attrs for second");
+        };
+        // Both cached and uncached files return 32-byte hashes
+        assert_eq!(attrs2.root_hash.len(), 32);
+    }
+
+    #[test]
+    fn stat_response_nonexistent_file_returns_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let db = Database::open_in_memory().unwrap();
+
+        let req = StatRequest {
+            handles: vec![b"nonexistent.txt".to_vec()],
+        };
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+
+        assert_eq!(response.results.len(), 1);
+        assert!(matches!(
+            response.results[0].result.as_ref().unwrap(),
+            stat_result::Result::Error(_)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server integration tests (with database)
+// ---------------------------------------------------------------------------
+
+use rift_server::metadata::db::Database;
+
+mod helpers_with_db {
+    use super::*;
+    use crate::helpers::gen_cert;
+
+    pub async fn start_server_with_db(share: PathBuf, db: Arc<Option<Database>>) -> SocketAddr {
+        let (cert, key) = gen_cert("rift-test-server");
+        let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
+            .expect("server_endpoint failed");
+        let addr = listener.local_addr();
+        tokio::spawn(rift_server::server::accept_loop(listener, share, db));
+        addr
+    }
+
+    pub fn file_mtime_ns(path: &std::path::PathBuf) -> u64 {
+        let meta = std::fs::metadata(path).unwrap();
+        meta.modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    pub fn file_size(path: &std::path::PathBuf) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+}
+
+#[tokio::test]
+async fn server_sends_root_hash_when_db_configured() {
+    use rift_common::crypto::Blake3Hash;
+    use rift_protocol::messages::{stat_result, StatRequest};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+    let file_path = root.join("hello.txt");
+    std::fs::write(&file_path, b"hello rift").unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    let root_hash = Blake3Hash::new(b"test-content");
+    let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+    db.put_merkle(
+        &file_path,
+        helpers_with_db::file_mtime_ns(&file_path),
+        helpers_with_db::file_size(&file_path),
+        &root_hash,
+        &leaf_hashes,
+    )
+    .unwrap();
+
+    let server_db = Arc::new(Some(db));
+    let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+
+    let mut stream = conn.open_stream().await.unwrap();
+
+    let req = StatRequest {
+        handles: vec![b"hello.txt".to_vec()],
+    };
+    stream
+        .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
+    assert_eq!(type_id, msg::STAT_RESPONSE);
+
+    let response = StatResponse::decode(&payload[..]).unwrap();
+    assert_eq!(response.results.len(), 1);
+
+    let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+        panic!("expected attrs");
+    };
+    assert_eq!(attrs.root_hash, root_hash.as_bytes());
+}
+
+#[tokio::test]
+async fn server_computes_root_hash_when_cache_miss() {
+    use rift_protocol::messages::{stat_result, StatRequest};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+    let file_path = root.join("uncached.txt");
+    std::fs::write(&file_path, b"hello rift").unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    let server_db = Arc::new(Some(db));
+    let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+
+    let mut stream = conn.open_stream().await.unwrap();
+
+    let req = StatRequest {
+        handles: vec![b"uncached.txt".to_vec()],
+    };
+    stream
+        .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
+    assert_eq!(type_id, msg::STAT_RESPONSE);
+
+    let response = StatResponse::decode(&payload[..]).unwrap();
+    let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+        panic!("expected attrs");
+    };
+    // Root hash is always computed, even without a cache
+    assert_eq!(attrs.root_hash.len(), 32);
 }

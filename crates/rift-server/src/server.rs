@@ -19,6 +19,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use prost::Message as _;
 use tracing::{debug, debug_span, instrument, warn, Instrument};
@@ -29,7 +30,7 @@ use rift_transport::{
     RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
 };
 
-use crate::handler;
+use crate::{handler, metadata::db::Database};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -37,19 +38,24 @@ use crate::handler;
 
 /// Accept connections in a loop and serve each one in a background task.
 ///
-/// Returns when the listener is closed.  Individual connection or stream
-/// errors are logged and do not terminate the loop.
-#[instrument(skip(listener), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
-pub async fn accept_loop(listener: QuicListener, share: PathBuf) -> anyhow::Result<()> {
+/// Uses a Merkle cache database for computing root hashes. Pass `None` for `db`
+/// to disable caching (root hashes will still be computed on-demand).
+#[instrument(skip(listener, db), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
+pub async fn accept_loop(
+    listener: QuicListener,
+    share: PathBuf,
+    db: Arc<Option<Database>>,
+) -> anyhow::Result<()> {
     loop {
         match listener.accept().await {
             Ok(conn) => {
                 let share = share.clone();
+                let db = db.clone();
                 let peer = conn.peer_fingerprint().to_string();
                 let conn_span = debug_span!("server.connection", peer = %peer);
                 tokio::spawn(
                     async move {
-                        serve_connection(conn, share).await;
+                        serve_connection(conn, share, db).await;
                     }
                     .instrument(conn_span),
                 );
@@ -67,8 +73,8 @@ pub async fn accept_loop(listener: QuicListener, share: PathBuf) -> anyhow::Resu
 // Per-connection loop
 // ---------------------------------------------------------------------------
 
-#[instrument(skip(conn, share), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
-async fn serve_connection(conn: QuicConnection, share: PathBuf) {
+#[instrument(skip(conn, share, db), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
+async fn serve_connection(conn: QuicConnection, share: PathBuf, db: Arc<Option<Database>>) {
     debug!("connection established");
 
     // TODO(v1): authorise peer fingerprint against per-share permission files
@@ -78,10 +84,11 @@ async fn serve_connection(conn: QuicConnection, share: PathBuf) {
         match conn.accept_stream().await {
             Ok(stream) => {
                 let share = share.clone();
+                let db = db.clone();
                 let stream_span = debug_span!("server.stream", share = %share.display());
                 tokio::spawn(
                     async move {
-                        if let Err(e) = handle_stream(stream, share).await {
+                        if let Err(e) = handle_stream(stream, share, db).await {
                             debug!("stream error: {}", e);
                         }
                     }
@@ -101,7 +108,11 @@ async fn serve_connection(conn: QuicConnection, share: PathBuf) {
 // ---------------------------------------------------------------------------
 
 #[instrument(skip_all, fields(share = %share.display()), err)]
-async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result<()> {
+async fn handle_stream(
+    mut stream: QuicStream,
+    share: PathBuf,
+    db: Arc<Option<Database>>,
+) -> anyhow::Result<()> {
     let (type_id, payload) = match stream.recv_frame().await {
         Ok(Some(f)) => f,
         Ok(None) => {
@@ -158,10 +169,11 @@ async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result
         }
 
         // ------------------------------------------------------------------
-        // Metadata operations
+        // Metadata operations (with optional Merkle cache)
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
-            let response = handler::stat_response(&payload, &share);
+            let db_ref = db.as_ref().as_ref();
+            let response = handler::stat_response(&payload, &share, db_ref);
             stream
                 .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -169,7 +181,8 @@ async fn handle_stream(mut stream: QuicStream, share: PathBuf) -> anyhow::Result
         }
 
         msg::LOOKUP_REQUEST => {
-            let response = handler::lookup_response(&payload, &share);
+            let db_ref = db.as_ref().as_ref();
+            let response = handler::lookup_response(&payload, &share, db_ref);
             stream
                 .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
                 .await?;
