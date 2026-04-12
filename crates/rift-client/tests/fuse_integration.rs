@@ -99,7 +99,7 @@ impl RemoteShare for MockRemoteShare {
         let mut results = Vec::new();
         for handle in handles {
             match self.stats.get(&handle) {
-                Some(attrs) => results.push(Ok(*attrs)),
+                Some(attrs) => results.push(Ok((*attrs).clone())),
                 None => results.push(Err(FsError::NotFound)),
             }
         }

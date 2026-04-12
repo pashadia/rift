@@ -2,6 +2,7 @@
 //!
 //! Client-side API for connecting to Rift servers
 
+pub mod cache;
 pub mod client;
 pub mod remote;
 pub mod view;

@@ -21,6 +21,7 @@ serde.workspace = true
 prost.workspace = true
 async-trait.workspace = true
 rcgen.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
