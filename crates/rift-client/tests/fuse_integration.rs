@@ -11,10 +11,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tempfile::TempDir;
 
+use rift_client::client::{ChunkReadResult, MerkleDrillResult};
 use rift_client::fuse::{path_to_handle, RiftFilesystem};
 use rift_client::remote::RemoteShare;
 use rift_client::view::{RiftShareView, ShareView};
-use rift_client::client::{ChunkReadResult, MerkleDrillResult};
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 

@@ -115,8 +115,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .stat_batch(vec![handle.to_vec()])
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?
-            .remove(0)
-            ?;
+            .remove(0)?;
 
         if attrs.root_hash.is_empty() {
             return Err(FsError::Io);

@@ -327,7 +327,10 @@ async fn client_merkle_drill_fetches_root_level() {
         .await
         .unwrap();
 
-    let result = client.merkle_drill(b"hello.txt", 0, &[]).await.expect("merkle_drill failed");
+    let result = client
+        .merkle_drill(b"hello.txt", 0, &[])
+        .await
+        .expect("merkle_drill failed");
     assert!(!result.hashes.is_empty());
     assert_eq!(result.hashes[0].len(), 32);
 }

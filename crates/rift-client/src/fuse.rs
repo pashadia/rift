@@ -4,11 +4,11 @@
 //! feature is enabled.
 
 use crate::view::ShareView;
-use prost::bytes::Bytes;
 use fuse3::path::prelude::*;
 use fuse3::{Errno, FileType as Fuse3FileType, Result as Fuse3Result};
 use futures::stream;
 use futures::stream::Stream;
+use prost::bytes::Bytes;
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType as ProtoFileType};
 use std::ffi::{OsStr, OsString};
@@ -200,7 +200,9 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         offset: u64,
         size: u32,
     ) -> Fuse3Result<ReplyData> {
-        let handle = path.map(path_to_handle).ok_or_else(|| Errno::from(libc::ENOENT))?;
+        let handle = path
+            .map(path_to_handle)
+            .ok_or_else(|| Errno::from(libc::ENOENT))?;
 
         tracing::debug!(?handle, offset, size, "read request for file");
 
@@ -210,7 +212,9 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
             .await
             .map_err(to_errno)?;
 
-        Ok(ReplyData { data: Bytes::from(data) })
+        Ok(ReplyData {
+            data: Bytes::from(data),
+        })
     }
 
     #[instrument(skip(self), fields(path = ?path), level = "debug")]

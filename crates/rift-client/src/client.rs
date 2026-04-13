@@ -34,8 +34,9 @@ use tracing::instrument;
 use rift_common::FsError;
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ErrorCode,
-    FileAttrs, LookupRequest, LookupResponse, MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse,
-    ReaddirEntry, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse, TransferComplete,
+    FileAttrs, LookupRequest, LookupResponse, MerkleDrill, MerkleLevelResponse, ReadRequest,
+    ReadResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
+    TransferComplete,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
@@ -390,13 +391,11 @@ impl RiftClient {
             .await?;
         stream.finish_send().await?;
 
-        let (_, payload) = stream
-            .recv_frame()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("merkle_drill: server closed stream without response"))?;
+        let (_, payload) = stream.recv_frame().await?.ok_or_else(|| {
+            anyhow::anyhow!("merkle_drill: server closed stream without response")
+        })?;
 
-        let response =
-            MerkleLevelResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
+        let response = MerkleLevelResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
 
         Ok(response)
     }
