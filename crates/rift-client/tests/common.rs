@@ -33,7 +33,16 @@ pub async fn start_server(share: PathBuf) -> SocketAddr {
     let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
         .expect("server_endpoint failed");
     let addr = listener.local_addr();
-    let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
-    tokio::spawn(rift_server::server::accept_loop(listener, share, db));
+
+    // Spawn in a dedicated thread so the server stays alive
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
+        rt.block_on(async { rift_server::server::accept_loop(listener, share, db).await })
+    });
+
+    // Wait for server to be ready
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     addr
 }

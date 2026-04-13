@@ -16,10 +16,6 @@ static MOUNT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ls_on_real_server_succeeds() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("rift_client=debug")
-        .try_init();
-
     let _guard = MOUNT_LOCK.lock().await;
 
     // 1. Start a real server
@@ -34,52 +30,94 @@ async fn test_ls_on_real_server_succeeds() {
     let fs = RiftFilesystem::new(Arc::new(view));
 
     // 3. Mount the filesystem
-    let mount_point = TempDir::new().expect("Failed to create temp mount point");
+    let mount_dir = TempDir::new().expect("Failed to create temp mount point");
+    let mount_path_buf = mount_dir.path().to_path_buf();
+    let mount_path = mount_path_buf.clone();
     let session = fuse3::path::Session::new(fuse3::MountOptions::default());
     let mount_handle = session
-        .mount_with_unprivileged(fs, mount_point.path())
+        .mount_with_unprivileged(fs, mount_path_buf)
         .await
         .expect("mount failed");
 
-    // Give FUSE time to initialize
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Give kernel time to process mount
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    // 4. Run `ls` and assert success
-    let mount_path = mount_point.path().to_path_buf();
+    // 4. Run ls
     let output = tokio::task::spawn_blocking(move || Command::new("ls").arg(&mount_path).output())
         .await
         .unwrap()
-        .expect("ls command failed to execute");
+        .expect("ls failed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("ls output:\n{}", stdout);
+    eprintln!("ls output: {}", stdout);
 
+    // Keep directories alive until here
+    drop(mount_handle);
+    drop(mount_dir);
+    drop(_share_dir);
+
+    // 5. Assert
     assert!(
         output.status.success(),
-        "ls command failed with stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "ls failed: {}",
+        stderr(&output.stderr)
     );
     assert!(stdout.contains("hello.txt"));
     assert!(stdout.contains("subdir"));
+}
 
-    // 5. Run `cat` and assert success
-    let mount_path = mount_point.path().to_path_buf();
-    let cat_output = tokio::task::spawn_blocking(move || {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_file_returns_expected_content() {
+    let _guard = MOUNT_LOCK.lock().await;
+
+    // 1. Start a real server
+    let (_share_dir, share_path) = common::make_share();
+    let addr = common::start_server(share_path).await;
+
+    // 2. Connect a real client
+    let remote = RiftClient::connect(addr, "demo")
+        .await
+        .expect("connect failed");
+    let view = RiftShareView::new(Arc::new(remote));
+    let fs = RiftFilesystem::new(Arc::new(view));
+
+    // 3. Mount
+    let mount_dir = TempDir::new().expect("Failed to create temp mount point");
+    let mount_path_buf = mount_dir.path().to_path_buf();
+    let mount_path = mount_path_buf.clone();
+    let session = fuse3::path::Session::new(fuse3::MountOptions::default());
+    let mount_handle = session
+        .mount_with_unprivileged(fs, mount_path_buf)
+        .await
+        .expect("mount failed");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // 4. Run cat
+    let output = tokio::task::spawn_blocking(move || {
         Command::new("cat")
             .arg(mount_path.join("hello.txt"))
             .output()
     })
     .await
     .unwrap()
-    .expect("cat command failed to execute");
+    .expect("cat failed");
 
-    let cat_stdout = String::from_utf8_lossy(&cat_output.stdout);
-    println!("cat output:\n{}", cat_stdout);
-    eprintln!(
-        "cat stderr: {}",
-        String::from_utf8_lossy(&cat_output.stderr)
+    drop(mount_handle);
+    drop(mount_dir);
+    drop(_share_dir);
+
+    // 5. Assert
+    assert!(
+        output.status.success(),
+        "cat failed: {}",
+        stderr(&output.stderr)
     );
+    let content_raw = String::from_utf8_lossy(&output.stdout);
+    let content = content_raw.trim();
+    assert_eq!(content, "hello rift");
+}
 
-    // 6. Unmount
-    mount_handle.unmount().await.expect("unmount failed");
+fn stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr).to_string()
 }
