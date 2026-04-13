@@ -35,9 +35,12 @@ enum Command {
 async fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
 
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_target(true))
-        .with(tracing_subscriber::filter::LevelFilter::WARN)
+        .with(filter)
         .init();
 
     let args = Args::parse();
