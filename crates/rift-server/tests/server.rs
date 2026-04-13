@@ -141,14 +141,14 @@ fn metadata_to_attrs_directory() {
     assert_eq!(attrs.file_type, FileType::Directory as i32);
 }
 
-#[test]
-fn stat_response_valid_handle_returns_attrs() {
+#[tokio::test]
+async fn stat_response_valid_handle_returns_attrs() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
     let req = StatRequest {
         handles: vec![b"hello.txt".to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
+    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -156,14 +156,14 @@ fn stat_response_valid_handle_returns_attrs() {
     ));
 }
 
-#[test]
-fn stat_response_invalid_handle_returns_error() {
+#[tokio::test]
+async fn stat_response_invalid_handle_returns_error() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
     let req = StatRequest {
         handles: vec![b"nonexistent.txt".to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
+    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -171,14 +171,14 @@ fn stat_response_invalid_handle_returns_error() {
     ));
 }
 
-#[test]
-fn stat_response_multiple_handles() {
+#[tokio::test]
+async fn stat_response_multiple_handles() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
     let req = StatRequest {
         handles: vec![b"hello.txt".to_vec(), b"nonexistent.txt".to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
+    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
     assert_eq!(response.results.len(), 2);
     assert!(matches!(
         response.results[0].result,
@@ -190,15 +190,15 @@ fn stat_response_multiple_handles() {
     ));
 }
 
-#[test]
-fn lookup_response_finds_existing_entry() {
+#[tokio::test]
+async fn lookup_response_finds_existing_entry() {
     use rift_protocol::messages::lookup_response;
     let (_dir, root) = helpers::make_share();
     let req = LookupRequest {
         parent_handle: b".".to_vec(),
         name: "hello.txt".to_string(),
     };
-    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None);
+    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None).await;
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Entry(_))
@@ -210,15 +210,15 @@ fn lookup_response_finds_existing_entry() {
     }
 }
 
-#[test]
-fn lookup_response_missing_entry_returns_error() {
+#[tokio::test]
+async fn lookup_response_missing_entry_returns_error() {
     use rift_protocol::messages::lookup_response;
     let (_dir, root) = helpers::make_share();
     let req = LookupRequest {
         parent_handle: b".".to_vec(),
         name: "does_not_exist.txt".to_string(),
     };
-    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None);
+    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None).await;
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Error(_))
@@ -344,16 +344,16 @@ fn resolve_does_not_panic_on_empty_handle() {
 // connection task.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn stat_response_malformed_payload_does_not_panic() {
+#[tokio::test]
+async fn stat_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    let _ = rift_server::handler::stat_response(b"this is not protobuf", &root, None);
+    let _ = rift_server::handler::stat_response(b"this is not protobuf", &root, None).await;
 }
 
-#[test]
-fn lookup_response_malformed_payload_does_not_panic() {
+#[tokio::test]
+async fn lookup_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root, None);
+    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root, None).await;
 }
 
 #[test]
@@ -710,14 +710,14 @@ mod merkle_integration {
         std::fs::metadata(path).unwrap().len()
     }
 
-    #[test]
-    fn stat_response_returns_root_hash_for_regular_file() {
+    #[tokio::test]
+    async fn stat_response_returns_root_hash_for_regular_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"hello").unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let root_hash = Blake3Hash::new(b"test-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -727,12 +727,14 @@ mod merkle_integration {
             &root_hash,
             &leaf_hashes,
         )
+        .await
         .unwrap();
 
         let req = StatRequest {
             handles: vec![b"test.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -741,8 +743,8 @@ mod merkle_integration {
         assert_eq!(attrs.root_hash, root_hash.as_bytes());
     }
 
-    #[test]
-    fn stat_response_without_db_returns_empty_root_hash() {
+    #[tokio::test]
+    async fn stat_response_without_db_returns_empty_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("test.txt");
@@ -751,7 +753,7 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![b"test.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None);
+        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -761,18 +763,19 @@ mod merkle_integration {
         assert_eq!(attrs.root_hash.len(), 32);
     }
 
-    #[test]
-    fn stat_response_directory_has_root_hash() {
+    #[tokio::test]
+    async fn stat_response_directory_has_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let subdir = root.join("subdir");
         std::fs::create_dir(&subdir).unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let req = StatRequest {
             handles: vec![b"subdir".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -782,14 +785,14 @@ mod merkle_integration {
         assert_eq!(attrs.root_hash.len(), 32);
     }
 
-    #[test]
-    fn stat_response_uses_cached_merkle() {
+    #[tokio::test]
+    async fn stat_response_uses_cached_merkle() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"hello").unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -799,12 +802,14 @@ mod merkle_integration {
             &cached_root,
             &leaf_hashes,
         )
+        .await
         .unwrap();
 
         let req = StatRequest {
             handles: vec![b"test.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -812,14 +817,14 @@ mod merkle_integration {
         assert_eq!(attrs.root_hash, cached_root.as_bytes());
     }
 
-    #[test]
-    fn stat_response_stale_cache_returns_empty_root_hash() {
+    #[tokio::test]
+    async fn stat_response_stale_cache_returns_empty_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"hello").unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let stale_root = Blake3Hash::new(b"stale-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -829,12 +834,14 @@ mod merkle_integration {
             &stale_root,
             &leaf_hashes,
         )
+        .await
         .unwrap();
 
         let req = StatRequest {
             handles: vec![b"test.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -843,19 +850,20 @@ mod merkle_integration {
         assert_eq!(attrs.root_hash.len(), 32);
     }
 
-    #[test]
-    fn stat_response_cache_miss_computes_root_hash() {
+    #[tokio::test]
+    async fn stat_response_cache_miss_computes_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("uncached.txt");
         std::fs::write(&file_path, b"hello").unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
 
         let req = StatRequest {
             handles: vec![b"uncached.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -864,14 +872,14 @@ mod merkle_integration {
         assert_eq!(attrs.root_hash.len(), 32);
     }
 
-    #[test]
-    fn lookup_response_returns_root_hash() {
+    #[tokio::test]
+    async fn lookup_response_returns_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("hello.txt");
         std::fs::write(&file_path, b"hello rift").unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let root_hash = Blake3Hash::new(b"hello-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -881,6 +889,7 @@ mod merkle_integration {
             &root_hash,
             &leaf_hashes,
         )
+        .await
         .unwrap();
 
         let req = LookupRequest {
@@ -888,7 +897,7 @@ mod merkle_integration {
             name: "hello.txt".to_string(),
         };
         let response =
-            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, Some(&db));
+            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
             panic!("expected entry");
@@ -899,8 +908,8 @@ mod merkle_integration {
         );
     }
 
-    #[test]
-    fn lookup_response_without_db_returns_empty_root_hash() {
+    #[tokio::test]
+    async fn lookup_response_without_db_returns_empty_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("hello.txt");
@@ -910,7 +919,8 @@ mod merkle_integration {
             parent_handle: b".".to_vec(),
             name: "hello.txt".to_string(),
         };
-        let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None);
+        let response =
+            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None).await;
 
         let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
             panic!("expected entry");
@@ -919,8 +929,8 @@ mod merkle_integration {
         assert_eq!(entry.attrs.as_ref().unwrap().root_hash.len(), 32);
     }
 
-    #[test]
-    fn stat_response_multiple_files_both_have_root_hash() {
+    #[tokio::test]
+    async fn stat_response_multiple_files_both_have_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file1 = root.join("cached.txt");
@@ -928,7 +938,7 @@ mod merkle_integration {
         std::fs::write(&file1, b"cached").unwrap();
         std::fs::write(&file2, b"uncached").unwrap();
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -938,12 +948,14 @@ mod merkle_integration {
             &cached_root,
             &leaf_hashes,
         )
+        .await
         .unwrap();
 
         let req = StatRequest {
             handles: vec![b"cached.txt".to_vec(), b"uncached.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         assert_eq!(response.results.len(), 2);
         let stat_result::Result::Attrs(attrs1) = response.results[0].result.as_ref().unwrap()
@@ -960,16 +972,17 @@ mod merkle_integration {
         assert_eq!(attrs2.root_hash.len(), 32);
     }
 
-    #[test]
-    fn stat_response_nonexistent_file_returns_error() {
+    #[tokio::test]
+    async fn stat_response_nonexistent_file_returns_error() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
 
         let req = StatRequest {
             handles: vec![b"nonexistent.txt".to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db));
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
 
         assert_eq!(response.results.len(), 1);
         assert!(matches!(
@@ -1022,7 +1035,7 @@ async fn server_sends_root_hash_when_db_configured() {
     let file_path = root.join("hello.txt");
     std::fs::write(&file_path, b"hello rift").unwrap();
 
-    let db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().await.unwrap();
     let root_hash = Blake3Hash::new(b"test-content");
     let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
     db.put_merkle(
@@ -1032,6 +1045,7 @@ async fn server_sends_root_hash_when_db_configured() {
         &root_hash,
         &leaf_hashes,
     )
+    .await
     .unwrap();
 
     let server_db = Arc::new(Some(db));
@@ -1070,7 +1084,7 @@ async fn server_computes_root_hash_when_cache_miss() {
     let file_path = root.join("uncached.txt");
     std::fs::write(&file_path, b"hello rift").unwrap();
 
-    let db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().await.unwrap();
     let server_db = Arc::new(Some(db));
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
     let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;

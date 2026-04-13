@@ -156,36 +156,35 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
 ///
 /// Malformed payloads return an empty result list rather than panicking.
 #[instrument(skip(share, db), fields(share = %share.display()), level = "debug")]
-pub fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) -> StatResponse {
+pub async fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) -> StatResponse {
     let req = match StatRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => return StatResponse { results: vec![] },
     };
 
-    let results = req
-        .handles
-        .into_iter()
-        .map(|handle| {
-            let canonical = match resolve(share, &handle) {
-                Ok(p) => p,
-                Err(_) => {
-                    return stat_error(io_error_code(&handle, share));
-                }
-            };
-
-            let meta = match std::fs::metadata(&canonical) {
-                Ok(m) => m,
-                Err(_) => {
-                    return stat_error(io_error_code(&handle, share));
-                }
-            };
-
-            let root_hash = get_or_compute_merkle_root(&canonical, &meta, db);
-            StatResult {
-                result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
+    let mut results = Vec::with_capacity(req.handles.len());
+    for handle in req.handles {
+        let canonical = match resolve(share, &handle) {
+            Ok(p) => p,
+            Err(_) => {
+                results.push(stat_error(io_error_code(&handle, share)));
+                continue;
             }
-        })
-        .collect();
+        };
+
+        let meta = match std::fs::metadata(&canonical) {
+            Ok(m) => m,
+            Err(_) => {
+                results.push(stat_error(io_error_code(&handle, share)));
+                continue;
+            }
+        };
+
+        let root_hash = get_or_compute_merkle_root(&canonical, &meta, db).await;
+        results.push(StatResult {
+            result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
+        });
+    }
 
     StatResponse { results }
 }
@@ -195,7 +194,11 @@ pub fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) -> Sta
 ///
 /// Returns `ErrorNotFound` if either the parent or the child does not exist.
 #[instrument(skip(share, db), fields(share = %share.display()), level = "debug")]
-pub fn lookup_response(payload: &[u8], share: &Path, db: Option<&Database>) -> LookupResponse {
+pub async fn lookup_response(
+    payload: &[u8],
+    share: &Path,
+    db: Option<&Database>,
+) -> LookupResponse {
     let req = match LookupRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
@@ -242,7 +245,7 @@ pub fn lookup_response(payload: &[u8], share: &Path, db: Option<&Database>) -> L
         .map(|rel| rel.to_string_lossy().into_owned().into_bytes())
         .unwrap_or_else(|_| req.name.into_bytes());
 
-    let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db);
+    let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db).await;
 
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
@@ -385,7 +388,7 @@ fn io_error_code(handle: &[u8], share: &Path) -> ErrorCode {
 /// Always returns a 32-byte Blake3Hash:
 /// - For regular files: Merkle root computed from content (cached if possible)
 /// - For non-files (directories, etc.): uses a constant sentinel hash
-fn get_or_compute_merkle_root(
+async fn get_or_compute_merkle_root(
     path: &Path,
     meta: &std::fs::Metadata,
     db: Option<&Database>,
@@ -396,14 +399,16 @@ fn get_or_compute_merkle_root(
         return root_hash_for_type(true);
     }
 
+    // Try cache first
     if let Some(database) = db {
-        match database.get_merkle(path) {
+        match database.get_merkle(path).await {
             Ok(Some(entry)) => return entry.root,
             Ok(None) => {}
             Err(_) => {}
         }
     }
 
+    // Compute from content
     let content = match std::fs::read(path) {
         Ok(c) => c,
         Err(_) => return root_hash_for_type(true),
@@ -423,6 +428,7 @@ fn get_or_compute_merkle_root(
     let merkle = MerkleTree::default();
     let root = merkle.build(&leaf_hashes);
 
+    // Cache the result
     if let Some(database) = db {
         if let Ok(file_meta) = std::fs::metadata(path) {
             let mtime_ns = match file_meta.modified() {
@@ -432,9 +438,10 @@ fn get_or_compute_merkle_root(
                     .unwrap_or(0),
                 Err(_) => 0,
             };
-
             let file_size = file_meta.len();
-            let _ = database.put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes);
+            let _ = database
+                .put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes)
+                .await;
         }
     }
 
@@ -588,7 +595,9 @@ pub async fn read_response<S: RiftStream>(
                 Err(_) => 0,
             };
             let file_size = file_meta.len();
-            let _ = database.put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes);
+            let _ = database
+                .put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes)
+                .await;
         }
     }
 
@@ -700,7 +709,9 @@ pub async fn merkle_drill_response<S: RiftStream>(
                             .unwrap_or(0)
                     })
                     .unwrap_or(0);
-                let _ = database.put_merkle(&canonical, mtime_ns, meta.len(), &root, &leaf_hashes);
+                let _ = database
+                    .put_merkle(&canonical, mtime_ns, meta.len(), &root, &leaf_hashes)
+                    .await;
             }
         }
 

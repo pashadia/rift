@@ -173,7 +173,7 @@ async fn handle_stream(
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::stat_response(&payload, &share, db_ref);
+            let response = handler::stat_response(&payload, &share, db_ref).await;
             stream
                 .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -182,7 +182,7 @@ async fn handle_stream(
 
         msg::LOOKUP_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::lookup_response(&payload, &share, db_ref);
+            let response = handler::lookup_response(&payload, &share, db_ref).await;
             stream
                 .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
                 .await?;
