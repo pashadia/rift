@@ -1,10 +1,12 @@
 //! Defines the `ShareView` trait, the filesystem-level abstraction that the FUSE
 //! implementation uses.
 
+use crate::cache::db::FileCache;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, ReaddirEntry};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -46,13 +48,27 @@ pub trait ShareView: Send + Sync + 'static {
 /// It acts as a "pass-through" adapter, translating the simple, synchronous
 /// filesystem calls from the FUSE layer into the asynchronous, protocol-level
 /// calls of the `RemoteShare` trait.
+///
+/// Optionally uses a `FileCache` for caching file manifests and chunk data.
 pub struct RiftShareView<R: RemoteShare> {
     remote: Arc<R>,
+    cache: Option<Arc<FileCache>>,
 }
 
 impl<R: RemoteShare> RiftShareView<R> {
     pub fn new(remote: Arc<R>) -> Self {
-        Self { remote }
+        Self {
+            remote,
+            cache: None,
+        }
+    }
+
+    pub async fn with_cache(remote: Arc<R>, cache_dir: PathBuf) -> anyhow::Result<Self> {
+        let cache = FileCache::open(&cache_dir).await?;
+        Ok(Self {
+            remote,
+            cache: Some(Arc::new(cache)),
+        })
     }
 }
 
@@ -108,7 +124,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         handle: &[u8],
         offset: u64,
         length: u64,
-        cached_root_hash: Option<&[u8]>,
+        _cached_root_hash: Option<&[u8]>,
     ) -> Result<Vec<u8>, FsError> {
         let attrs = self
             .remote
@@ -127,13 +143,42 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        if let Some(cached) = cached_root_hash {
-            if cached == merkle_root.as_slice() {
-                tracing::debug!("root hash matches, reading from cache");
-                return Ok(vec![]);
+        // Check cache for manifest and chunk data
+        if let Some(ref cache) = self.cache {
+            // Try to get manifest from cache
+            match cache.get_manifest(handle).await {
+                Ok(Some(manifest)) => {
+                    // Check if root hash matches
+                    if manifest.root.as_bytes() == merkle_root.as_slice() {
+                        // Root matches - try to reconstruct from cache
+                        match cache.reconstruct(&manifest.chunks).await {
+                            Ok(data) => {
+                                let start = offset as usize;
+                                let end = (offset + length).min(file_size) as usize;
+                                if end <= data.len() {
+                                    tracing::debug!("read {} bytes from cache", end - start);
+                                    return Ok(data[start..end].to_vec());
+                                }
+                            }
+                            Err(missing_hashes) => {
+                                tracing::debug!("cache miss for {} chunks", missing_hashes.len());
+                                // Continue to fetch missing chunks
+                            }
+                        }
+                    } else {
+                        tracing::debug!("root hash changed, cache invalid");
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!("no cached manifest for handle");
+                }
+                Err(e) => {
+                    tracing::warn!("cache error: {}", e);
+                }
             }
         }
 
+        // Cache miss or validation failed - fetch from server
         let end = (offset + length).min(file_size);
         let chunk_size = 128 * 1024u64;
         let start_chunk = (offset / chunk_size) as u32;
@@ -163,6 +208,30 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .read_chunks(handle, start_chunk, chunk_count)
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+
+        // Store fetched chunks in cache
+        if let Some(ref cache) = self.cache {
+            for chunk in &read_result.chunks {
+                let _ = cache.put_chunk(&chunk.hash, &chunk.data).await;
+            }
+            // Store manifest for future cache hits
+            let root = rift_common::crypto::Blake3Hash::from_slice(&merkle_root)
+                .unwrap_or_else(|_| rift_common::crypto::Blake3Hash::from_array([0u8; 32]));
+            let manifest = crate::cache::db::Manifest {
+                root,
+                chunks: read_result
+                    .chunks
+                    .iter()
+                    .map(|c| crate::cache::db::ChunkInfo {
+                        index: c.index,
+                        offset: c.index as u64 * chunk_size,
+                        length: c.length,
+                        hash: c.hash,
+                    })
+                    .collect(),
+            };
+            let _ = cache.put_manifest(handle, &manifest).await;
+        }
 
         let mut all_data = Vec::new();
         for chunk in read_result.chunks {

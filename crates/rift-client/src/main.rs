@@ -28,6 +28,10 @@ enum Command {
 
         /// Local directory to mount the filesystem at
         path: PathBuf,
+
+        /// Directory for local cache (optional)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
 }
 
@@ -50,10 +54,11 @@ async fn main() -> Result<()> {
             server,
             share,
             path,
+            cache_dir,
         } => {
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (server, share, path);
+                let _ = (server, share, path, cache_dir);
                 anyhow::bail!("mount is only supported on Linux");
             }
 
@@ -71,12 +76,19 @@ async fn main() -> Result<()> {
                     server = %addr,
                     share  = %share,
                     mountpoint = %path.display(),
+                    cache_dir = ?cache_dir,
                     "connecting to server"
                 );
 
                 let client = rift_client::client::RiftClient::connect(addr, &share).await?;
                 let fingerprint = client.server_fingerprint().to_string();
-                let view = rift_client::view::RiftShareView::new(std::sync::Arc::new(client));
+
+                let view = if let Some(dir) = cache_dir {
+                    rift_client::view::RiftShareView::with_cache(std::sync::Arc::new(client), dir)
+                        .await?
+                } else {
+                    rift_client::view::RiftShareView::new(std::sync::Arc::new(client))
+                };
 
                 println!("Connected — server fingerprint: {fingerprint}");
 
