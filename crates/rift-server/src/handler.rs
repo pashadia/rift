@@ -702,7 +702,32 @@ pub async fn merkle_drill_response<S: RiftStream>(
         return Ok(());
     }
 
-    // For now, return empty for other levels (simplified implementation)
+    // Level 1 = chunk hashes (the leaf level content hashes)
+    if req.level == 1 {
+        let hashes: Vec<Vec<u8>> = leaf_hashes
+            .iter()
+            .map(|h| h.as_bytes().to_vec())
+            .collect();
+        
+        let sizes: Vec<u64> = chunk_boundaries
+            .iter()
+            .map(|(_, length)| *length as u64)
+            .collect();
+
+        let response = MerkleLevelResponse {
+            level: 1,
+            hashes,
+            subtree_bytes: sizes,
+        };
+        stream
+            .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        return Ok(());
+    }
+
+    // For other levels, return empty for now
     let response = MerkleLevelResponse {
         level: req.level,
         hashes: vec![],
