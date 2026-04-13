@@ -117,22 +117,23 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?
             .remove(0)?;
 
+        let file_size = attrs.size;
         if attrs.root_hash.is_empty() {
             return Err(FsError::Io);
         }
         let merkle_root = attrs.root_hash;
 
-        if attrs.size == 0 {
+        if file_size == 0 {
             return Ok(vec![]);
         }
 
         if let Some(cached) = cached_root_hash {
             if cached == merkle_root.as_slice() {
+                tracing::debug!("root hash matches, reading from cache");
                 return Ok(vec![]);
             }
         }
 
-        let file_size = attrs.size;
         let end = (offset + length).min(file_size);
         let chunk_size = 128 * 1024u64;
         let start_chunk = (offset / chunk_size) as u32;
@@ -170,7 +171,6 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         let start_offset = (offset % chunk_size) as usize;
         let requested_length = (end - offset) as usize;
-        
         let result = all_data
             .get(start_offset..start_offset + requested_length)
             .map(|s| s.to_vec())

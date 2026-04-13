@@ -18,8 +18,9 @@ use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
     ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
-    MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest,
-    ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
+    MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry,
+    ReaddirRequest, ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult,
+    TransferComplete,
 };
 use rift_transport::RiftStream;
 
@@ -693,7 +694,11 @@ pub async fn merkle_drill_response<S: RiftStream>(
             if let Ok(meta) = std::fs::metadata(&canonical) {
                 let mtime_ns = meta
                     .modified()
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0))
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0)
+                    })
                     .unwrap_or(0);
                 let _ = database.put_merkle(&canonical, mtime_ns, meta.len(), &root, &leaf_hashes);
             }
@@ -704,11 +709,8 @@ pub async fn merkle_drill_response<S: RiftStream>(
 
     // Level 1 = chunk hashes (the leaf level content hashes)
     if req.level == 1 {
-        let hashes: Vec<Vec<u8>> = leaf_hashes
-            .iter()
-            .map(|h| h.as_bytes().to_vec())
-            .collect();
-        
+        let hashes: Vec<Vec<u8>> = leaf_hashes.iter().map(|h| h.as_bytes().to_vec()).collect();
+
         let sizes: Vec<u64> = chunk_boundaries
             .iter()
             .map(|(_, length)| *length as u64)

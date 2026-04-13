@@ -19,7 +19,7 @@ async fn test_ls_on_real_server_succeeds() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("rift_client=debug")
         .try_init();
-    
+
     let _guard = MOUNT_LOCK.lock().await;
 
     // 1. Start a real server
@@ -46,11 +46,10 @@ async fn test_ls_on_real_server_succeeds() {
 
     // 4. Run `ls` and assert success
     let mount_path = mount_point.path().to_path_buf();
-    let output =
-        tokio::task::spawn_blocking(move || Command::new("ls").arg(&mount_path).output())
-            .await
-            .unwrap()
-            .expect("ls command failed to execute");
+    let output = tokio::task::spawn_blocking(move || Command::new("ls").arg(&mount_path).output())
+        .await
+        .unwrap()
+        .expect("ls command failed to execute");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("ls output:\n{}", stdout);
@@ -65,15 +64,21 @@ async fn test_ls_on_real_server_succeeds() {
 
     // 5. Run `cat` and assert success
     let mount_path = mount_point.path().to_path_buf();
-    let cat_output =
-        tokio::task::spawn_blocking(move || Command::new("cat").arg(mount_path.join("hello.txt")).output())
-            .await
-            .unwrap()
-            .expect("cat command failed to execute");
+    let cat_output = tokio::task::spawn_blocking(move || {
+        Command::new("cat")
+            .arg(mount_path.join("hello.txt"))
+            .output()
+    })
+    .await
+    .unwrap()
+    .expect("cat command failed to execute");
 
     let cat_stdout = String::from_utf8_lossy(&cat_output.stdout);
     println!("cat output:\n{}", cat_stdout);
-    eprintln!("cat stderr: {}", String::from_utf8_lossy(&cat_output.stderr));
+    eprintln!(
+        "cat stderr: {}",
+        String::from_utf8_lossy(&cat_output.stderr)
+    );
 
     // 6. Unmount
     mount_handle.unmount().await.expect("unmount failed");
