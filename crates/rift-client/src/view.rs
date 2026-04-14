@@ -70,6 +70,30 @@ impl<R: RemoteShare> RiftShareView<R> {
             cache: Some(Arc::new(cache)),
         })
     }
+
+    async fn try_read_from_cache(
+        &self,
+        handle: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> Option<Vec<u8>> {
+        let cache = self.cache.as_ref()?;
+        let manifest = cache.get_manifest(handle).await.ok()??;
+        match cache.reconstruct(&manifest.chunks).await {
+            Ok(data) => {
+                let start = offset as usize;
+                let end = (offset + length).min(data.len() as u64) as usize;
+                if end <= data.len() {
+                    tracing::debug!("offline read: served {} bytes from cache", end - start);
+                    return Some(data[start..end].to_vec());
+                }
+            }
+            Err(_) => {
+                tracing::debug!("offline read: could not reconstruct from cache");
+            }
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -126,18 +150,25 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         length: u64,
         _cached_root_hash: Option<&[u8]>,
     ) -> Result<Vec<u8>, FsError> {
-        let attrs = self
-            .remote
-            .stat_batch(vec![handle.to_vec()])
-            .await
-            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?
-            .remove(0)?;
+        let attrs = self.remote.stat_batch(vec![handle.to_vec()]).await;
 
-        let file_size = attrs.size;
-        if attrs.root_hash.is_empty() {
-            return Err(FsError::Io);
-        }
-        let merkle_root = attrs.root_hash;
+        let (file_size, merkle_root) = match attrs {
+            Ok(mut results) => {
+                let attrs = results.remove(0)?;
+                let file_size = attrs.size;
+                if attrs.root_hash.is_empty() {
+                    return Err(FsError::Io);
+                }
+                (file_size, attrs.root_hash)
+            }
+            Err(_) if self.cache.is_some() => {
+                if let Some(data) = self.try_read_from_cache(handle, offset, length).await {
+                    return Ok(data);
+                }
+                return Err(FsError::Io);
+            }
+            Err(_) => return Err(FsError::Io),
+        };
 
         if file_size == 0 {
             return Ok(vec![]);
@@ -620,5 +651,79 @@ mod tests {
             call_count, 1,
             "should fall back to server on root hash mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn read_returns_error_when_offline_and_not_cached() {
+        let cache = FileCache::open_in_memory().await.unwrap();
+        let cache = Arc::new(cache);
+
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView {
+            remote: remote.clone(),
+            cache: Some(cache.clone()),
+        };
+
+        let handle = b"uncached_file";
+
+        remote
+            .set_stat_batch(Err(anyhow::anyhow!("connection lost")))
+            .await;
+
+        let result = view.read(handle, 0, 1024, None).await;
+
+        assert!(
+            result.is_err(),
+            "should return error when server unavailable and not cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_returns_cached_data_when_offline() {
+        let cache = FileCache::open_in_memory().await.unwrap();
+        let cache = Arc::new(cache);
+
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView {
+            remote: remote.clone(),
+            cache: Some(cache.clone()),
+        };
+
+        let handle = b"cached_file";
+        let root_hash = Blake3Hash::new(b"cached-root");
+        let content = b"offline content";
+
+        cache
+            .put_manifest(
+                handle,
+                &Manifest {
+                    root: root_hash.clone(),
+                    chunks: vec![ChunkInfo {
+                        index: 0,
+                        offset: 0,
+                        length: content.len() as u64,
+                        hash: *root_hash.as_bytes(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        cache
+            .put_chunk(root_hash.as_bytes(), content)
+            .await
+            .unwrap();
+
+        remote
+            .set_stat_batch(Err(anyhow::anyhow!("connection lost")))
+            .await;
+
+        let result = view.read(handle, 0, content.len() as u64, None).await;
+
+        assert!(
+            result.is_ok(),
+            "should return cached data when server unavailable"
+        );
+        assert_eq!(result.unwrap(), content);
     }
 }
