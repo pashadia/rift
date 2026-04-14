@@ -49,13 +49,15 @@ use rift_transport::{
 
 /// A connected Rift client session for a single share.
 ///
-/// Construct with [`RiftClient::connect`]; each method opens a new QUIC
-/// stream for its operation and closes it when done.
+/// Construct with [`RiftClient::connect`] for production use, or
+/// [`RiftClient::from_connection`] for testing with mock connections.
 ///
-/// `RiftClient` is `Clone` (the underlying `QuicConnection` is internally
-/// reference-counted) so it can be shared across `Arc` or moved into tasks.
-pub struct RiftClient {
-    conn: QuicConnection,
+/// Each method opens a new QUIC stream for its operation and closes it when done.
+///
+/// `RiftClient` is `Clone` (the underlying connection is reference-counted via
+/// `Arc`) so it can be shared across `Arc` or moved into tasks.
+pub struct RiftClient<C: RiftConnection> {
+    conn: C,
     /// Opaque handle for the share root (from `RiftWelcome.root_handle`).
     root_handle: Vec<u8>,
 }
@@ -75,7 +77,10 @@ pub struct ChunkData {
     pub data: Vec<u8>,
 }
 
-impl RiftClient {
+/// Type alias for a RiftClient backed by a real QUIC connection.
+pub type DefaultRiftClient = RiftClient<QuicConnection>;
+
+impl RiftClient<QuicConnection> {
     /// Connect to a Rift server, authenticate, and mount `share_name`.
     ///
     /// Generates an ephemeral self-signed TLS certificate for this session.
@@ -109,6 +114,16 @@ impl RiftClient {
             root_handle: welcome.root_handle,
         })
     }
+}
+
+impl<C: RiftConnection> RiftClient<C> {
+    /// Construct a client from an already-established connection and root handle.
+    ///
+    /// This is primarily useful for testing with mock or recording connections.
+    /// For production use, prefer [`RiftClient::connect`].
+    pub fn from_connection(conn: C, root_handle: Vec<u8>) -> Self {
+        Self { conn, root_handle }
+    }
 
     /// The server certificate fingerprint
     pub fn server_fingerprint(&self) -> &str {
@@ -131,6 +146,90 @@ impl RiftClient {
         self.conn.close();
     }
 
+    /// Stat multiple handles in batch.
+    ///
+    /// Returns one result per handle, in the same order as the input.
+    /// Each `Ok(attrs)` means the handle exists; `Err(FsError)` indicates
+    /// the handle does not exist or is inaccessible.
+    ///
+    /// Sends a single `StatRequest` with all handles in one network request.
+    #[instrument(skip(self), fields(handle_count = handles.len()), err)]
+    pub async fn stat_batch(
+        &self,
+        handles: Vec<Vec<u8>>,
+    ) -> Result<Vec<Result<FileAttrs, FsError>>> {
+        if handles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("stat_batch: open stream: {e}"))?;
+
+        let req = StatRequest { handles };
+        stream
+            .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        let (_, payload) = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stat_batch: server closed stream without response"))?;
+
+        let response = StatResponse::decode(payload.as_ref())
+            .map_err(|_| anyhow::Error::from(FsError::Io))?;
+
+        let results: Vec<Result<FileAttrs, FsError>> = response
+            .results
+            .into_iter()
+            .map(|result| match result.result {
+                Some(stat_result::Result::Attrs(attrs)) => Ok(attrs),
+                Some(stat_result::Result::Error(e)) => {
+                    let err = map_proto_error(e.code);
+                    Err(err.downcast::<FsError>().unwrap_or(FsError::Io))
+                }
+                None => Err(FsError::Io),
+            })
+            .collect();
+
+        Ok(results)
+    }
+}
+
+/// A trait for connection statistics, primarily for testing.
+pub trait ConnectionStats {
+    fn stream_count(&self) -> usize;
+    fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord>;
+}
+
+impl ConnectionStats for QuicConnection {
+    fn stream_count(&self) -> usize {
+        0
+    }
+    fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord> {
+        Vec::new()
+    }
+}
+
+/// Test helpers for RiftClient backed by RecordingConnection.
+/// These are separate from the main impl block because RecordingConnection
+/// is specifically designed for testing.
+impl RiftClient<rift_transport::RecordingConnection<QuicConnection>> {
+    /// Get the number of times `open_stream` was called on the underlying connection.
+    pub fn stream_count(&self) -> usize {
+        self.conn.stream_count()
+    }
+
+    /// Access the frames recorded by the underlying connection.
+    pub fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord> {
+        self.conn.recorded_frames()
+    }
+}
+
+impl RiftClient<QuicConnection> {
     // -----------------------------------------------------------------------
     // Async filesystem operations
     // -----------------------------------------------------------------------
@@ -439,18 +538,7 @@ impl crate::remote::RemoteShare for RiftClient {
         &self,
         handles: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let result = self.stat(&handle).await;
-            match result {
-                Ok(attrs) => results.push(Ok(attrs)),
-                Err(e) => {
-                    let fs_error = e.downcast::<FsError>().unwrap_or(FsError::Io);
-                    results.push(Err(fs_error));
-                }
-            }
-        }
-        Ok(results)
+        self.stat_batch(handles).await
     }
 
     async fn read_chunks(

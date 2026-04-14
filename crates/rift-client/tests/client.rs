@@ -315,11 +315,6 @@ async fn client_read_chunks_returns_error_for_invalid_handle() {
     assert!(result.is_err());
 }
 
-// ---------------------------------------------------------------------------
-// MerkleDrill
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
 async fn client_merkle_drill_fetches_root_level() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;

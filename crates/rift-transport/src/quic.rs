@@ -120,6 +120,10 @@ impl RiftConnection for QuicConnection {
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed) || self.inner.close_reason().is_some()
     }
+
+    fn close(&self) {
+        self.close();
+    }
 }
 
 // ---------------------------------------------------------------------------

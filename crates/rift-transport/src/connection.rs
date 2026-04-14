@@ -33,6 +33,11 @@ pub trait RiftConnection: Send + Sync {
 
     /// True if the connection has been closed by either side.
     fn is_closed(&self) -> bool;
+
+    /// Close the connection immediately, aborting any in-flight operations.
+    ///
+    /// Subsequent operations should fail promptly.
+    fn close(&self);
 }
 
 /// A bidirectional stream carrying type-and-length-framed protocol messages.
@@ -159,6 +164,10 @@ impl RiftConnection for InMemoryConnection {
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// An in-memory bidirectional stream backed by two tokio channels.
@@ -189,6 +198,118 @@ impl RiftStream for InMemoryStream {
     async fn finish_send(&mut self) -> Result<(), TransportError> {
         self.tx = None;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecordingConnection - for testing request counting
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+/// Trait for accessing recording stats from a connection.
+pub trait RecordingConnectionStats {
+    fn recorded_frames(&self) -> Vec<FrameRecord>;
+}
+
+/// A recording wrapper around any [`RiftConnection`] that tracks all frames sent.
+///
+/// Primarily useful for testing that a client sends the expected number of
+/// requests (e.g., verifying batch operations send one request instead of N).
+pub struct RecordingConnection<C: RiftConnection> {
+    inner: C,
+    /// All frames sent via `send_frame`, in order.
+    frames_sent: Arc<Mutex<Vec<FrameRecord>>>,
+    /// Number of times `open_stream` was called.
+    stream_open_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A recorded frame: type ID and raw payload bytes.
+#[derive(Debug, Clone)]
+pub struct FrameRecord {
+    pub type_id: u8,
+    pub payload: Vec<u8>,
+}
+
+impl<C: RiftConnection> RecordingConnection<C> {
+    /// Wrap a connection to record all frames sent.
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner,
+            frames_sent: Arc::new(Mutex::new(Vec::new())),
+            stream_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Access the recorded frames.
+    pub fn recorded_frames(&self) -> Vec<FrameRecord> {
+        self.frames_sent.lock().unwrap().clone()
+    }
+
+    /// Number of times `open_stream` was called.
+    pub fn stream_count(&self) -> usize {
+        self.stream_open_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl<C: RiftConnection> RiftConnection for RecordingConnection<C> {
+    type Stream = RecordingStream<C::Stream>;
+
+    async fn open_stream(&self) -> Result<Self::Stream, TransportError> {
+        self.stream_open_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stream = self.inner.open_stream().await?;
+        Ok(RecordingStream::new(stream, self.frames_sent.clone()))
+    }
+
+    fn peer_fingerprint(&self) -> &str {
+        self.inner.peer_fingerprint()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+
+    async fn accept_stream(&self) -> Result<Self::Stream, TransportError> {
+        let stream = self.inner.accept_stream().await?;
+        Ok(RecordingStream::new(stream, self.frames_sent.clone()))
+    }
+}
+
+/// A recording stream that wraps any [`RiftStream`].
+pub struct RecordingStream<S: RiftStream> {
+    inner: S,
+    frames_sent: Arc<Mutex<Vec<FrameRecord>>>,
+}
+
+impl<S: RiftStream> RecordingStream<S> {
+    fn new(inner: S, frames_sent: Arc<Mutex<Vec<FrameRecord>>>) -> Self {
+        Self { inner, frames_sent }
+    }
+}
+
+#[async_trait]
+impl<S: RiftStream> RiftStream for RecordingStream<S> {
+    async fn send_frame(&mut self, type_id: u8, payload: &[u8]) -> Result<(), TransportError> {
+        self.frames_sent.lock().unwrap().push(FrameRecord {
+            type_id,
+            payload: payload.to_vec(),
+        });
+        self.inner.send_frame(type_id, payload).await
+    }
+
+    async fn recv_frame(&mut self) -> Result<Option<(u8, Bytes)>, TransportError> {
+        self.inner.recv_frame().await
+    }
+
+    async fn finish_send(&mut self) -> Result<(), TransportError> {
+        self.inner.finish_send().await
     }
 }
 
@@ -284,5 +405,139 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let result = client.open_stream().await;
         assert!(matches!(result, Err(TransportError::ConnectionClosed)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecordingConnection unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recording_connection_tracks_stream_count() {
+        let (inner, _server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+
+        assert_eq!(recording.stream_count(), 0);
+
+        let _s1 = recording.open_stream().await.unwrap();
+        assert_eq!(recording.stream_count(), 1);
+
+        let _s2 = recording.open_stream().await.unwrap();
+        let _s3 = recording.open_stream().await.unwrap();
+        assert_eq!(recording.stream_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn recording_stream_records_frames() {
+        let (inner, _server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+
+        let mut stream = recording.open_stream().await.unwrap();
+        stream.send_frame(0x10, b"first").await.unwrap();
+        stream.send_frame(0x20, b"second").await.unwrap();
+
+        let frames = recording.recorded_frames();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].type_id, 0x10);
+        assert_eq!(frames[0].payload, b"first");
+        assert_eq!(frames[1].type_id, 0x20);
+        assert_eq!(frames[1].payload, b"second");
+    }
+
+    #[tokio::test]
+    async fn recording_connection_wires_to_in_memory() {
+        let (client, server) = InMemoryConnection::pair();
+        let client_recording = RecordingConnection::new(client);
+
+        let mut stream = client_recording.open_stream().await.unwrap();
+        stream.send_frame(0x42, b"test message").await.unwrap();
+        stream.finish_send().await.unwrap();
+
+        let mut server_stream = server.accept_stream().await.unwrap();
+        let (type_id, payload) = server_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, 0x42);
+        assert_eq!(&payload[..], b"test message");
+    }
+
+    #[tokio::test]
+    async fn recording_connection_delegates_peer_fingerprint() {
+        let (inner, _server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+        assert_eq!(recording.peer_fingerprint(), "test-server-fingerprint");
+    }
+
+    #[tokio::test]
+    async fn recording_connection_close_is_delegated() {
+        let (inner, _server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+
+        assert!(!recording.is_closed());
+        recording.close();
+        assert!(recording.is_closed());
+    }
+
+    #[tokio::test]
+    async fn recording_frames_encode_raw_bytes() {
+        let (inner, _server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+
+        let mut stream = recording.open_stream().await.unwrap();
+
+        // Send arbitrary bytes - RecordingConnection stores raw bytes
+        stream
+            .send_frame(0x01, &[0x08, 0x03, 0x2f, 0x66, 0x6f, 0x6f])
+            .await
+            .unwrap();
+
+        let frames = recording.recorded_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].type_id, 0x01);
+        assert_eq!(frames[0].payload, &[0x08, 0x03, 0x2f, 0x66, 0x6f, 0x6f]);
+    }
+
+    #[tokio::test]
+    async fn recording_stream_count_isolation_between_clients() {
+        let (inner1, _s1) = InMemoryConnection::pair();
+        let (inner2, _s2) = InMemoryConnection::pair();
+
+        let rec1 = RecordingConnection::new(inner1);
+        let rec2 = RecordingConnection::new(inner2);
+
+        let _ = rec1.open_stream().await.unwrap();
+        let _ = rec1.open_stream().await.unwrap();
+        let _ = rec2.open_stream().await.unwrap();
+
+        assert_eq!(rec1.stream_count(), 2);
+        assert_eq!(rec2.stream_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn recording_frames_isolation_between_clients() {
+        let (inner1, _s1) = InMemoryConnection::pair();
+        let (inner2, _s2) = InMemoryConnection::pair();
+
+        let rec1 = RecordingConnection::new(inner1);
+        let rec2 = RecordingConnection::new(inner2);
+
+        let mut s1 = rec1.open_stream().await.unwrap();
+        let mut s2 = rec2.open_stream().await.unwrap();
+
+        s1.send_frame(0x10, b"client1").await.unwrap();
+        s2.send_frame(0x20, b"client2").await.unwrap();
+
+        let frames1 = rec1.recorded_frames();
+        let frames2 = rec2.recorded_frames();
+
+        assert_eq!(frames1.len(), 1);
+        assert_eq!(frames1[0].type_id, 0x10);
+        assert_eq!(frames1[0].payload, b"client1");
+
+        assert_eq!(frames2.len(), 1);
+        assert_eq!(frames2[0].type_id, 0x20);
+        assert_eq!(frames2[0].payload, b"client2");
     }
 }
