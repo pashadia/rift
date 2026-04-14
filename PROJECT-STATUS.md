@@ -66,7 +66,7 @@ For complete dependency list and rationale, see [`docs/05-implementation/technol
 - [x] Block-level transfer protocol
 - [x] Content-defined chunking (FastCDC, 32/128/512 KB) ⭐ **FINALIZED**
 - [x] CDC parameters (aggressive delta sync option)
-- [x] Merkle tree structure (1024-ary, high-fanout)
+- [x] Merkle tree structure (64-ary, high-fanout)
 - [x] Write protocol (streaming, resumable)
 - [x] Mutation broadcasts (change notifications)
 
@@ -86,32 +86,32 @@ For complete dependency list and rationale, see [`docs/05-implementation/technol
 - [x] DiscoverRequest/Response
 - [x] WhoamiRequest/Response
 
-**Filesystem operations:** ⚠️ Need to define
-- [ ] STAT_REQUEST/RESPONSE
-- [ ] LOOKUP_REQUEST/RESPONSE
-- [ ] READDIR_REQUEST/RESPONSE (with READDIR_PLUS support)
-- [ ] CREATE_REQUEST/RESPONSE
-- [ ] MKDIR_REQUEST/RESPONSE
-- [ ] UNLINK_REQUEST/RESPONSE
-- [ ] RMDIR_REQUEST/RESPONSE
-- [ ] RENAME_REQUEST/RESPONSE
-- [ ] LINK_REQUEST/RESPONSE
-- [ ] OPEN_REQUEST/RESPONSE
-- [ ] CLOSE_REQUEST
-- [ ] GETXATTR/SETXATTR/LISTXATTR/REMOVEXATTR (if RIFT_XATTRS)
+**Filesystem operations:**
+- [x] STAT_REQUEST/RESPONSE (implemented; batch stat not tested)
+- [x] LOOKUP_REQUEST/RESPONSE
+- [x] READDIR_REQUEST/RESPONSE
+- [ ] CREATE_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] MKDIR_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] UNLINK_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] RMDIR_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] RENAME_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] LINK_REQUEST/RESPONSE (deferred)
+- [ ] OPEN_REQUEST/RESPONSE (not needed - handles used directly)
+- [ ] CLOSE_REQUEST (not needed - stateless operations)
+- [ ] GETXATTR/SETXATTR/LISTXATTR/REMOVEXATTR (if RIFT_XATTRS, deferred)
 
-**Transfer messages:** ⚠️ Need to define
-- [ ] READ_REQUEST/RESPONSE
-- [ ] BLOCK_HEADER
-- [ ] BLOCK_DATA
-- [ ] WRITE_REQUEST/RESPONSE
-- [ ] WRITE_COMPLETE
+**Transfer messages:** ⚠️ Partial implementation, tests failing
+- [x] READ_REQUEST/RESPONSE (partial - tests failing)
+- [x] BLOCK_HEADER (partial - tests failing)
+- [x] BLOCK_DATA (partial - tests failing)
+- [ ] WRITE_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] WRITE_COMPLETE (defined in proto, not in handler)
 
-**Merkle tree messages:** ⚠️ Need to define
-- [ ] MERKLE_COMPARE (root hash exchange)
-- [ ] MERKLE_LEVEL (request/response for tree level)
-- [ ] MERKLE_DRILL (identify differing blocks)
-- [ ] MERKLE_LEAVES (leaf hash batch)
+**Merkle tree messages:** ⚠️ Partial implementation, tests failing
+- [ ] MERKLE_COMPARE (not implemented)
+- [ ] MERKLE_LEVEL (defined, partial server implementation)
+- [x] MERKLE_DRILL (partial - server responds, client tests failing)
+- [ ] MERKLE_LEAVES (defined, not implemented)
 
 **Notification messages:** ⚠️ Deferred (not PoC)
 - [ ] FILE_CHANGED
@@ -179,7 +179,7 @@ For complete dependency list and rationale, see [`docs/05-implementation/technol
 - [x] Technology stack finalized (Rust, quinn, rustls, prost, etc.)
 - [x] QUIC library evaluation (quinn selected over quiche)
 - [x] iroh-blobs evaluation (not used, borrow patterns only)
-- [x] Crate architecture (10 crates: 2 binaries, 8 libraries)
+- [x] Crate architecture (5 crates: 2 binaries, 3 libraries)
 - [x] Dependency graph (clear layering, no cycles)
 - [x] Error handling strategy (thiserror for libs, anyhow for bins)
 - [x] Module organization best practices
@@ -226,19 +226,19 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Error types round-trip through `Display`/`Debug`
 
 **Tasks:**
-- [ ] Create workspace directory structure
-- [ ] Set up root `Cargo.toml` with workspace dependencies
-- [ ] Create per-crate `Cargo.toml` files (8 crates)
-- [ ] Scaffold all crates with basic `lib.rs` / `main.rs`
-- [ ] Implement `rift-common`:
-  - [ ] Configuration parsing (TOML)
-  - [ ] Shared types (ShareInfo, Permissions, etc.)
+- [x] Create workspace directory structure
+- [x] Set up root `Cargo.toml` with workspace dependencies
+- [x] Create per-crate `Cargo.toml` files (5 crates)
+- [x] Scaffold all crates with basic `lib.rs` / `main.rs`
+- [x] Implement `rift-common`:
+  - [x] Configuration parsing (TOML)
+  - [x] Shared types (ShareInfo, Permissions, etc.)
   - [ ] Permission file parsing
-  - [ ] Test utilities (temp dirs, test cert generation)
-  - [ ] BLAKE3 hashing wrapper
-  - [ ] FastCDC chunking wrapper (32/128/512 KB params)
-  - [ ] Merkle tree construction (64-ary)
-  - [ ] Unit tests (hash verification, chunking boundaries, config parsing)
+  - [x] Test utilities (temp dirs, test cert generation)
+  - [x] BLAKE3 hashing wrapper
+  - [x] FastCDC chunking wrapper (32/128/512 KB params)
+  - [x] Merkle tree construction (64-ary)
+  - [x] Unit tests (hash verification, chunking boundaries, config parsing)
 
 ---
 
@@ -259,15 +259,15 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Malformed frames (truncated, oversized) produce clean errors, not panics
 
 **Tasks:**
-- [ ] Write complete `.proto` file (all message types)
-- [ ] Set up `prost-build` in `build.rs`
-- [ ] Generate Rust types
-- [ ] Message type constants
-- [ ] Varint message framing (type + length encoding)
-- [ ] Send/receive message helpers
+- [x] Write complete `.proto` file (all message types)
+- [x] Set up `prost-build` in `build.rs`
+- [x] Generate Rust types
+- [x] Message type constants
+- [x] Varint message framing (type + length encoding)
+- [ ] Send/receive message helpers (partial - in transport layer)
 - [ ] Request/response correlation (for bi-directional streams)
-- [ ] Stream multiplexing utilities
-- [ ] Basic serialization tests
+- [ ] Stream multiplexing utilities (handled by quinn)
+- [x] Basic serialization tests
 
 ---
 
@@ -289,11 +289,11 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Connection drop is detected cleanly
 
 **Tasks:**
-- [ ] Custom TLS verifiers:
-  - [ ] AcceptAnyCertVerifier (server-side, accept all client certs)
-  - [ ] TofuVerifier (client-side, TOFU pinning for self-signed servers)
-- [ ] QUIC connection establishment (quinn wrapper)
-- [ ] Certificate fingerprint extraction (SHA256 of DER)
+- [x] Custom TLS verifiers:
+  - [x] AcceptAnyCertVerifier (server-side, accept all client certs)
+  - [x] TofuVerifier (client-side, TOFU pinning for self-signed servers)
+- [x] QUIC connection establishment (quinn wrapper)
+- [x] Certificate fingerprint extraction (SHA256 of DER)
 - [ ] 0-RTT session resumption
 - [ ] Connection migration handling
 - [ ] Integration tests (establish connection, verify certs)
@@ -321,26 +321,26 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Permission denied paths return proper error
 
 **Tasks:**
-- [ ] Accept QUIC connections
-- [ ] Handle RiftHello/RiftWelcome handshake
-- [ ] Extract client fingerprint from TLS session
+- [x] Accept QUIC connections
+- [x] Handle RiftHello/RiftWelcome handshake
+- [x] Extract client fingerprint from TLS session
 - [ ] Load server config (`/etc/rift/config.toml`)
 - [ ] Load permission files (`/etc/rift/permissions/*.allow`)
 - [ ] Authorization logic (check fingerprint against permissions)
 - [ ] Handle DiscoverRequest (list authorized shares)
 - [ ] Handle WhoamiRequest (return identity info)
 - [ ] Connection logging (in-memory + persistent JSONL)
-- [ ] Share management (map share names to filesystem paths)
+- [x] Share management (map share names to filesystem paths)
 - [ ] File handle generation (encrypted paths)
 - [ ] File handle tracking (open files table)
-- [ ] STAT (return file metadata)
-- [ ] LOOKUP (resolve path to inode)
-- [ ] READDIR (list directory, optionally with stat info)
-- [ ] OPEN (allocate file handle)
-- [ ] READ (serve file data, block-level)
-- [ ] CLOSE (deallocate file handle)
-- [ ] CLI args parsing (config file path, etc.)
-- [ ] Graceful shutdown (SIGTERM/SIGINT handling)
+- [x] STAT (return file metadata)
+- [x] LOOKUP (resolve path to inode)
+- [x] READDIR (list directory, optionally with stat info)
+- [x] OPEN (allocate file handle)
+- [x] READ (serve file data, block-level)
+- [x] CLOSE (deallocate file handle)
+- [x] CLI args parsing (config file path, etc.)
+- [x] Graceful shutdown (SIGTERM/SIGINT handling)
 
 ---
 
@@ -361,16 +361,16 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Client reconnects after server restart (if you implement reconnection here)
 
 **Tasks:**
-- [ ] Connect to server (QUIC + TLS)
-- [ ] Send RiftHello, receive RiftWelcome
+- [x] Connect to server (QUIC + TLS)
+- [x] Send RiftHello, receive RiftWelcome
 - [ ] Verify server cert (CA validation or TOFU prompt)
 - [ ] Send DiscoverRequest, parse response
 - [ ] Send WhoamiRequest, parse response
-- [ ] High-level API (list_shares, whoami, stat, readdir, read_file)
+- [x] High-level API (stat, lookup, readdir, read_chunks, merkle_drill)
 - [ ] Session management (connection pooling)
 - [ ] File handle caching (reuse across operations)
-- [ ] CLI args parsing (clap derive API)
-- [ ] Implement basic client commands
+- [x] CLI args parsing (clap derive API)
+- [ ] Implement basic client commands (only mount implemented)
 - [ ] Interactive prompts (TOFU confirmation)
 - [ ] Output formatting (table, JSON)
 
@@ -395,7 +395,7 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - CoW atomicity: kill server mid-write, original file is intact
 
 **Tasks:**
-- [ ] Protocol messages: WRITE_REQUEST/RESPONSE, ACQUIRE_LOCK/RELEASE_LOCK, CREATE/MKDIR/UNLINK/RMDIR/RENAME
+- [x] Protocol messages: WRITE_REQUEST/RESPONSE, ACQUIRE_LOCK/RELEASE_LOCK, CREATE/MKDIR/UNLINK/RMDIR/RENAME
 - [ ] Server: Write locking (single-writer MVCC), CoW writes, Merkle verification, atomic commit
 - [ ] Client: Acquire lock, stream write data, build Merkle tree, exchange root hash, handle errors
 - [ ] CLI: Implement write commands
@@ -419,8 +419,8 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Full-file sync and delta sync produce identical results
 
 **Tasks:**
-- [ ] Protocol messages: MERKLE_COMPARE, MERKLE_LEVEL, MERKLE_DRILL, MERKLE_LEAVES
-- [ ] Server: Build Merkle tree on first read (cache to disk), serve tree levels, identify changed blocks
+- [x] Protocol messages: MERKLE_COMPARE, MERKLE_LEVEL, MERKLE_DRILL, MERKLE_LEAVES
+- [x] Server: Build Merkle tree on first read (cache to disk), serve tree levels, identify changed blocks
 - [ ] Client: Build Merkle tree from received data, compare trees, request only changed blocks, cache trees
 - [ ] Testing: Full transfer, delta sync, integrity verification
 
@@ -444,45 +444,18 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - Unmount is clean
 
 **Tasks:**
-- [ ] Implement `fuser::Filesystem` trait
-- [ ] Map FUSE operations to `rift-client` calls
-- [ ] File handle management (map FUSE fh to Rift handles)
+- [x] Implement `fuser::Filesystem` trait
+- [x] Map FUSE operations to `rift-client` calls
+- [x] File handle management (map FUSE fh to Rift handles)
 - [ ] Inode number generation
-- [ ] Metadata caching (optional optimization)
+- [x] Metadata caching (optional optimization)
 - [ ] Background worker for async ops
-- [ ] CLI: `rift mount` and `rift umount` commands
+- [x] CLI: `rift mount` command
 - [ ] Testing: Basic file ops, git clone/pull, compile code, stream video
 
 ---
 
-## Phase 6: FUSE Integration 🔜 FUTURE
-
-**Status:** 🔜 Post-PoC
-
-**Estimated duration:** 2-3 weeks
-
-**Tasks:**
-- [ ] Implement FUSE logic in `rift-client`:
-  - [ ] Implement `fuser::Filesystem` trait
-  - [ ] Map FUSE operations to `rift-client` calls
-  - [ ] File handle management (map FUSE fh to Rift handles)
-  - [ ] Inode number generation
-  - [ ] Metadata caching (optional optimization)
-  - [ ] Background worker for async ops
-- [ ] CLI command:
-  - [ ] `rift mount <share>@<server> <mountpoint>` (mount filesystem)
-  - [ ] `rift umount <mountpoint>` (unmount)
-- [ ] Testing:
-  - [ ] Basic file ops (ls, cat, cp, rm)
-  - [ ] Git clone/pull on mounted share
-  - [ ] Compile code on mounted share
-  - [ ] Stream video from mounted share
-
-**Deliverable:** Can mount Rift shares as POSIX filesystems via FUSE
-
----
-
-## Phase 7: Performance & Optimization 🔜 FUTURE
+## Phase 9: Performance & Optimization 🔜 FUTURE
 
 **Status:** 🔜 Post-FUSE
 
@@ -513,7 +486,7 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 
 ---
 
-## Phase 8: Production Readiness 🔜 FUTURE
+## Phase 10: Production Readiness 🔜 FUTURE
 
 **Status:** 🔜 v1 prep
 
@@ -602,15 +575,16 @@ See `docs/05-implementation/crate-architecture.md` for the complete crate archit
 - Hashing: BLAKE3
 - Serialization: protobuf (prost)
 - FUSE: fuser
-- Crate structure: 8 crates (2 binaries with libs, 6 libraries)
+- Crate structure: 5 crates (2 binaries with libs, 3 libraries)
 
-**Crate architecture (simplified from original 10-crate design):**
-- `rift-server` - Server binary (includes server logic)
-- `rift-client` - Client binary (includes client logic)  
-- `rift-protocol` - Protobuf messages + framing (merged `rift-wire`)
-- `rift-transport` - QUIC/TLS abstraction
-- `rift-client` - Client binary (includes optional FUSE implementation)
-- `rift-common` - Shared types, config, utilities, crypto (merged `rift-crypto`)
+**Crate architecture:**
+| Crate | Purpose |
+|-------|---------|
+| `rift-common` | Shared types, config, crypto (BLAKE3, FastCDC, Merkle 64-ary), utilities |
+| `rift-protocol` | Protobuf messages + varint framing codec |
+| `rift-transport` | QUIC/TLS abstraction (quinn + rustls) |
+| `rift-server` | Server library (handles, file serving) |
+| `rift-client` | Client library + FUSE implementation (Linux only) |
 
 **Next immediate task:**
 Create workspace skeleton and implement Phase 1 (rift-common foundation)
