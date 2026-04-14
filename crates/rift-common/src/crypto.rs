@@ -516,4 +516,187 @@ mod merkle_ext_tests {
 
         assert_eq!(root1, root2);
     }
+
+    // =======================================================================
+    // Fanout 64-ary edge cases
+    // =======================================================================
+
+    #[test]
+    fn merkle_64_ary_exactly_fanout() {
+        // 64 leaves = exactly one fanout unit, 1 level
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root = tree.build(&leaves);
+        assert_eq!(root.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn merkle_64_ary_exactly_fanout_deterministic() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&leaves);
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn merkle_64_ary_one_over_fanout() {
+        // 65 leaves = one over fanout boundary, triggers second level
+        // Structure: [0-63] → parent1, [64] → parent2, then root = hash(parent1, parent2)
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root = tree.build(&leaves);
+        assert_eq!(root.as_bytes().len(), 32);
+
+        // Manually build what the tree SHOULD produce:
+        // Level 0: 65 leaves [h0, h1, ..., h64]
+        // Level 1: 2 nodes
+        //   - chunk_0 = hash(h0, h1, ..., h63) for indices 0..64
+        //   - chunk_1 = hash(h64) for index 64
+        // Level 2: 1 root = hash(chunk_0, chunk_1)
+
+        // Verify chunks
+        let chunks: Vec<_> = leaves.chunks(64).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 64);
+        assert_eq!(chunks[1].len(), 1);
+
+        // Compute chunk_0: hash of first 64 leaves
+        let mut hasher0 = blake3::Hasher::new();
+        for hash in chunks[0].iter() {
+            hasher0.update(hash.as_bytes());
+        }
+        let chunk0_hash = Blake3Hash(*hasher0.finalize().as_bytes());
+
+        // Compute chunk_1: hash of last leaf (single element)
+        let mut hasher1 = blake3::Hasher::new();
+        for hash in chunks[1].iter() {
+            hasher1.update(hash.as_bytes());
+        }
+        let chunk1_hash = Blake3Hash(*hasher1.finalize().as_bytes());
+
+        // Compute root: hash of both chunk hashes
+        let mut root_hasher = blake3::Hasher::new();
+        root_hasher.update(chunk0_hash.as_bytes());
+        root_hasher.update(chunk1_hash.as_bytes());
+        let expected_root = Blake3Hash(*root_hasher.finalize().as_bytes());
+
+        assert_eq!(
+            root, expected_root,
+            "Root should match manually computed value"
+        );
+    }
+
+    #[test]
+    fn merkle_64_ary_one_over_fanout_deterministic() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&leaves);
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn merkle_64_ary_fanout_squared() {
+        // 4096 leaves = 64^2, exactly 2 levels
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u16..4096)
+            .map(|i| Blake3Hash::new(&i.to_le_bytes()))
+            .collect();
+
+        let root = tree.build(&leaves);
+        assert_eq!(root.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn merkle_64_ary_fanout_squared_deterministic() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u16..4096)
+            .map(|i| Blake3Hash::new(&i.to_le_bytes()))
+            .collect();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&leaves);
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn merkle_64_ary_over_fanout_squared() {
+        // 4097 leaves = 64^2 + 1, triggers third level
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u16..4097)
+            .map(|i| Blake3Hash::new(&i.to_le_bytes()))
+            .collect();
+
+        let root = tree.build(&leaves);
+        assert_eq!(root.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn merkle_64_ary_over_fanout_squared_deterministic() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u16..4097)
+            .map(|i| Blake3Hash::new(&i.to_le_bytes()))
+            .collect();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&leaves);
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn merkle_64_ary_128_leaves() {
+        // 128 = 2 fanout units, 1 level
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u8..128).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root = tree.build(&leaves);
+        assert_eq!(root.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn merkle_64_ary_128_leaves_deterministic() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0u8..128).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root1 = tree.build(&leaves);
+        let root2 = tree.build(&leaves);
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn merkle_64_ary_65_vs_64_different_roots() {
+        // Verify that going over the fanout boundary produces different roots
+        let tree = MerkleTree::new(64);
+
+        let leaves_64: Vec<_> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves_65: Vec<_> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+
+        let root_64 = tree.build(&leaves_64);
+        let root_65 = tree.build(&leaves_65);
+
+        assert_ne!(root_64, root_65);
+    }
+
+    #[test]
+    fn merkle_64_ary_4096_vs_4097_different_roots() {
+        // Verify that going over the squared fanout boundary produces different roots
+        let tree = MerkleTree::new(64);
+
+        let leaves_4096: Vec<_> = (0u16..4096)
+            .map(|i| Blake3Hash::new(&i.to_le_bytes()))
+            .collect();
+        let leaves_4097: Vec<_> = (0u16..4097)
+            .map(|i| Blake3Hash::new(&i.to_le_bytes()))
+            .collect();
+
+        let root_4096 = tree.build(&leaves_4096);
+        let root_4097 = tree.build(&leaves_4097);
+
+        assert_ne!(root_4096, root_4097);
+    }
 }
