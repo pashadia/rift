@@ -1,14 +1,17 @@
 //! Certificate fingerprint verification policies.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use crate::CertError;
 
 /// Decides whether to trust a remote peer based on its certificate fingerprint.
+#[async_trait]
 pub trait FingerprintPolicy: Send + Sync {
     /// Return `Ok(())` to accept the connection, `Err` to reject it.
-    fn check(&self, fingerprint: &str) -> Result<(), CertError>;
+    async fn check(&self, fingerprint: &str) -> Result<(), CertError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -23,8 +26,9 @@ pub trait FingerprintPolicy: Send + Sync {
 #[derive(Debug)]
 pub struct AcceptAnyPolicy;
 
+#[async_trait]
 impl FingerprintPolicy for AcceptAnyPolicy {
-    fn check(&self, _fingerprint: &str) -> Result<(), CertError> {
+    async fn check(&self, _fingerprint: &str) -> Result<(), CertError> {
         Ok(())
     }
 }
@@ -50,8 +54,9 @@ impl AllowlistPolicy {
     }
 }
 
+#[async_trait]
 impl FingerprintPolicy for AllowlistPolicy {
-    fn check(&self, fingerprint: &str) -> Result<(), CertError> {
+    async fn check(&self, fingerprint: &str) -> Result<(), CertError> {
         if self.allowed.contains(fingerprint) {
             Ok(())
         } else {
@@ -99,26 +104,27 @@ impl TofuStore {
 pub struct TofuPolicy {
     /// The host identity used as the lookup key (e.g. "hostname:port").
     host: String,
-    store: Arc<Mutex<TofuStore>>,
+    store: Arc<tokio::sync::Mutex<TofuStore>>,
 }
 
 impl TofuPolicy {
     pub fn new(host: impl Into<String>, known: HashMap<String, String>) -> Self {
         Self {
             host: host.into(),
-            store: Arc::new(Mutex::new(TofuStore::new(known))),
+            store: Arc::new(tokio::sync::Mutex::new(TofuStore::new(known))),
         }
     }
 
     /// Returns a clone of the `Arc` so the caller can observe and persist state.
-    pub fn store(&self) -> Arc<Mutex<TofuStore>> {
+    pub fn store(&self) -> Arc<tokio::sync::Mutex<TofuStore>> {
         Arc::clone(&self.store)
     }
 }
 
+#[async_trait]
 impl FingerprintPolicy for TofuPolicy {
-    fn check(&self, fingerprint: &str) -> Result<(), CertError> {
-        let mut store = self.store.lock().unwrap();
+    async fn check(&self, fingerprint: &str) -> Result<(), CertError> {
+        let mut store = self.store.lock().await;
         match store.known.get(&self.host) {
             None => {
                 // First contact: pin the fingerprint.
@@ -147,68 +153,71 @@ mod tests {
 
     // --- AcceptAnyPolicy ---
 
-    #[test]
-    fn accept_any_accepts_anything() {
+    #[tokio::test]
+    async fn accept_any_accepts_anything() {
         let policy = AcceptAnyPolicy;
-        assert!(policy.check("aabbccdd").is_ok());
-        assert!(policy.check("").is_ok());
-        assert!(policy.check("definitely-not-a-real-fingerprint").is_ok());
+        assert!(policy.check("aabbccdd").await.is_ok());
+        assert!(policy.check("").await.is_ok());
+        assert!(policy
+            .check("definitely-not-a-real-fingerprint")
+            .await
+            .is_ok());
     }
 
     // --- AllowlistPolicy ---
 
-    #[test]
-    fn allowlist_accepts_known_fingerprint() {
+    #[tokio::test]
+    async fn allowlist_accepts_known_fingerprint() {
         let policy = AllowlistPolicy::new(["aabbccdd", "11223344"]);
-        assert!(policy.check("aabbccdd").is_ok());
-        assert!(policy.check("11223344").is_ok());
+        assert!(policy.check("aabbccdd").await.is_ok());
+        assert!(policy.check("11223344").await.is_ok());
     }
 
-    #[test]
-    fn allowlist_rejects_unknown_fingerprint() {
+    #[tokio::test]
+    async fn allowlist_rejects_unknown_fingerprint() {
         let policy = AllowlistPolicy::new(["aabbccdd"]);
-        let err = policy.check("deadbeef").unwrap_err();
+        let err = policy.check("deadbeef").await.unwrap_err();
         assert!(matches!(err, CertError::NotTrusted { fingerprint } if fingerprint == "deadbeef"));
     }
 
-    #[test]
-    fn allowlist_empty_rejects_all() {
+    #[tokio::test]
+    async fn allowlist_empty_rejects_all() {
         let policy = AllowlistPolicy::new([] as [&str; 0]);
-        assert!(policy.check("anything").is_err());
+        assert!(policy.check("anything").await.is_err());
     }
 
     // --- TofuPolicy ---
 
-    #[test]
-    fn tofu_pins_on_first_contact() {
+    #[tokio::test]
+    async fn tofu_pins_on_first_contact() {
         let policy = TofuPolicy::new("server:4433", HashMap::new());
         let store = policy.store();
 
-        assert!(policy.check("aabbccdd").is_ok());
+        assert!(policy.check("aabbccdd").await.is_ok());
 
-        let s = store.lock().unwrap();
+        let s = store.lock().await;
         assert_eq!(s.known.get("server:4433").unwrap(), "aabbccdd");
         assert!(s.dirty);
     }
 
-    #[test]
-    fn tofu_accepts_known_fingerprint() {
+    #[tokio::test]
+    async fn tofu_accepts_known_fingerprint() {
         let known = HashMap::from([("server:4433".to_string(), "aabbccdd".to_string())]);
         let policy = TofuPolicy::new("server:4433", known);
         let store = policy.store();
 
-        assert!(policy.check("aabbccdd").is_ok());
+        assert!(policy.check("aabbccdd").await.is_ok());
 
         // Already known — dirty should NOT be set
-        assert!(!store.lock().unwrap().dirty);
+        assert!(!store.lock().await.dirty);
     }
 
-    #[test]
-    fn tofu_rejects_changed_fingerprint() {
+    #[tokio::test]
+    async fn tofu_rejects_changed_fingerprint() {
         let known = HashMap::from([("server:4433".to_string(), "aabbccdd".to_string())]);
         let policy = TofuPolicy::new("server:4433", known);
 
-        let err = policy.check("deadbeef").unwrap_err();
+        let err = policy.check("deadbeef").await.unwrap_err();
         assert!(matches!(
             err,
             CertError::FingerprintChanged { ref expected, ref actual }
@@ -216,47 +225,47 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn tofu_does_not_set_dirty_when_fingerprint_unchanged() {
+    #[tokio::test]
+    async fn tofu_does_not_set_dirty_when_fingerprint_unchanged() {
         let known = HashMap::from([("server:4433".to_string(), "aabbccdd".to_string())]);
         let policy = TofuPolicy::new("server:4433", known);
         let store = policy.store();
 
-        policy.check("aabbccdd").unwrap();
-        policy.check("aabbccdd").unwrap();
+        policy.check("aabbccdd").await.unwrap();
+        policy.check("aabbccdd").await.unwrap();
 
-        assert!(!store.lock().unwrap().dirty);
+        assert!(!store.lock().await.dirty);
     }
 
-    #[test]
-    fn tofu_different_hosts_are_independent() {
+    #[tokio::test]
+    async fn tofu_different_hosts_are_independent() {
         let policy = TofuPolicy::new("server-a:4433", HashMap::new());
 
         // First contact with server-a
-        assert!(policy.check("fingerprint-a").is_ok());
+        assert!(policy.check("fingerprint-a").await.is_ok());
 
         // Same policy, same host — still matches
-        assert!(policy.check("fingerprint-a").is_ok());
+        assert!(policy.check("fingerprint-a").await.is_ok());
 
         // Different fingerprint — rejected
-        assert!(policy.check("fingerprint-b").is_err());
+        assert!(policy.check("fingerprint-b").await.is_err());
     }
 
-    #[test]
-    fn tofu_store_shared_across_clones() {
+    #[tokio::test]
+    async fn tofu_store_shared_across_clones() {
         let policy = TofuPolicy::new("server:4433", HashMap::new());
         let store1 = policy.store();
         let store2 = policy.store();
 
-        policy.check("aabbccdd").unwrap();
+        policy.check("aabbccdd").await.unwrap();
 
         // Both Arc clones see the pinned fingerprint
         assert_eq!(
-            store1.lock().unwrap().known.get("server:4433").unwrap(),
+            store1.lock().await.known.get("server:4433").unwrap(),
             "aabbccdd"
         );
         assert_eq!(
-            store2.lock().unwrap().known.get("server:4433").unwrap(),
+            store2.lock().await.known.get("server:4433").unwrap(),
             "aabbccdd"
         );
     }

@@ -121,8 +121,8 @@ impl<P: FingerprintPolicy + std::fmt::Debug + 'static> rustls::client::danger::S
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let fingerprint = cert_fingerprint(end_entity.as_ref());
-        self.policy
-            .check(&fingerprint)
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(self.policy.check(&fingerprint))
             .map_err(|e| TlsError::General(e.to_string()))?;
         Ok(ServerCertVerified::assertion())
     }
