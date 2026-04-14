@@ -172,3 +172,34 @@ async fn recv_hello_on_wrong_message_type_returns_error() {
 
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn client_handshake_rejects_wrong_response_type() {
+    let (listener, connector) = InMemoryListener::new("server", "client");
+
+    let client_conn = connector.connect().unwrap();
+    let server_conn = listener.accept().await.unwrap();
+
+    let welcome_to_send = make_welcome();
+    let server_task = tokio::spawn(async move {
+        let mut s = server_conn.accept_stream().await.unwrap();
+        let hello = recv_hello(&mut s).await.unwrap();
+        assert_eq!(hello.share_name, "my-share");
+        // Send wrong message type instead of RIFT_WELCOME
+        use rift_protocol::messages::msg;
+        use rift_transport::RiftStream;
+        s.send_frame(msg::STAT_REQUEST, b"not-a-welcome")
+            .await
+            .unwrap();
+        s.finish_send().await.unwrap();
+    });
+
+    let mut cs = client_conn.open_stream().await.unwrap();
+    let result = client_handshake(&mut cs, "my-share", &[]).await;
+    assert!(
+        result.is_err(),
+        "client_handshake should reject non-WELCOME frames"
+    );
+
+    server_task.await.unwrap();
+}

@@ -597,3 +597,43 @@ fn generate_client_cert() -> Result<(Vec<u8>, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["rift-client".to_string()])?;
     Ok((cert.cert.der().to_vec(), cert.key_pair.serialize_der()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_common::FsError;
+
+    #[test]
+    fn map_proto_error_not_found() {
+        let err = map_proto_error(ErrorCode::ErrorNotFound as i32);
+        assert!(err.downcast_ref::<FsError>().is_some());
+    }
+
+    #[test]
+    fn map_proto_error_permission_denied() {
+        let err = map_proto_error(ErrorCode::ErrorPermissionDenied as i32);
+        let fs_err = err.downcast_ref::<FsError>().unwrap();
+        assert!(matches!(fs_err, FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn map_proto_error_not_a_directory() {
+        let err = map_proto_error(ErrorCode::ErrorNotADirectory as i32);
+        let fs_err = err.downcast_ref::<FsError>().unwrap();
+        assert!(matches!(fs_err, FsError::NotADirectory));
+    }
+
+    #[test]
+    fn map_proto_error_is_a_directory() {
+        let err = map_proto_error(ErrorCode::ErrorIsADirectory as i32);
+        let fs_err = err.downcast_ref::<FsError>().unwrap();
+        assert!(matches!(fs_err, FsError::NotADirectory));
+    }
+
+    #[test]
+    fn map_proto_error_unknown_code_maps_to_io() {
+        let err = map_proto_error(9999);
+        let fs_err = err.downcast_ref::<FsError>().unwrap();
+        assert!(matches!(fs_err, FsError::Io));
+    }
+}

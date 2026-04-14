@@ -189,6 +189,56 @@ mod tests {
         assert_eq!(root, leaf);
     }
 
+    #[test]
+    fn test_merkle_tree_two_leaves() {
+        let tree = MerkleTree::default();
+        let leaf1 = Blake3Hash::new(b"a");
+        let leaf2 = Blake3Hash::new(b"b");
+        let root = tree.build(&[leaf1.clone(), leaf2.clone()]);
+        assert_ne!(root, leaf1);
+        assert_ne!(root, leaf2);
+    }
+
+    #[test]
+    fn test_merkle_tree_fanout_boundary() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<_> = (0..64).map(|i| Blake3Hash::new(&[i])).collect();
+        let root = tree.build(&leaves);
+        let leaves_65: Vec<_> = (0..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let root_65 = tree.build(&leaves_65);
+        assert_ne!(root, root_65);
+    }
+
+    // Deserialize tests
+    #[test]
+    fn test_deserialize_leaves_exact_multiple() {
+        let tree = MerkleTree::default();
+        let leaves = vec![
+            Blake3Hash::new(b"a"),
+            Blake3Hash::new(b"b"),
+            Blake3Hash::new(b"c"),
+        ];
+        let serialized = tree.serialize_leaves(&leaves);
+        let deserialized = tree.deserialize_leaves(&serialized).unwrap();
+        assert_eq!(deserialized.len(), 3);
+    }
+
+    #[test]
+    fn test_deserialize_leaves_not_multiple_of_32() {
+        let tree = MerkleTree::default();
+        let result = tree.deserialize_leaves(b"too short");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_leaves_exactly_32_bytes() {
+        let tree = MerkleTree::default();
+        let leaf = Blake3Hash::new(b"data");
+        let serialized = leaf.as_bytes();
+        let deserialized = tree.deserialize_leaves(serialized).unwrap();
+        assert_eq!(deserialized.len(), 1);
+    }
+
     // Merkle tree tests - verify determinism
     #[test]
     fn test_merkle_tree_deterministic() {

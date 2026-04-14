@@ -228,3 +228,57 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_protocol::messages::FileType;
+
+    #[test]
+    fn proto_to_fuse3_attr_directory() {
+        let attrs = FileAttrs {
+            file_type: FileType::Directory as i32,
+            size: 4096,
+            mode: 0o755,
+            ..Default::default()
+        };
+        let attr = proto_to_fuse3_attr(&attrs);
+        assert!(matches!(attr.kind, Fuse3FileType::Directory));
+    }
+
+    #[test]
+    fn proto_to_fuse3_attr_symlink() {
+        let attrs = FileAttrs {
+            file_type: FileType::Symlink as i32,
+            size: 10,
+            mode: 0o777,
+            ..Default::default()
+        };
+        let attr = proto_to_fuse3_attr(&attrs);
+        assert!(matches!(attr.kind, Fuse3FileType::Symlink));
+    }
+
+    #[test]
+    fn proto_to_fuse3_attr_regular_file() {
+        let attrs = FileAttrs {
+            file_type: FileType::Regular as i32,
+            size: 100,
+            mode: 0o644,
+            ..Default::default()
+        };
+        let attr = proto_to_fuse3_attr(&attrs);
+        assert!(matches!(attr.kind, Fuse3FileType::RegularFile));
+    }
+
+    #[test]
+    fn proto_to_fuse3_attr_unknown_type_defaults_to_file() {
+        let attrs = FileAttrs {
+            file_type: 9999,
+            size: 0,
+            mode: 0,
+            ..Default::default()
+        };
+        let attr = proto_to_fuse3_attr(&attrs);
+        assert!(matches!(attr.kind, Fuse3FileType::RegularFile));
+    }
+}

@@ -184,6 +184,34 @@ mod tests {
     }
 
     #[test]
+    fn test_message_size_at_max_allowed() {
+        let payload = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = BytesMut::new();
+        encode_message(0x01, &payload, &mut buf).unwrap();
+        let (type_id, decoded) = decode_message(&mut buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x01);
+        assert_eq!(decoded.len(), MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn test_decode_oversized_length() {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.put_u8(0x01);
+        encode_varint((MAX_MESSAGE_SIZE + 1) as u64, &mut buf);
+        let result = decode_message(&mut buf);
+        assert!(matches!(result, Err(CodecError::MessageTooLarge(_))));
+    }
+
+    #[test]
+    fn test_decode_oversized_length_at_limit() {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.put_u8(0x01);
+        encode_varint(MAX_MESSAGE_SIZE as u64, &mut buf);
+        let result = decode_message(&mut buf);
+        assert!(result.is_ok(), "exactly at limit should be ok");
+    }
+
+    #[test]
     fn test_multiple_messages_in_sequence() {
         let mut buf = BytesMut::new();
         encode_message(0x01, b"first", &mut buf).unwrap();
@@ -240,6 +268,17 @@ mod tests {
             let decoded = decode_varint(&mut buf).unwrap().unwrap();
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn test_varint_boundary_at_128() {
+        let mut buf = BytesMut::new();
+        encode_varint(127, &mut buf);
+        assert_eq!(buf.len(), 1, "127 should be single byte");
+
+        buf.clear();
+        encode_varint(128, &mut buf);
+        assert_eq!(buf.len(), 2, "128 should need two bytes (continuation bit)");
     }
 
     #[test]

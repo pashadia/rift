@@ -274,7 +274,31 @@ fn readdir_response_applies_offset() {
     let Some(readdir_response::Result::Entries(offset_entries)) = offset_resp.result else {
         panic!("expected entries");
     };
-    assert_eq!(offset_entries.entries.len(), 0);
+    assert!(
+        offset_entries.entries.is_empty(),
+        "offset at end should return empty"
+    );
+}
+
+#[test]
+fn readdir_response_applies_limit() {
+    use rift_protocol::messages::readdir_response;
+    let (_dir, root) = helpers::make_share();
+
+    let req = ReaddirRequest {
+        directory_handle: b".".to_vec(),
+        offset: 0,
+        limit: 1,
+    };
+    let response = rift_server::handler::readdir_response(&req.encode_to_vec(), &root);
+    let Some(readdir_response::Result::Entries(success)) = response.result else {
+        panic!("expected entries");
+    };
+    assert_eq!(success.entries.len(), 1, "limit 1 should return 1 entry");
+    assert!(
+        success.has_more,
+        "has_more should be true when entries remain"
+    );
 }
 
 // ---------------------------------------------------------------------------
