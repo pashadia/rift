@@ -14,6 +14,24 @@ use tokio::sync::Mutex;
 const MAX_RETRIES: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 100;
 
+fn is_connection_error(err: &anyhow::Error) -> bool {
+    // Don't retry on domain errors (FsError variants)
+    if err.downcast_ref::<FsError>().is_some() {
+        return false;
+    }
+
+    // Check for connection-related error messages
+    let msg = err.to_string().to_lowercase();
+    msg.contains("connection")
+        || msg.contains("timeout")
+        || msg.contains("closed")
+        || msg.contains("stream")
+        || msg.contains("quic")
+        || msg.contains("network")
+        || msg.contains("reset")
+        || msg.contains("refused")
+}
+
 pub struct ReconnectingClient {
     client: Arc<Mutex<RiftClient<rift_transport::QuicConnection>>>,
 }
@@ -35,6 +53,10 @@ impl ReconnectingClient {
         let result = loop {
             match make_op().await {
                 Ok(result) => break Ok(result),
+                Err(e) if !is_connection_error(&e) => {
+                    // Domain error (like NotFound) - don't retry, propagate immediately
+                    break Err(e);
+                }
                 Err(e) if attempts >= MAX_RETRIES => {
                     tracing::warn!("operation failed after {} retries: {}", MAX_RETRIES, e);
                     break Err(e);
@@ -43,7 +65,7 @@ impl ReconnectingClient {
                     attempts += 1;
                     let backoff_ms = BASE_BACKOFF_MS * 2u64.pow(attempts - 1);
                     tracing::warn!(
-                        "operation failed (attempt {}/{}): {}. retrying in {}ms",
+                        "connection error (attempt {}/{}): {}. retrying in {}ms",
                         attempts,
                         MAX_RETRIES,
                         e,
