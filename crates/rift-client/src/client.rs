@@ -286,7 +286,7 @@ impl<C: RiftConnection> RiftClient<C> {
     /// the handle does not exist or is inaccessible.
     ///
     /// Sends a single `StatRequest` with all handles in one network request.
-    #[instrument(skip(self), fields(handle_count = handles.len()), err)]
+    #[instrument(skip(self), fields(handle_count = handles.len()))]
     pub async fn stat_batch(
         &self,
         handles: Vec<Vec<u8>>,
@@ -371,7 +371,7 @@ impl RiftClient<QuicConnection> {
     ///
     /// Server `ErrorCode` values are mapped to [`FsError`] variants so the
     /// FUSE layer can produce the correct POSIX errno.
-    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
+    #[instrument(skip(self), fields(handle_len = handle.len()))]
     pub async fn stat(&self, handle: &[u8]) -> Result<FileAttrs> {
         let mut stream = self
             .conn
@@ -411,7 +411,7 @@ impl RiftClient<QuicConnection> {
     /// Resolve `name` within the directory identified by `parent`.
     ///
     /// Returns `(child_handle, child_attrs)`.
-    #[instrument(skip(self), fields(parent_len = parent.len(), name = %name), err)]
+    #[instrument(skip(self), fields(parent_len = parent.len(), name = %name))]
     pub async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
         let mut stream = self
             .conn
@@ -452,7 +452,7 @@ impl RiftClient<QuicConnection> {
     ///
     /// Returns all entries (no client-side pagination).  FUSE-level
     /// offset/pagination is handled by [`rift_fuse::compute_readdir`].
-    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
+    #[instrument(skip(self), fields(handle_len = handle.len()))]
     pub async fn readdir(&self, handle: &[u8]) -> Result<Vec<ReaddirEntry>> {
         let mut stream = self
             .conn
@@ -496,7 +496,7 @@ impl RiftClient<QuicConnection> {
     /// - `chunk_count`: Number of chunks to read (0 = all remaining)
     ///
     /// Returns `ChunkReadResult` with chunk data and the file's Merkle root.
-    #[instrument(skip(self), fields(handle_len = handle.len()), err)]
+    #[instrument(skip(self), fields(handle_len = handle.len()))]
     pub async fn read_chunks(
         &self,
         handle: &[u8],
@@ -600,7 +600,7 @@ impl RiftClient<QuicConnection> {
     /// - `subtrees`: Specific subtree indices to fetch (empty = all at this level)
     ///
     /// Returns `MerkleLevelResponse` with hashes and subtree byte counts.
-    #[instrument(skip(self), fields(handle_len = handle.len(), level, subtrees_len = subtrees.len()), err)]
+    #[instrument(skip(self), fields(handle_len = handle.len(), level, subtrees_len = subtrees.len()))]
     pub async fn merkle_drill(
         &self,
         handle: &[u8],
