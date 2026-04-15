@@ -166,7 +166,8 @@ impl RiftConnection for InMemoryConnection {
     }
 
     fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

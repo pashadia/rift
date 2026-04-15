@@ -11,7 +11,9 @@ pub mod policy;
 pub mod quic;
 pub mod tls;
 
-pub use connection::{FrameRecord, RecordingConnection, RecordingConnectionStats, RiftConnection, RiftStream};
+pub use connection::{
+    FrameRecord, RecordingConnection, RecordingConnectionStats, RiftConnection, RiftStream,
+};
 pub use error::{CertError, TransportError};
 pub use fingerprint::cert_fingerprint;
 pub use handshake::{

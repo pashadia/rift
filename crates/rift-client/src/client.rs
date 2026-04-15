@@ -58,8 +58,62 @@ use rift_transport::{
 /// `Arc`) so it can be shared across `Arc` or moved into tasks.
 pub struct RiftClient<C: RiftConnection> {
     conn: C,
-    /// Opaque handle for the share root (from `RiftWelcome.root_handle`).
     root_handle: Vec<u8>,
+    addr: SocketAddr,
+    share_name: String,
+    cert: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl<C: RiftConnection + Clone> Clone for RiftClient<C> {
+    fn clone(&self) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            root_handle: self.root_handle.clone(),
+            addr: self.addr,
+            share_name: self.share_name.clone(),
+            cert: self.cert.clone(),
+            key: self.key.clone(),
+        }
+    }
+}
+
+impl RiftClient<QuicConnection> {
+    /// Reconnect to the server using stored connection parameters.
+    ///
+    /// Returns a new client with a fresh connection. The new client preserves
+    /// the server address, share name, and TLS certificate from the original.
+    pub async fn reconnect(&self) -> Result<Self> {
+        tracing::info!(
+            addr = %self.addr,
+            share_name = %self.share_name,
+            "reconnecting to server"
+        );
+
+        let ep = client_endpoint(&self.cert, &self.key)?;
+        let conn = connect(&ep, self.addr, "rift-server", Arc::new(AcceptAnyPolicy))
+            .await
+            .map_err(|e| anyhow::anyhow!("QUIC reconnect to {}: {e}", self.addr))?;
+
+        let mut ctrl = conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("open control stream: {e}"))?;
+
+        let welcome = client_handshake(&mut ctrl, &self.share_name, &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake for share '{}': {e}", self.share_name))?;
+
+        tracing::info!("reconnected successfully");
+        Ok(Self {
+            conn,
+            root_handle: welcome.root_handle,
+            addr: self.addr,
+            share_name: self.share_name.clone(),
+            cert: self.cert.clone(),
+            key: self.key.clone(),
+        })
+    }
 }
 
 /// Result of a read_chunks operation, containing the fetched chunk data and Merkle root.
@@ -112,6 +166,78 @@ impl RiftClient<QuicConnection> {
         Ok(Self {
             conn,
             root_handle: welcome.root_handle,
+            addr,
+            share_name: share_name.to_string(),
+            cert,
+            key,
+        })
+    }
+
+    /// Connect with explicit certificate paths.
+    ///
+    /// - If `cert_key_paths` is `Some((cert_path, key_path))`, loads the cert/key from those files.
+    /// - If `None`, generates an ephemeral cert, optionally saving to `config_dir`.
+    /// - If `config_dir` is provided and no cert exists, saves generated cert there.
+    #[instrument(fields(addr = %addr, share_name = %share_name), err)]
+    pub async fn connect_with_cert(
+        addr: SocketAddr,
+        share_name: &str,
+        cert_key_paths: Option<(&std::path::Path, &std::path::Path)>,
+        config_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let (cert, key) = match cert_key_paths {
+            Some((cert_path, key_path)) => {
+                let cert = std::fs::read(cert_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
+                let key = std::fs::read(key_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
+                (cert, key)
+            }
+            None => {
+                let cert_path = config_dir.join("client.cert");
+                let key_path = config_dir.join("client.key");
+                if cert_path.exists() && key_path.exists() {
+                    let cert = std::fs::read(&cert_path)
+                        .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
+                    let key = std::fs::read(&key_path)
+                        .map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
+                    (cert, key)
+                } else {
+                    let (cert, key) = generate_client_cert()?;
+                    if !config_dir.exists() {
+                        std::fs::create_dir_all(config_dir)
+                            .map_err(|e| anyhow::anyhow!("failed to create config dir: {e}"))?;
+                    }
+                    std::fs::write(&cert_path, &cert)
+                        .map_err(|e| anyhow::anyhow!("failed to write cert: {e}"))?;
+                    std::fs::write(&key_path, &key)
+                        .map_err(|e| anyhow::anyhow!("failed to write key: {e}"))?;
+                    (cert, key)
+                }
+            }
+        };
+
+        let ep = client_endpoint(&cert, &key)?;
+        let conn = connect(&ep, addr, "rift-server", Arc::new(AcceptAnyPolicy))
+            .await
+            .map_err(|e| anyhow::anyhow!("QUIC connect to {addr}: {e}"))?;
+
+        let mut ctrl = conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("open control stream: {e}"))?;
+
+        let welcome = client_handshake(&mut ctrl, share_name, &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake for share '{share_name}': {e}"))?;
+
+        Ok(Self {
+            conn,
+            root_handle: welcome.root_handle,
+            addr,
+            share_name: share_name.to_string(),
+            cert,
+            key,
         })
     }
 }
@@ -120,9 +246,16 @@ impl<C: RiftConnection> RiftClient<C> {
     /// Construct a client from an already-established connection and root handle.
     ///
     /// This is primarily useful for testing with mock or recording connections.
-    /// For production use, prefer [`RiftClient::connect`].
+    /// For production use, prefer [`RiftClient::connect`] or [`RiftClient::connect_with_cert`].
     pub fn from_connection(conn: C, root_handle: Vec<u8>) -> Self {
-        Self { conn, root_handle }
+        Self {
+            conn,
+            root_handle,
+            addr: "127.0.0.1:0".parse().unwrap(),
+            share_name: String::new(),
+            cert: Vec::new(),
+            key: Vec::new(),
+        }
     }
 
     /// The server certificate fingerprint
@@ -179,8 +312,8 @@ impl<C: RiftConnection> RiftClient<C> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("stat_batch: server closed stream without response"))?;
 
-        let response = StatResponse::decode(payload.as_ref())
-            .map_err(|_| anyhow::Error::from(FsError::Io))?;
+        let response =
+            StatResponse::decode(payload.as_ref()).map_err(|_| anyhow::Error::from(FsError::Io))?;
 
         let results: Vec<Result<FileAttrs, FsError>> = response
             .results
@@ -525,7 +658,7 @@ impl From<MerkleLevelResponse> for MerkleDrillResult {
 /// The async methods simply delegate to the corresponding `RiftClient` methods.
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 #[async_trait::async_trait]
-impl crate::remote::RemoteShare for RiftClient {
+impl crate::remote::RemoteShare for RiftClient<QuicConnection> {
     async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
         self.lookup(parent, name).await
     }

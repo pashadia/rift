@@ -11,7 +11,9 @@ mod common;
 use common as helpers;
 
 use rift_protocol::messages::msg;
-use rift_transport::{client_endpoint, connect, AcceptAnyPolicy, RecordingConnection, RiftConnection};
+use rift_transport::{
+    client_endpoint, connect, AcceptAnyPolicy, RecordingConnection, RiftConnection,
+};
 
 // ---------------------------------------------------------------------------
 // stat_batch behavior tests
@@ -123,15 +125,17 @@ async fn stat_batch_sends_single_request_with_all_handles() {
     let recording_conn = RecordingConnection::new(real_conn);
 
     // Do the handshake to get root handle
-    let mut ctrl = recording_conn.open_stream().await.expect("open stream failed");
+    let mut ctrl = recording_conn
+        .open_stream()
+        .await
+        .expect("open stream failed");
     let welcome = rift_transport::client_handshake(&mut ctrl, "demo", &[])
         .await
         .expect("handshake failed");
     let root_handle = welcome.root_handle;
 
     // Create client with the recording connection
-    let client =
-        rift_client::client::RiftClient::from_connection(recording_conn, root_handle);
+    let client = rift_client::client::RiftClient::from_connection(recording_conn, root_handle);
 
     // Record the stream count after handshake (so we can measure just stat_batch)
     let streams_before = client.stream_count();
@@ -164,9 +168,5 @@ async fn stat_batch_sends_single_request_with_all_handles() {
         .into_iter()
         .filter(|f| f.type_id == msg::STAT_REQUEST)
         .collect();
-    assert_eq!(
-        stat_frames.len(),
-        1,
-        "should send exactly 1 STAT_REQUEST"
-    );
+    assert_eq!(stat_frames.len(), 1, "should send exactly 1 STAT_REQUEST");
 }

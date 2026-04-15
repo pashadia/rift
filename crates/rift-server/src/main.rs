@@ -18,6 +18,14 @@ struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:4433")]
     addr: SocketAddr,
+
+    /// TLS certificate file (PEM). If not specified, generates an ephemeral certificate.
+    #[arg(long)]
+    cert: Option<PathBuf>,
+
+    /// TLS private key file (PEM). Required if --cert is specified.
+    #[arg(long)]
+    key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -38,10 +46,20 @@ async fn main() -> Result<()> {
         anyhow::bail!("share path does not exist: {}", args.share.display());
     }
 
-    // TODO(v1): load a persistent cert from /etc/rift/server.{cert,key}.
-    let cert = rcgen::generate_simple_self_signed(vec!["rift-server".to_string()])?;
-    let cert_der = cert.cert.der().to_vec();
-    let key_der = cert.key_pair.serialize_der();
+    let (cert_der, key_der) = match (&args.cert, &args.key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_der = std::fs::read(cert_path)
+                .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
+            let key_der =
+                std::fs::read(key_path).map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
+            (cert_der, key_der)
+        }
+        (None, None) => {
+            let cert = rcgen::generate_simple_self_signed(vec!["rift-server".to_string()])?;
+            (cert.cert.der().to_vec(), cert.key_pair.serialize_der())
+        }
+        _ => anyhow::bail!("both --cert and --key must be specified together"),
+    };
 
     let fingerprint = rift_transport::cert_fingerprint(&cert_der);
     tracing::info!(addr = %args.addr, share = %args.share.display(), "starting rift-server");
