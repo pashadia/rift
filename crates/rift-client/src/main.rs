@@ -119,11 +119,16 @@ async fn main() -> Result<()> {
                 .await?;
                 let fingerprint = client.server_fingerprint().to_string();
 
+                let reconnecting = rift_client::reconnect::ReconnectingClient::new(client);
+
                 let view = if let Some(dir) = cache_dir {
-                    rift_client::view::RiftShareView::with_cache(std::sync::Arc::new(client), dir)
-                        .await?
+                    rift_client::view::RiftShareView::with_cache(
+                        std::sync::Arc::new(reconnecting),
+                        dir,
+                    )
+                    .await?
                 } else {
-                    rift_client::view::RiftShareView::new(std::sync::Arc::new(client))
+                    rift_client::view::RiftShareView::new(std::sync::Arc::new(reconnecting))
                 };
 
                 println!("Connected — server fingerprint: {fingerprint}");
