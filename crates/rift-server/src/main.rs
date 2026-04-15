@@ -19,11 +19,12 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:4433")]
     addr: SocketAddr,
 
-    /// TLS certificate file (PEM). If not specified, generates an ephemeral certificate.
+    /// TLS certificate file. If not specified, uses ~/.config/rift/server.cert
+    /// or generates a new one on first boot.
     #[arg(long)]
     cert: Option<PathBuf>,
 
-    /// TLS private key file (PEM). Required if --cert is specified.
+    /// TLS private key file. Required if --cert is specified.
     #[arg(long)]
     key: Option<PathBuf>,
 }
@@ -46,20 +47,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("share path does not exist: {}", args.share.display());
     }
 
-    let (cert_der, key_der) = match (&args.cert, &args.key) {
-        (Some(cert_path), Some(key_path)) => {
-            let cert_der = std::fs::read(cert_path)
-                .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
-            let key_der =
-                std::fs::read(key_path).map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
-            (cert_der, key_der)
-        }
-        (None, None) => {
-            let cert = rcgen::generate_simple_self_signed(vec!["rift-server".to_string()])?;
-            (cert.cert.der().to_vec(), cert.key_pair.serialize_der())
-        }
-        _ => anyhow::bail!("both --cert and --key must be specified together"),
-    };
+    let (cert_der, key_der) = rift_server::cert::get_or_create_cert(args.cert, args.key)?;
 
     let fingerprint = rift_transport::cert_fingerprint(&cert_der);
     tracing::info!(addr = %args.addr, share = %args.share.display(), "starting rift-server");

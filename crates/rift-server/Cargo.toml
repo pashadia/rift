@@ -21,6 +21,8 @@ serde.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rcgen.workspace = true
+rustls.workspace = true
+dirs.workspace = true
 tokio-rusqlite = "0.7"
 
 rift-common = { path = "../rift-common" }

@@ -1281,3 +1281,113 @@ async fn server_read_returns_error_for_invalid_handle() {
         _ => panic!("expected error"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Certificate management tests
+// ---------------------------------------------------------------------------
+
+mod cert_tests {
+    use super::*;
+
+    fn default_cert_paths(tmp_dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        (tmp_dir.join("server.cert"), tmp_dir.join("server.key"))
+    }
+
+    #[test]
+    fn cert_manager_generates_cert_if_none_exist() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let result = rift_server::cert::get_or_create_cert(
+            Some(tmp_dir.path().join("new.cert")),
+            Some(tmp_dir.path().join("new.key")),
+        );
+
+        assert!(
+            result.is_ok(),
+            "should generate cert when none exist: {:?}",
+            result
+        );
+        let (cert, key) = result.unwrap();
+        assert!(!cert.is_empty(), "cert should not be empty");
+        assert!(!key.is_empty(), "key should not be empty");
+
+        // Files should be created
+        assert!(tmp_dir.path().join("new.cert").exists());
+        assert!(tmp_dir.path().join("new.key").exists());
+    }
+
+    #[test]
+    fn cert_manager_reads_existing_cert() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = default_cert_paths(tmp_dir.path());
+
+        // First, generate a cert
+        let (original_cert, original_key) =
+            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()))
+                .unwrap();
+
+        // Now read it again
+        let (read_cert, read_key) =
+            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()))
+                .unwrap();
+
+        assert_eq!(original_cert, read_cert, "cert should be same on re-read");
+        assert_eq!(original_key, read_key, "key should be same on re-read");
+    }
+
+    #[test]
+    fn cert_manager_returns_same_fingerprint_on_reconnect() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = default_cert_paths(tmp_dir.path());
+
+        // Generate cert
+        let (cert, _key) =
+            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()))
+                .unwrap();
+
+        let fp1 = rift_transport::cert_fingerprint(&cert);
+
+        // Re-read and check fingerprint
+        let (cert2, _key2) =
+            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()))
+                .unwrap();
+
+        let fp2 = rift_transport::cert_fingerprint(&cert2);
+        assert_eq!(fp1, fp2, "fingerprint should be stable across re-reads");
+    }
+
+    #[test]
+    fn cert_manager_provides_helpful_error_for_pem() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = default_cert_paths(tmp_dir.path());
+
+        // Write a PEM certificate (invalid for our format)
+        let pem_cert = r#"-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIBITAKBggqhkjOPQQDAjAhMQswCQYDVQQGEwJVUzEL
+MAkGA1UECAwCQ0EwHhcNMjMwMDEwMDAwMDAwWhcNMjQwMTIzMTIzNTk1WjAh
+MQswCQYDVQQGEwJVUzELMAkGA1UECAwCQ0EwCgYIKoZIzj0EAwIDSQAwRgIh
+APz2u0I0x5lE7V5aE9qG3g0C1A2p2q0N1q1q1q1q1q1q1q1q1q1q1q1q1q1q
+-----END CERTIFICATE-----"#;
+
+        let pem_key = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg5cDZj5x5x5x5x5
+x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5
+x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x
+x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x
+-----END PRIVATE KEY-----"#;
+
+        std::fs::write(&cert_path, pem_cert).unwrap();
+        std::fs::write(&key_path, pem_key).unwrap();
+
+        let result =
+            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()));
+
+        assert!(result.is_err(), "should fail with PEM cert");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("PEM") || err.contains("format") || err.contains("invalid"),
+            "error should mention format issue: {}",
+            err
+        );
+    }
+}
