@@ -190,9 +190,44 @@ impl RemoteShare for ReconnectingClient {
             async move {
                 let client = client.lock().await;
                 let resp = client.merkle_drill(&handle, level, &subtrees).await?;
-                Ok(resp.into())
+                Ok(        resp.into())
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_connection_error_returns_false_for_fs_error() {
+        let not_found = anyhow::Error::new(FsError::NotFound);
+        assert!(!is_connection_error(&not_found));
+
+        let perm_denied = anyhow::Error::new(FsError::PermissionDenied);
+        assert!(!is_connection_error(&perm_denied));
+
+        let io_error = anyhow::Error::new(FsError::Io);
+        assert!(!is_connection_error(&io_error));
+    }
+
+    #[test]
+    fn is_connection_error_returns_true_for_connection_errors() {
+        let timeout = anyhow::anyhow!("connection timed out");
+        assert!(is_connection_error(&timeout));
+
+        let closed = anyhow::anyhow!("connection closed");
+        assert!(is_connection_error(&closed));
+
+        let refused = anyhow::anyhow!("connection refused");
+        assert!(is_connection_error(&refused));
+    }
+
+    #[test]
+    fn is_connection_error_returns_true_for_quic_errors() {
+        let quic_err = anyhow::anyhow!("QUIC connection error: timed out");
+        assert!(is_connection_error(&quic_err));
     }
 }
