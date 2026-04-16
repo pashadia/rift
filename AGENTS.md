@@ -182,12 +182,47 @@ proptest! {
 
 ### Test-Driven Development (TDD)
 
-This project follows TDD practices:
+**STRICT REQUIREMENT**: This project uses TDD for ALL code. Not a single line of production code gets written without having a failing test first. Never disregard this flow without explicit permission.
 
-1. Write test describing expected behavior
-2. Implement minimal code to pass test
-3. Refactor while keeping tests green
-4. Run tests frequently (`cargo test` is fast)
+#### The TDD Cycle (Red-Green-Refactor)
+
+1. **Red** - Write a failing test that describes the expected behavior
+   - Tests must be atomic: test one thing at a time
+   - Work in small steps: each test should fail for a specific reason
+   - Run the test to confirm it fails (Red)
+
+2. **Green** - Write minimal code to make the test pass
+   - Write only what's needed to pass the test
+   - No premature abstractions or "future-proofing"
+   - Run the test to confirm it passes (Green)
+
+3. **Refactor** - Improve code while keeping tests green
+   - Consider whether the current code (or tests) is the best it can be for the implemented functionality
+   - **Only consider what's currently implemented** - don't try to anticipate future needs
+   - It's OK if the Refactor step makes no changes
+   - Run tests to confirm they still pass
+
+#### Test Tool
+
+**Use `cargo nextest` instead of `cargo test`** for faster, better test execution:
+
+```bash
+# Run all tests with nextest
+cargo nextest run
+
+# Run a specific test
+cargo nextest run test_name
+
+# Run with output
+cargo nextest run -- -s
+```
+
+#### Never Skip TDD
+
+- Never write implementation code before a failing test
+- Never write a test that passes before implementation exists
+- Never skip the Refactor step after making tests green
+- Never "just write both" without following the cycle
 
 ### Performance
 
