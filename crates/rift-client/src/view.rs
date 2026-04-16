@@ -342,10 +342,8 @@ impl<R: RemoteShare> RiftShareView<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::db::{ChunkInfo, FileCache, Manifest};
     use crate::client::{ChunkData, ChunkReadResult, MerkleDrillResult};
     use async_trait::async_trait;
-    use rift_common::crypto::Blake3Hash;
     use rift_protocol::messages::ReaddirEntry;
     use std::sync::Arc;
     use tokio::sync::Mutex;
