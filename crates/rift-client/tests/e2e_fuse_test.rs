@@ -26,7 +26,8 @@ async fn test_ls_on_real_server_succeeds() {
     let remote = RiftClient::connect(addr, "demo")
         .await
         .expect("connect failed");
-    let view = RiftShareView::new(Arc::new(remote));
+    let root_handle = remote.root_handle();
+    let view = RiftShareView::new(Arc::new(remote), root_handle);
     let fs = RiftFilesystem::new(Arc::new(view));
 
     // 3. Mount the filesystem
@@ -78,7 +79,8 @@ async fn test_read_file_returns_expected_content() {
     let remote = RiftClient::connect(addr, "demo")
         .await
         .expect("connect failed");
-    let view = RiftShareView::new(Arc::new(remote));
+    let root_handle = remote.root_handle();
+    let view = RiftShareView::new(Arc::new(remote), root_handle);
     let fs = RiftFilesystem::new(Arc::new(view));
 
     // 3. Mount

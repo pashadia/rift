@@ -14,6 +14,7 @@ use rift_protocol::messages::msg;
 use rift_transport::{
     client_endpoint, connect, AcceptAnyPolicy, RecordingConnection, RiftConnection,
 };
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // stat_batch behavior tests
@@ -27,8 +28,18 @@ async fn client_stat_batch_returns_results_in_order() {
         .await
         .unwrap();
 
+    // Lookup files to get their Uuid handles
+    let (hello_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup hello.txt failed");
+    let (subdir_handle, _) = client
+        .lookup(client.root_handle(), "subdir")
+        .await
+        .expect("lookup subdir failed");
+
     let results = client
-        .stat_batch(vec![b"hello.txt".to_vec(), b"subdir".to_vec()])
+        .stat_batch(vec![hello_handle, subdir_handle])
         .await
         .expect("stat_batch failed");
 
@@ -50,12 +61,21 @@ async fn client_stat_batch_handles_mixed_results() {
         .await
         .unwrap();
 
+    // Lookup existing files to get their Uuid handles
+    let (hello_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup hello.txt failed");
+    let (subdir_handle, _) = client
+        .lookup(client.root_handle(), "subdir")
+        .await
+        .expect("lookup subdir failed");
+
+    // Create a random Uuid for a non-existent file
+    let nonexistent_handle = Uuid::now_v7();
+
     let results = client
-        .stat_batch(vec![
-            b"hello.txt".to_vec(),
-            b"nonexistent.txt".to_vec(),
-            b"subdir".to_vec(),
-        ])
+        .stat_batch(vec![hello_handle, nonexistent_handle, subdir_handle])
         .await
         .expect("stat_batch failed");
 
@@ -87,8 +107,14 @@ async fn client_stat_batch_single_handle() {
         .await
         .unwrap();
 
+    // Lookup the file to get its Uuid handle
+    let (hello_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup hello.txt failed");
+
     let results = client
-        .stat_batch(vec![b"hello.txt".to_vec()])
+        .stat_batch(vec![hello_handle])
         .await
         .expect("stat_batch failed");
 
@@ -132,24 +158,32 @@ async fn stat_batch_sends_single_request_with_all_handles() {
     let welcome = rift_transport::client_handshake(&mut ctrl, "demo", &[])
         .await
         .expect("handshake failed");
-    let root_handle = welcome.root_handle;
+    let root_handle =
+        Uuid::from_slice(&welcome.root_handle).expect("invalid root handle from server");
 
     // Create client with the recording connection
     let client = rift_client::client::RiftClient::from_connection(recording_conn, root_handle);
 
+    // Create a regular client to lookup handles (since we need Uuids)
+    let lookup_client = rift_client::client::RiftClient::connect(server_addr, "demo")
+        .await
+        .expect("connect failed");
+    let (hello_handle, _) = lookup_client
+        .lookup(lookup_client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup hello.txt failed");
+    let (subdir_handle, _) = lookup_client
+        .lookup(lookup_client.root_handle(), "subdir")
+        .await
+        .expect("lookup subdir failed");
+    let nonexistent_handle = Uuid::now_v7();
+
     // Record the stream count after handshake (so we can measure just stat_batch)
     let streams_before = client.stream_count();
 
-    // Call stat_batch with 3 handles
-    let handles = vec![
-        b"hello.txt".to_vec(),
-        b"subdir".to_vec(),
-        b"nonexistent.txt".to_vec(),
-    ];
-    let _results = client
-        .stat_batch(handles.clone())
-        .await
-        .expect("stat_batch failed");
+    // Call stat_batch with 3 handles (using Uuids)
+    let handles = vec![hello_handle, subdir_handle, nonexistent_handle];
+    let _results = client.stat_batch(handles).await.expect("stat_batch failed");
 
     // Count how many additional streams stat_batch opened
     let stat_batch_streams = client.stream_count() - streams_before;

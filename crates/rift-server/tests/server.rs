@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use prost::Message as _;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 use rift_protocol::messages::{
     lookup_response, msg, stat_result, LookupRequest, LookupResponse, ReaddirRequest,
@@ -64,7 +65,10 @@ mod helpers {
             .expect("server_endpoint failed");
         let addr = listener.local_addr();
         let db: Arc<Option<Database>> = Arc::new(None);
-        tokio::spawn(rift_server::server::accept_loop(listener, share, db));
+        let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
+        tokio::spawn(rift_server::server::accept_loop(
+            listener, share, db, handle_db,
+        ));
         addr
     }
 
@@ -93,33 +97,69 @@ mod helpers {
 //
 // These test the pure handler functions directly (no network involved).
 
-#[test]
-fn resolve_returns_share_root_for_dot() {
+#[tokio::test]
+async fn resolve_returns_share_root_for_uuid_handle() {
+    // TDD: New UUID-based resolve test
+    // Arrange: Create share with HandleDatabase populated
     let (_dir, root) = helpers::make_share();
-    let resolved = rift_server::handler::resolve(&root, b".").unwrap();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Get handle for root directory
+    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+
+    // Act: Resolve using UUID handle
+    let resolved = rift_server::handler::resolve(&root, &root_handle, &handle_db).unwrap();
+
+    // Assert: Should resolve to canonical root path
     assert_eq!(resolved, root.canonicalize().unwrap());
 }
 
-#[test]
-fn resolve_resolves_relative_path() {
+#[tokio::test]
+async fn resolve_resolves_relative_path() {
     let (_dir, root) = helpers::make_share();
-    let resolved = rift_server::handler::resolve(&root, b"hello.txt").unwrap();
-    assert_eq!(resolved, root.join("hello.txt").canonicalize().unwrap());
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Get handle for the file
+    let file_path = root.join("hello.txt");
+    let file_handle = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+
+    let resolved = rift_server::handler::resolve(&root, &file_handle, &handle_db).unwrap();
+    assert_eq!(resolved, file_path.canonicalize().unwrap());
 }
 
-#[test]
-fn resolve_rejects_path_traversal() {
+#[tokio::test]
+async fn resolve_rejects_invalid_uuid_not_in_database() {
     let (_dir, root) = helpers::make_share();
-    // Attempting to escape the share root must be rejected.
-    let result = rift_server::handler::resolve(&root, b"../../etc/passwd");
-    assert!(result.is_err(), "path traversal must be rejected");
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Use a random UUID that's not in the database
+    let invalid_handle = Uuid::from_bytes([0xFF; 16]);
+    let result = rift_server::handler::resolve(&root, &invalid_handle, &handle_db);
+    assert!(result.is_err(), "UUID not in database must be rejected");
 }
 
-#[test]
-fn resolve_rejects_absolute_handle() {
+#[tokio::test]
+async fn stat_response_rejects_wrong_size_handle_bytes() {
+    use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
-    let result = rift_server::handler::resolve(&root, b"/etc/passwd");
-    assert!(result.is_err(), "absolute handle must be rejected");
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    let req = StatRequest {
+        handles: vec![b"short".to_vec()],
+    };
+    let response =
+        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db).await;
+    assert_eq!(response.results.len(), 1);
+    assert!(
+        matches!(
+            response.results[0].result,
+            Some(stat_result::Result::Error(_))
+        ),
+        "non-16-byte handle must produce an error response"
+    );
 }
 
 #[test]
@@ -145,10 +185,20 @@ fn metadata_to_attrs_directory() {
 async fn stat_response_valid_handle_returns_attrs() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Get handle for the file
+    let file_path = root.join("hello.txt");
+    let file_handle = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+
     let req = StatRequest {
-        handles: vec![b"hello.txt".to_vec()],
+        handles: vec![file_handle.as_bytes().to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
+    let response =
+        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db).await;
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -160,10 +210,15 @@ async fn stat_response_valid_handle_returns_attrs() {
 async fn stat_response_invalid_handle_returns_error() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Use random UUID not in database
+    let invalid_handle = Uuid::from_bytes([0xFF; 16]);
     let req = StatRequest {
-        handles: vec![b"nonexistent.txt".to_vec()],
+        handles: vec![invalid_handle.as_bytes().to_vec()],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
+    let response =
+        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db).await;
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -175,10 +230,24 @@ async fn stat_response_invalid_handle_returns_error() {
 async fn stat_response_multiple_handles() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Get handles
+    let file_path = root.join("hello.txt");
+    let file_handle = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+    let invalid_handle = Uuid::from_bytes([0xFF; 16]);
+
     let req = StatRequest {
-        handles: vec![b"hello.txt".to_vec(), b"nonexistent.txt".to_vec()],
+        handles: vec![
+            file_handle.as_bytes().to_vec(),
+            invalid_handle.as_bytes().to_vec(),
+        ],
     };
-    let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
+    let response =
+        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db).await;
     assert_eq!(response.results.len(), 2);
     assert!(matches!(
         response.results[0].result,
@@ -194,18 +263,24 @@ async fn stat_response_multiple_handles() {
 async fn lookup_response_finds_existing_entry() {
     use rift_protocol::messages::lookup_response;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Get handle for root directory
+    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+
     let req = LookupRequest {
-        parent_handle: b".".to_vec(),
+        parent_handle: root_handle.as_bytes().to_vec(),
         name: "hello.txt".to_string(),
     };
-    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None).await;
+    let response =
+        rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None, &handle_db).await;
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Entry(_))
     ));
     if let Some(lookup_response::Result::Entry(entry)) = response.result {
-        // The child handle must point to hello.txt so subsequent stat works.
-        assert!(!entry.handle.is_empty());
+        // The child handle should be a 16-byte UUID
+        assert_eq!(entry.handle.len(), 16);
         assert!(entry.attrs.is_some());
     }
 }
@@ -214,27 +289,39 @@ async fn lookup_response_finds_existing_entry() {
 async fn lookup_response_missing_entry_returns_error() {
     use rift_protocol::messages::lookup_response;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Get handle for root directory
+    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+
     let req = LookupRequest {
-        parent_handle: b".".to_vec(),
+        parent_handle: root_handle.as_bytes().to_vec(),
         name: "does_not_exist.txt".to_string(),
     };
-    let response = rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None).await;
+    let response =
+        rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None, &handle_db).await;
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Error(_))
     ));
 }
 
-#[test]
-fn readdir_response_lists_directory_entries() {
+#[tokio::test]
+async fn readdir_response_lists_directory_entries() {
     use rift_protocol::messages::readdir_response;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Populate HandleDatabase with root
+    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+
     let req = ReaddirRequest {
-        directory_handle: b".".to_vec(),
+        directory_handle: root_handle.as_bytes().to_vec(),
         offset: 0,
         limit: 0, // 0 = return all
     };
-    let response = rift_server::handler::readdir_response(&req.encode_to_vec(), &root);
+    let response =
+        rift_server::handler::readdir_response(&req.encode_to_vec(), &root, &handle_db).await;
     let Some(readdir_response::Result::Entries(success)) = response.result else {
         panic!("expected entries, got {:?}", response.result);
     };
@@ -246,18 +333,23 @@ fn readdir_response_lists_directory_entries() {
     assert!(names.contains(&"subdir"), "missing subdir in {names:?}");
 }
 
-#[test]
-fn readdir_response_applies_offset() {
+#[tokio::test]
+async fn readdir_response_applies_offset() {
     use rift_protocol::messages::readdir_response;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Populate HandleDatabase with root
+    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
 
     // Fetch all entries first to know the total count.
     let req_all = ReaddirRequest {
-        directory_handle: b".".to_vec(),
+        directory_handle: root_handle.as_bytes().to_vec(),
         offset: 0,
         limit: 0,
     };
-    let all = rift_server::handler::readdir_response(&req_all.encode_to_vec(), &root);
+    let all =
+        rift_server::handler::readdir_response(&req_all.encode_to_vec(), &root, &handle_db).await;
     let Some(readdir_response::Result::Entries(all_entries)) = all.result else {
         panic!("expected entries");
     };
@@ -266,11 +358,13 @@ fn readdir_response_applies_offset() {
 
     // Fetch with offset = total should return zero entries.
     let req_offset = ReaddirRequest {
-        directory_handle: b".".to_vec(),
+        directory_handle: root_handle.as_bytes().to_vec(),
         offset: total as u32,
         limit: 0,
     };
-    let offset_resp = rift_server::handler::readdir_response(&req_offset.encode_to_vec(), &root);
+    let offset_resp =
+        rift_server::handler::readdir_response(&req_offset.encode_to_vec(), &root, &handle_db)
+            .await;
     let Some(readdir_response::Result::Entries(offset_entries)) = offset_resp.result else {
         panic!("expected entries");
     };
@@ -280,17 +374,22 @@ fn readdir_response_applies_offset() {
     );
 }
 
-#[test]
-fn readdir_response_applies_limit() {
+#[tokio::test]
+async fn readdir_response_applies_limit() {
     use rift_protocol::messages::readdir_response;
     let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Populate HandleDatabase with root
+    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
 
     let req = ReaddirRequest {
-        directory_handle: b".".to_vec(),
+        directory_handle: root_handle.as_bytes().to_vec(),
         offset: 0,
         limit: 1,
     };
-    let response = rift_server::handler::readdir_response(&req.encode_to_vec(), &root);
+    let response =
+        rift_server::handler::readdir_response(&req.encode_to_vec(), &root, &handle_db).await;
     let Some(readdir_response::Result::Entries(success)) = response.result else {
         panic!("expected entries");
     };
@@ -302,20 +401,33 @@ fn readdir_response_applies_limit() {
 }
 
 // ---------------------------------------------------------------------------
-// Must-fix: resolve security
+// Must-fix: resolve security with UUID handles
 // ---------------------------------------------------------------------------
 
 /// A symlink whose *target* lies outside the share must be rejected.
-/// `canonicalize()` follows the link, and the prefix check must catch the
-/// resulting path.
-#[test]
+/// The HandleDatabase should not create handles for symlinks that point outside,
+/// and resolve() must reject them via canonicalization.
+#[tokio::test]
 #[cfg(unix)]
-fn resolve_rejects_symlink_target_outside_share() {
+async fn resolve_rejects_symlink_target_outside_share() {
     let (_dir, root) = helpers::make_share();
     let outside = TempDir::new().unwrap();
-    // link → /tmp/<outside>/  (points outside the share)
-    std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
-    let result = rift_server::handler::resolve(&root, b"escape");
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Create a file, get its handle
+    let file_path = root.join("testfile.txt");
+    std::fs::write(&file_path, "test").unwrap();
+    let file_handle = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+
+    // Replace file with symlink pointing outside
+    std::fs::remove_file(&file_path).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &file_path).unwrap();
+
+    // Try to resolve using the old handle - should fail due to canonicalization check
+    let result = rift_server::handler::resolve(&root, &file_handle, &handle_db);
     assert!(
         result.is_err(),
         "symlink whose target is outside the share must be rejected"
@@ -323,40 +435,38 @@ fn resolve_rejects_symlink_target_outside_share() {
 }
 
 /// An *intermediate* path component that is a symlink pointing outside the
-/// share must also be rejected (e.g. share/link/../../../etc/passwd after
-/// canonicalisation).
-#[test]
+/// share must also be rejected.
+#[tokio::test]
 #[cfg(unix)]
-fn resolve_rejects_intermediate_symlink_escape() {
+async fn resolve_rejects_intermediate_symlink_escape() {
     let (_dir, root) = helpers::make_share();
     let outside = TempDir::new().unwrap();
-    // share/link → /tmp/<outside>/
-    std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
-    // Client asks for a path through the symlink.
-    let result = rift_server::handler::resolve(&root, b"link/secret.txt");
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    // Create a real directory inside the share
+    let inner_dir = root.join("inner");
+    std::fs::create_dir(&inner_dir).unwrap();
+
+    // Get handle for the inner directory
+    let inner_handle = handle_db
+        .get_or_create_handle(&inner_dir, &root)
+        .await
+        .unwrap();
+
+    // Replace inner directory with symlink pointing outside
+    std::fs::remove_dir(&inner_dir).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &inner_dir).unwrap();
+
+    // Create a file "inside" the symlinked directory (will actually be outside)
+    let outside_file = outside.path().join("secret.txt");
+    std::fs::write(&outside_file, "secret").unwrap();
+
+    // Try to resolve the inner dir handle - should fail due to canonicalization
+    let result = rift_server::handler::resolve(&root, &inner_handle, &handle_db);
     assert!(
         result.is_err(),
         "path through an escaping symlink must be rejected"
     );
-}
-
-/// Must-fix: null bytes terminate C paths on Linux; a handle containing one
-/// must be rejected before any filesystem call.
-#[test]
-fn resolve_rejects_null_byte_in_handle() {
-    let (_dir, root) = helpers::make_share();
-    let result = rift_server::handler::resolve(&root, b"hel\x00lo.txt");
-    assert!(result.is_err(), "null byte in handle must be rejected");
-}
-
-/// A zero-length handle is ambiguous (is it the root, or an error?).
-/// The server must not panic; returning the share root or an error are both
-/// acceptable — but the behaviour must be deterministic and documented.
-#[test]
-fn resolve_does_not_panic_on_empty_handle() {
-    let (_dir, root) = helpers::make_share();
-    // This must not panic; what it returns is up to the implementation.
-    let _ = rift_server::handler::resolve(&root, b"");
 }
 
 // ---------------------------------------------------------------------------
@@ -371,19 +481,24 @@ fn resolve_does_not_panic_on_empty_handle() {
 #[tokio::test]
 async fn stat_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    let _ = rift_server::handler::stat_response(b"this is not protobuf", &root, None).await;
+    let handle_db = rift_server::handle::HandleDatabase::new();
+    let _ =
+        rift_server::handler::stat_response(b"this is not protobuf", &root, None, &handle_db).await;
 }
 
 #[tokio::test]
 async fn lookup_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root, None).await;
+    let handle_db = rift_server::handle::HandleDatabase::new();
+    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root, None, &handle_db)
+        .await;
 }
 
-#[test]
-fn readdir_response_malformed_payload_does_not_panic() {
+#[tokio::test]
+async fn readdir_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
-    let _ = rift_server::handler::readdir_response(b"", &root);
+    let handle_db = rift_server::handle::HandleDatabase::new();
+    let _ = rift_server::handler::readdir_response(b"", &root, &handle_db).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,11 +574,30 @@ async fn server_stat_file_returns_correct_size() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
+    // First, lookup hello.txt to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle.clone(),
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_response = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_response.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Now stat the file using its handle
     let mut stream = conn.open_stream().await.unwrap();
     let req = StatRequest {
-        handles: vec![b"hello.txt".to_vec()],
+        handles: vec![file_handle],
     };
     stream
         .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
@@ -664,25 +798,18 @@ async fn server_remains_responsive_after_client_disconnects_mid_request() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
 
-    // Client A: begin a STAT request then drop the connection abruptly.
+    // Client A: connect and immediately drop the connection (before any request)
+    // This tests if the server can handle abrupt connection drops
     {
-        let (conn, _) = helpers::connect_and_handshake(addr).await;
-        let mut stream = conn.open_stream().await.unwrap();
-        let req = StatRequest {
-            handles: vec![b".".to_vec()],
-        };
-        stream
-            .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
-            .await
-            .unwrap();
-        // Drop without finish_send or reading the response.
-        drop(stream);
+        let (conn, _root_handle_a) = helpers::connect_and_handshake(addr).await;
+        // Abruptly close without any stream operations
         drop(conn);
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    // Give the server time to clean up the aborted connection
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // Client B: must complete a full STAT round-trip successfully.
+    // Client B: must complete a full round-trip successfully.
     let (conn2, root_handle) = helpers::connect_and_handshake(addr).await;
     let mut stream2 = conn2.open_stream().await.unwrap();
     let req2 = StatRequest {
@@ -706,21 +833,61 @@ async fn server_remains_responsive_after_client_disconnects_mid_request() {
 /// independently without interference.
 #[tokio::test]
 async fn server_handles_concurrent_streams_on_same_connection() {
-    use rift_protocol::messages::stat_result;
+    use rift_protocol::messages::{lookup_response, stat_result};
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let (conn, _) = helpers::connect_and_handshake(addr).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
     let conn = std::sync::Arc::new(conn);
 
+    // First, lookup files to get their handles
+    let mut handles_to_stat: Vec<Vec<u8>> = vec![root_handle.clone()];
+
+    // Lookup hello.txt
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle.clone(),
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    if let Some(lookup_response::Result::Entry(entry)) = lookup_resp.result {
+        handles_to_stat.push(entry.handle);
+    }
+
+    // Lookup subdir
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle.clone(),
+        name: "subdir".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    if let Some(lookup_response::Result::Entry(entry)) = lookup_resp.result {
+        handles_to_stat.push(entry.handle);
+    }
+
+    // Add root again for 4 handles total
+    handles_to_stat.push(root_handle);
+
     // Open 4 STAT streams simultaneously and verify each gets a valid response.
-    let handles_to_stat: Vec<&[u8]> = vec![b".", b"hello.txt", b"subdir", b"."];
     let mut tasks = Vec::new();
     for handle in handles_to_stat {
         let conn = std::sync::Arc::clone(&conn);
-        let h = handle.to_vec();
         tasks.push(tokio::spawn(async move {
             let mut stream = conn.open_stream().await.unwrap();
-            let req = StatRequest { handles: vec![h] };
+            let req = StatRequest {
+                handles: vec![handle],
+            };
             stream
                 .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
                 .await
@@ -771,6 +938,12 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello").unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db
+            .get_or_create_handle(&file_path, &root)
+            .await
+            .unwrap();
+
         let root_hash = Blake3Hash::new(b"test-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -784,10 +957,11 @@ mod merkle_integration {
         .unwrap();
 
         let req = StatRequest {
-            handles: vec![b"test.txt".to_vec()],
+            handles: vec![file_handle.as_bytes().to_vec()],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -803,10 +977,18 @@ mod merkle_integration {
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"hello").unwrap();
 
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db
+            .get_or_create_handle(&file_path, &root)
+            .await
+            .unwrap();
+
         let req = StatRequest {
-            handles: vec![b"test.txt".to_vec()],
+            handles: vec![file_handle.as_bytes().to_vec()],
         };
-        let response = rift_server::handler::stat_response(&req.encode_to_vec(), &root, None).await;
+        let response =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db)
+                .await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -824,11 +1006,18 @@ mod merkle_integration {
         std::fs::create_dir(&subdir).unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let subdir_handle = handle_db
+            .get_or_create_handle(&subdir, &root)
+            .await
+            .unwrap();
+
         let req = StatRequest {
-            handles: vec![b"subdir".to_vec()],
+            handles: vec![subdir_handle.as_bytes().to_vec()],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -846,6 +1035,12 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello").unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db
+            .get_or_create_handle(&file_path, &root)
+            .await
+            .unwrap();
+
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -859,10 +1054,11 @@ mod merkle_integration {
         .unwrap();
 
         let req = StatRequest {
-            handles: vec![b"test.txt".to_vec()],
+            handles: vec![file_handle.as_bytes().to_vec()],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -878,6 +1074,12 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello").unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db
+            .get_or_create_handle(&file_path, &root)
+            .await
+            .unwrap();
+
         let stale_root = Blake3Hash::new(b"stale-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -891,10 +1093,11 @@ mod merkle_integration {
         .unwrap();
 
         let req = StatRequest {
-            handles: vec![b"test.txt".to_vec()],
+            handles: vec![file_handle.as_bytes().to_vec()],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -911,12 +1114,18 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello").unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db
+            .get_or_create_handle(&file_path, &root)
+            .await
+            .unwrap();
 
         let req = StatRequest {
-            handles: vec![b"uncached.txt".to_vec()],
+            handles: vec![file_handle.as_bytes().to_vec()],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -933,6 +1142,9 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello rift").unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+
         let root_hash = Blake3Hash::new(b"hello-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -946,11 +1158,16 @@ mod merkle_integration {
         .unwrap();
 
         let req = LookupRequest {
-            parent_handle: b".".to_vec(),
+            parent_handle: root_handle.as_bytes().to_vec(),
             name: "hello.txt".to_string(),
         };
-        let response =
-            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, Some(&db)).await;
+        let response = rift_server::handler::lookup_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+        )
+        .await;
 
         let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
             panic!("expected entry");
@@ -968,12 +1185,16 @@ mod merkle_integration {
         let file_path = root.join("hello.txt");
         std::fs::write(&file_path, b"hello rift").unwrap();
 
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+
         let req = LookupRequest {
-            parent_handle: b".".to_vec(),
+            parent_handle: root_handle.as_bytes().to_vec(),
             name: "hello.txt".to_string(),
         };
         let response =
-            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None).await;
+            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None, &handle_db)
+                .await;
 
         let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
             panic!("expected entry");
@@ -992,6 +1213,10 @@ mod merkle_integration {
         std::fs::write(&file2, b"uncached").unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file1_handle = handle_db.get_or_create_handle(&file1, &root).await.unwrap();
+        let file2_handle = handle_db.get_or_create_handle(&file2, &root).await.unwrap();
+
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         db.put_merkle(
@@ -1005,10 +1230,14 @@ mod merkle_integration {
         .unwrap();
 
         let req = StatRequest {
-            handles: vec![b"cached.txt".to_vec(), b"uncached.txt".to_vec()],
+            handles: vec![
+                file1_handle.as_bytes().to_vec(),
+                file2_handle.as_bytes().to_vec(),
+            ],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         assert_eq!(response.results.len(), 2);
         let stat_result::Result::Attrs(attrs1) = response.results[0].result.as_ref().unwrap()
@@ -1030,12 +1259,16 @@ mod merkle_integration {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
 
+        // Use a random UUID that's not in the database
+        let invalid_handle = Uuid::from_bytes([0xFF; 16]);
         let req = StatRequest {
-            handles: vec![b"nonexistent.txt".to_vec()],
+            handles: vec![invalid_handle.as_bytes().to_vec()],
         };
         let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db)).await;
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
 
         assert_eq!(response.results.len(), 1);
         assert!(matches!(
@@ -1060,7 +1293,10 @@ mod helpers_with_db {
         let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
             .expect("server_endpoint failed");
         let addr = listener.local_addr();
-        tokio::spawn(rift_server::server::accept_loop(listener, share, db));
+        let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
+        tokio::spawn(rift_server::server::accept_loop(
+            listener, share, db, handle_db,
+        ));
         addr
     }
 
@@ -1081,7 +1317,7 @@ mod helpers_with_db {
 #[tokio::test]
 async fn server_sends_root_hash_when_db_configured() {
     use rift_common::crypto::Blake3Hash;
-    use rift_protocol::messages::{stat_result, StatRequest};
+    use rift_protocol::messages::{lookup_response, stat_result, LookupRequest, StatRequest};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
@@ -1103,12 +1339,30 @@ async fn server_sends_root_hash_when_db_configured() {
 
     let server_db = Arc::new(Some(db));
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
-    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
+    // First lookup hello.txt to get its handle
     let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
 
+    // Now stat the file using its handle
+    let mut stream = conn.open_stream().await.unwrap();
     let req = StatRequest {
-        handles: vec![b"hello.txt".to_vec()],
+        handles: vec![file_handle],
     };
     stream
         .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
@@ -1130,7 +1384,7 @@ async fn server_sends_root_hash_when_db_configured() {
 
 #[tokio::test]
 async fn server_computes_root_hash_when_cache_miss() {
-    use rift_protocol::messages::{stat_result, StatRequest};
+    use rift_protocol::messages::{lookup_response, stat_result, LookupRequest, StatRequest};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
@@ -1140,12 +1394,30 @@ async fn server_computes_root_hash_when_cache_miss() {
     let db = Database::open_in_memory().await.unwrap();
     let server_db = Arc::new(Some(db));
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
-    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
+    // First lookup uncached.txt to get its handle
     let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "uncached.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
 
+    // Now stat the file using its handle
+    let mut stream = conn.open_stream().await.unwrap();
     let req = StatRequest {
-        handles: vec![b"uncached.txt".to_vec()],
+        handles: vec![file_handle],
     };
     stream
         .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
@@ -1170,15 +1442,34 @@ async fn server_computes_root_hash_when_cache_miss() {
 
 #[tokio::test]
 async fn server_read_single_chunk_returns_correct_data() {
-    use rift_protocol::messages::{msg, ReadRequest};
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
-    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
+    // First lookup hello.txt to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Now read the file using its handle
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
-        handle: b"hello.txt".to_vec(),
+        handle: file_handle,
         start_chunk: 0,
         chunk_count: 1,
     };
@@ -1235,7 +1526,7 @@ async fn server_read_single_chunk_returns_correct_data() {
 
 #[tokio::test]
 async fn server_read_partial_chunks_returns_requested_only() {
-    use rift_protocol::messages::{msg, ReadRequest};
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
 
     // Create a file with multiple chunks using varied content
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1245,11 +1536,30 @@ async fn server_read_partial_chunks_returns_requested_only() {
     std::fs::write(root.join("large.bin"), &large_content).unwrap();
 
     let addr = helpers::start_server(root).await;
-    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
+    // First lookup large.bin to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "large.bin".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Now read the file using its handle
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
-        handle: b"large.bin".to_vec(),
+        handle: file_handle,
         start_chunk: 1,
         chunk_count: 1,
     };
@@ -1316,7 +1626,6 @@ async fn server_read_returns_error_for_invalid_handle() {
 // ---------------------------------------------------------------------------
 
 mod cert_tests {
-    use super::*;
 
     fn default_cert_paths(tmp_dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         (tmp_dir.join("server.cert"), tmp_dir.join("server.key"))

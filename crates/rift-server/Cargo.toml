@@ -24,10 +24,12 @@ rcgen.workspace = true
 rustls.workspace = true
 dirs.workspace = true
 tokio-rusqlite = "0.7"
-ulid.workspace = true
+uuid.workspace = true
 scc.workspace = true
 xattr.workspace = true
 walkdir = "1"
+tokio-stream = { version = "0.1", features = ["fs"] }
+futures = "0.3"
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
@@ -36,4 +38,5 @@ rift-transport = { path = "../rift-transport" }
 [dev-dependencies]
 tempfile.workspace = true
 rcgen.workspace = true
+uuid.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

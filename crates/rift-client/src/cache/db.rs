@@ -15,6 +15,7 @@ use std::path::Path;
 use tokio_rusqlite::rusqlite;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Result as SqliteResult;
+use uuid::Uuid;
 
 /// A file manifest mapping a server handle to its Merkle tree.
 #[derive(Debug, Clone)]
@@ -130,19 +131,19 @@ impl FileCache {
     }
 
     /// Store the root hash for a file handle.
-    pub async fn put_root_hash(&self, handle: &[u8], root_hash: &Blake3Hash) -> SqliteResult<()> {
+    pub async fn put_root_hash(&self, handle: &Uuid, root_hash: &Blake3Hash) -> SqliteResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
-        let handle_vec = handle.to_vec();
+        let handle_str = handle.to_string();
         let root_bytes = root_hash.as_bytes().to_vec();
 
         self.call(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "INSERT OR REPLACE INTO manifests (handle, root_hash, updated_at) VALUES (?1, ?2, ?3)",
-                (&handle_vec, &root_bytes, now),
+                (&handle_str, &root_bytes, now),
             )
         })
         .await?;
@@ -150,14 +151,14 @@ impl FileCache {
     }
 
     /// Get the cached root hash for a file handle.
-    pub async fn get_root_hash(&self, handle: &[u8]) -> SqliteResult<Option<Blake3Hash>> {
-        let handle_vec = handle.to_vec();
+    pub async fn get_root_hash(&self, handle: &Uuid) -> SqliteResult<Option<Blake3Hash>> {
+        let handle_str = handle.to_string();
 
         let result = self
             .call(move |conn: &mut rusqlite::Connection| {
                 conn.query_row(
                     "SELECT root_hash FROM manifests WHERE handle = ?1",
-                    [&handle_vec],
+                    [&handle_str],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
             })
@@ -181,13 +182,13 @@ impl FileCache {
     }
 
     /// Store a file manifest (root hash + chunk list).
-    pub async fn put_manifest(&self, handle: &[u8], manifest: &Manifest) -> SqliteResult<()> {
+    pub async fn put_manifest(&self, handle: &Uuid, manifest: &Manifest) -> SqliteResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
-        let handle_vec = handle.to_vec();
+        let handle_str = handle.to_string();
         let root_bytes = manifest.root.as_bytes().to_vec();
         let chunks: Vec<(i64, i64, i64, Vec<u8>)> = manifest
             .chunks
@@ -205,16 +206,16 @@ impl FileCache {
         self.call(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "INSERT OR REPLACE INTO manifests (handle, root_hash, updated_at) VALUES (?1, ?2, ?3)",
-                (&handle_vec, &root_bytes, now),
+                (&handle_str, &root_bytes, now),
             )?;
 
-            conn.execute("DELETE FROM chunk_refs WHERE handle = ?1", [&handle_vec])?;
+            conn.execute("DELETE FROM chunk_refs WHERE handle = ?1", [&handle_str])?;
 
             for (index, offset, length, hash) in chunks {
                 conn.execute(
                     "INSERT INTO chunk_refs (handle, chunk_index, byte_offset, byte_length, chunk_hash)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (&handle_vec, index, offset, length, &hash),
+                    (&handle_str, index, offset, length, &hash),
                 )?;
             }
 
@@ -225,15 +226,15 @@ impl FileCache {
     }
 
     /// Get the cached manifest for a file handle.
-    pub async fn get_manifest(&self, handle: &[u8]) -> SqliteResult<Option<Manifest>> {
-        let handle_vec = handle.to_vec();
-        let handle_vec2 = handle_vec.clone();
+    pub async fn get_manifest(&self, handle: &Uuid) -> SqliteResult<Option<Manifest>> {
+        let handle_str = handle.to_string();
+        let handle_str2 = handle_str.clone();
 
         let root_bytes: Option<Vec<u8>> = self
             .call(move |conn: &mut rusqlite::Connection| {
                 match conn.query_row(
                     "SELECT root_hash FROM manifests WHERE handle = ?1",
-                    [&handle_vec],
+                    [&handle_str],
                     |row| row.get::<_, Vec<u8>>(0),
                 ) {
                     Ok(r) => Ok(Some(r)),
@@ -268,7 +269,7 @@ impl FileCache {
                      FROM chunk_refs WHERE handle = ?1 ORDER BY chunk_index",
                 )?;
 
-                let rows = stmt.query_map([&handle_vec2], |row| {
+                let rows = stmt.query_map([&handle_str2], |row| {
                     let hash_bytes: Vec<u8> = row.get(3)?;
                     let mut hash = [0u8; 32];
                     hash.copy_from_slice(&hash_bytes);
@@ -340,7 +341,7 @@ impl FileCache {
     /// Find chunks that are needed but not cached.
     pub async fn missing_chunks(
         &self,
-        _handle: &[u8],
+        _handle: &Uuid,
         server_chunks: &[ChunkInfo],
     ) -> SqliteResult<Vec<ChunkInfo>> {
         let mut missing = Vec::new();
@@ -400,8 +401,10 @@ impl FileCache {
 mod tests {
     use super::*;
 
-    fn make_handle(name: &str) -> Vec<u8> {
-        name.as_bytes().to_vec()
+    fn make_handle(byte: u8) -> Uuid {
+        let mut bytes = [0u8; 16];
+        bytes[0] = byte;
+        Uuid::from_bytes(bytes)
     }
 
     fn make_hash(byte: u8) -> [u8; 32] {
@@ -411,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_retrieve_root_hash() {
         let cache = FileCache::open_in_memory().await.unwrap();
-        let handle = make_handle("file1");
+        let handle = make_handle(1);
 
         let result = cache.get_root_hash(&handle).await.unwrap();
         assert!(result.is_none());
@@ -427,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_retrieve_manifest() {
         let cache = FileCache::open_in_memory().await.unwrap();
-        let handle = make_handle("file1");
+        let handle = make_handle(1);
 
         let manifest = Manifest {
             root: Blake3Hash::new(b"test-root"),
@@ -478,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn missing_chunks_empty_cache() {
         let cache = FileCache::open_in_memory().await.unwrap();
-        let handle = make_handle("file1");
+        let handle = make_handle(1);
 
         let server_chunks = vec![
             ChunkInfo {
@@ -502,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn missing_chunks_partial_cache() {
         let cache = FileCache::open_in_memory().await.unwrap();
-        let handle = make_handle("file1");
+        let handle = make_handle(1);
 
         cache
             .put_chunk(&[0x01u8; 32], b"chunk1 data")

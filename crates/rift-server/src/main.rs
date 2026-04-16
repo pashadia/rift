@@ -58,9 +58,10 @@ async fn main() -> Result<()> {
     let listener = rift_transport::server_endpoint(args.addr, &cert_der, &key_der)?;
 
     let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
+    let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
 
     tokio::select! {
-        result = rift_server::server::accept_loop(listener, args.share, db) => result,
+        result = rift_server::server::accept_loop(listener, args.share, db, handle_db) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("\nShutting down.");
             Ok(())

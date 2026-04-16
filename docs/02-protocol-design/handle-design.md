@@ -2,77 +2,109 @@
 
 ## Current state
 
-Handles are relative path strings encoded as UTF-8 bytes.  The share root is
-`b"."`, and every other object is the path from the share root to that object
-(e.g. `b"docs/report.md"`).  The server's `resolve()` function reconstructs
-the absolute filesystem path by joining the share root with the handle.
+Handles are **UUID v7** opaque tokens (16 bytes, RFC 9562).  The server assigns
+a UUID v7 to each filesystem object (file, directory, symlink) when it is first
+accessed, and stores the bidirectional mapping in an in-memory
+`HandleDatabase` backed by a `BidirectionalMap<Uuid, PathBuf>` from
+`rift-common`.
 
-## Problems
+### Wire format
 
-### Handles are not rename-stable
+All protobuf messages use `bytes` for handle fields (`root_handle`,
+`parent_handle`, `handle`, `handles[]`).  On the wire a handle is the 16-byte
+big-endian encoding of a UUID v7.  Conversion between `Uuid` and `Vec<u8>`
+happens at the proto boundary:
 
-If a client holds a handle to `b"docs/report.md"` and the server-side
-directory is renamed from `docs/` to `documents/`, the handle no longer
-resolves.  The server returns `ErrorNotFound` with no indication that the file
-still exists under a different name.  There is no mechanism for the server to
-proactively tell clients that their handles are stale.
+- **Egress** (server → wire): `uuid.as_bytes().to_vec()`
+- **Ingress** (wire → server): `Uuid::from_slice(&proto_bytes)`
 
-This is masked for now because:
-- The filesystem is read-only (no writes means no renames).
-- There is no notification system yet.
+### Server-side handle lifecycle
 
-It will become a real correctness issue as soon as writes are implemented.
+1. **Root handle**: `HandleDatabase::get_or_create_handle(share_root, share_root)` issues a UUID v7 during the handshake.  Sent to the client in `RiftWelcome.root_handle`.
 
-### Handles leak filesystem structure
+2. **Non-root handles**: created on demand by `lookup` and `readdir` operations.  The server:
+   - Resolves the parent handle to a path via `HandleDatabase::get_path()`
+   - Joins the child name to create the full filesystem path
+   - Calls `HandleDatabase::get_or_create_handle()` to get or assign a UUID
+   - Returns the UUID (as bytes) in the response
 
-A client can infer the directory tree from handle bytes without performing any
-`lookup` or `readdir` operations.  For a security model where the server
-controls what a client can see, leaking the full path in the handle is at odds
-with per-share access control.  A client authorised to read `docs/public/` but
-not `docs/private/` could construct a handle for the latter directly.
+3. **Persistence**: the server also stores each handle as an `xattr` (`user.rift.handle`) on disk for regular files, so handles survive server restarts.
 
-The server's `resolve()` checks that the resolved path is within the share
-root, which prevents escape, but it does not enforce finer-grained access
-control below the share boundary.
+### Client-side handle cache (planned)
 
-### Non-UTF-8 filenames are unsupported
+The client must maintain a **path ↔ UUID mapping** (`HandleCache`) because:
 
-Handles are constructed via `to_string_lossy()`, so filenames containing
-invalid UTF-8 sequences are silently mangled.  The handle then fails to resolve
-on the server.
+- The FUSE kernel interface sends **full paths** for each operation.
+- The Rift protocol uses **UUID handles** for all operations.
+- The only protocol responses that pair names with UUIDs are `readdir` (each
+  `ReaddirEntry` has `name` + `handle`) and `lookup` (returns
+  `(child_handle, child_attrs)` given `parent_handle` + `name`).
 
-## Planned design: server-assigned opaque handles
-
-The server will issue a short, random (or content-addressed) token when a file
-or directory is first accessed, and store the mapping in a per-session (or
-persistent) handle table:
+The `HandleCache` lives in `RiftShareView`, which is the layer that translates
+between path-based FUSE requests and UUID-based protocol operations.
 
 ```
-handle_id (random bytes, e.g. 16 bytes) → absolute canonical path
+Kernel (paths) → RiftFilesystem → ShareView (path-based, owns HandleCache) → RemoteShare (UUID-based) → RiftClient (proto/network)
 ```
 
-Properties:
-- **Rename-stable**: a rename updates the table entry; existing clients holding
-  the old handle continue to work.
-- **Opaque**: clients see no path structure.
-- **Revocable**: the server can invalidate a handle by removing it from the
-  table (e.g. on delete), returning `ErrorStaleHandle`.
-- **Binary-safe**: handles are arbitrary bytes, not UTF-8 strings, so
-  non-UTF-8 filenames are representable.
+Cache population:
 
-### Handle lifetime
+- **Root**: `RiftWelcome.root_handle` → cache `"/" → root_uuid`
+- **lookup response**: `(parent_path, name) → child_uuid`
+- **readdir response**: `(dir_path, entry_name) → entry_uuid` for each entry
 
-- Root handle: issued at handshake time, valid for the session.
-- Non-root handles: issued by `lookup` and `readdir` responses, valid until
-  explicitly invalidated or the session ends.
-- Persistent handles (post-v1): optionally survive reconnects, enabling
-  resumable transfers after network interruptions.
+Cache lookup:
 
-### Migration path
+- `getattr("/subdir/file.txt")` → cache lookup → `uuid` → `RemoteShare::stat_batch(vec![uuid])`
+- Cache miss → `ENOENT` (the kernel redisCOVERSs via `lookup`)
 
-1. Continue using path-based handles until writes are implemented.  All
-   `TODO(handles)` markers in the source indicate sites that must change.
-2. Before implementing the write path, replace path-based handles with
-   session-scoped opaque tokens.
-3. After implementing the notification system, extend handle lifetime across
-   sessions and add proactive invalidation.
+## Migration history
+
+### Phase 1: Path-based handles (original)
+
+Handles were relative path strings encoded as UTF-8 bytes (`b"."` for root,
+`b"docs/report.md"` for files).  The server's `resolve()` joined the share root
+with the handle bytes to reconstruct the absolute path.
+
+Problems:
+- **Not rename-stable**: renaming a directory invalidated all handles beneath it.
+- **Leaked filesystem structure**: clients could infer paths from handle bytes.
+- **Non-UTF-8 filenames**: handles used `to_string_lossy()`, silently mangling
+  non-UTF-8 filenames.
+
+### Phase 2: UUID v7 opaque handles (current — server done, client in progress)
+
+The server has been migrated to use `uuid::Uuid` (UUID v7) throughout:
+- `HandleDatabase` uses `BidirectionalMap<PathBuf>` with `Uuid` keys
+- All server operations (`stat`, `lookup`, `readdir`, `read`) parse handles
+  from proto bytes via `Uuid::from_slice()` and resolve them through the database
+- The client still uses path-bytes (`b"."`, `b"hello.txt"`) as handles — this
+  must be migrated
+
+### Client migration (this phase)
+
+- Replace all `Vec<u8>` / `&[u8]` handle types with `Uuid`
+- Add `HandleCache` to `RiftShareView` for path ↔ UUID resolution
+- Redesign `ShareView` trait as path-based (hides UUIDs from FUSE layer)
+- Keep `RemoteShare` trait as UUID-based (protocol boundary)
+- FUSE layer becomes a thin adapter calling `ShareView` with `Path` arguments
+- `path_to_handle()` function removed — replaced by cache lookup
+
+## Designed properties
+
+- **Rename-stable**: a rename updates the server's `HandleDatabase`; clients
+  holding the old UUID continue to resolve it correctly via `get_path()`.
+- **Opaque**: clients see 16 random-ish bytes; no path information is leaked.
+- **Revocable**: the server can remove a UUID from `HandleDatabase`, causing
+  `resolve()` to fail with `ErrorNotFound`.
+- **Binary-safe**: handles are 16-byte UUIDs, not UTF-8 strings. Non-UTF-8
+  filenames work because the server stores `PathBuf` values internally.
+
+## Future work
+
+- **Persistent handles**: survive server restarts via xattr persistence (already
+  implemented for regular files on the server side).
+- **Notification-based invalidation**: when writes are implemented, the server
+  can proactively invalidate stale handles via a notification channel.
+- **Cache invalidation on reconnect**: when the client reconnects, it receives
+  a new `root_handle` and should invalidate its local handle cache.

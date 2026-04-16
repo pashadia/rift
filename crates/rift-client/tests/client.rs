@@ -9,6 +9,7 @@ mod common;
 use common as helpers;
 
 use rift_common::FsError;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Persistent certificate management
@@ -41,7 +42,8 @@ async fn client_persistent_cert_loaded_if_exists() {
     .await
     .expect("connect failed");
 
-    assert!(!client.root_handle().is_empty());
+    // root_handle() returns Uuid, which is always non-zero for a valid connection
+    assert_ne!(client.root_handle(), Uuid::nil());
     // Verify fingerprint is stable across connects (same cert = same fingerprint)
 }
 
@@ -71,7 +73,8 @@ async fn client_generates_cert_if_not_exists() {
     assert!(!saved_cert.is_empty());
     assert!(!saved_key.is_empty());
 
-    assert!(!client.root_handle().is_empty());
+    // root_handle() returns Uuid, which is always non-zero for a valid connection
+    assert_ne!(client.root_handle(), Uuid::nil());
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +105,7 @@ async fn client_reconnect_after_connection_lost() {
     .await
     .expect("connect failed");
 
-    let original_root = client.root_handle().to_vec();
+    let original_root = client.root_handle();
 
     // Close the connection
     client.close_connection();
@@ -117,8 +120,13 @@ async fn client_reconnect_after_connection_lost() {
     assert_eq!(new_client.root_handle(), original_root);
 
     // Verify operations work after reconnect
+    // First lookup the file to get its Uuid handle
+    let (file_handle, _) = new_client
+        .lookup(new_client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup after reconnect failed");
     let attrs = new_client
-        .stat(b"hello.txt")
+        .stat(file_handle)
         .await
         .expect("stat after reconnect failed");
     assert_eq!(attrs.size, b"hello rift".len() as u64);
@@ -155,7 +163,12 @@ async fn client_reconnect_uses_same_cert() {
         let new_client = client.reconnect().await.expect("reconnect failed");
 
         // Verify we can still do operations
-        let attrs = new_client.stat(b"hello.txt").await.expect("stat failed");
+        // First lookup the file to get its Uuid handle
+        let (file_handle, _) = new_client
+            .lookup(new_client.root_handle(), "hello.txt")
+            .await
+            .expect("lookup failed");
+        let attrs = new_client.stat(file_handle).await.expect("stat failed");
         assert_eq!(attrs.size, b"hello rift".len() as u64);
     }
 }
@@ -201,7 +214,8 @@ async fn client_cli_cert_overrides_persistent() {
     );
 
     // Operations should work
-    assert!(!client.root_handle().is_empty());
+    // root_handle() returns Uuid, which is always non-zero for a valid connection
+    assert_ne!(client.root_handle(), Uuid::nil());
 }
 
 // ---------------------------------------------------------------------------
@@ -233,11 +247,20 @@ async fn client_auto_reconnect_on_operation_failure() {
     .await
     .expect("connect failed");
 
+    // Get root handle before wrapping in ReconnectingClient
+    let root_handle = client.root_handle();
+
     // Wrap in ReconnectingClient
     let reconnecting = rift_client::reconnect::ReconnectingClient::new(client);
 
+    // First lookup the file to get its Uuid handle
+    let (file_handle, _) = reconnecting
+        .lookup(root_handle, "hello.txt")
+        .await
+        .expect("lookup failed");
+
     // First operation should work
-    let attrs = reconnecting.stat_batch(vec![b"hello.txt".to_vec()]).await;
+    let attrs = reconnecting.stat_batch(vec![file_handle]).await;
     assert!(attrs.is_ok());
 
     // Close the underlying connection (simulate network loss)
@@ -245,7 +268,13 @@ async fn client_auto_reconnect_on_operation_failure() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Next operation should automatically reconnect and succeed
-    let attrs = reconnecting.stat_batch(vec![b"hello.txt".to_vec()]).await;
+    // Need to re-lookup after reconnect (file handle may have changed)
+    let (file_handle, _) = reconnecting
+        .lookup(root_handle, "hello.txt")
+        .await
+        .expect("lookup after reconnect failed");
+
+    let attrs = reconnecting.stat_batch(vec![file_handle]).await;
     assert!(
         attrs.is_ok(),
         "operation should succeed after auto-reconnect"
@@ -281,20 +310,36 @@ async fn client_reconnect_preserves_cached_data() {
     .await
     .expect("connect failed");
 
+    // Get root handle before wrapping in ReconnectingClient
+    let root_handle = client.root_handle();
+
     // Wrap in ReconnectingClient
     let reconnecting = std::sync::Arc::new(rift_client::reconnect::ReconnectingClient::new(client));
 
     // Create view with cache
     let view = rift_client::view::RiftShareView::with_cache(
         reconnecting.clone(),
+        root_handle,
         cache_dir.path().to_path_buf(),
     )
     .await
     .expect("failed to create view with cache");
 
+    // First lookup to populate the handle cache
+    let _ = view
+        .lookup(std::path::Path::new("."), "hello.txt")
+        .await
+        .expect("lookup failed");
+
     // First read - should fetch from server and cache
-    let content = view.read(b"hello.txt", 0, 100, None).await;
-    assert!(content.is_ok(), "first read should succeed");
+    let content = view
+        .read(std::path::Path::new("hello.txt"), 0, 100, None)
+        .await;
+    assert!(
+        content.is_ok(),
+        "first read should succeed: {:?}",
+        content.err()
+    );
     assert_eq!(content.unwrap(), b"hello rift");
 
     // Close the underlying connection
@@ -320,8 +365,8 @@ async fn client_connects_and_receives_root_handle() {
         .await
         .expect("connect failed");
 
-    // After connecting the client must hold a non-empty root handle.
-    assert!(!client.root_handle().is_empty());
+    // After connecting the client must hold a valid root handle (Uuid).
+    assert_ne!(client.root_handle(), Uuid::nil());
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +397,12 @@ async fn client_stat_file_returns_correct_size() {
         .await
         .unwrap();
 
-    let attrs = client.stat(b"hello.txt").await.expect("stat failed");
+    // Lookup the file to get its Uuid handle
+    let (file_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup failed");
+    let attrs = client.stat(file_handle).await.expect("stat failed");
     assert_eq!(attrs.size, b"hello rift".len() as u64);
 }
 
@@ -364,7 +414,9 @@ async fn client_stat_nonexistent_handle_returns_error() {
         .await
         .unwrap();
 
-    let result = client.stat(b"no_such_file.txt").await;
+    // Use a random Uuid that we know doesn't exist on the server
+    let nonexistent_handle = Uuid::now_v7();
+    let result = client.stat(nonexistent_handle).await;
     assert!(result.is_err(), "stat of nonexistent handle must error");
 }
 
@@ -386,7 +438,8 @@ async fn client_lookup_returns_handle_and_attrs() {
         .await
         .expect("lookup failed");
 
-    assert!(!child_handle.is_empty());
+    // Uuid is valid if it's not nil
+    assert_ne!(child_handle, Uuid::nil());
     assert_eq!(attrs.file_type, FileType::Regular as i32);
     assert_eq!(attrs.size, b"hello rift".len() as u64);
 }
@@ -459,7 +512,7 @@ async fn client_readdir_empty_subdir_returns_no_entries() {
         .lookup(client.root_handle(), "empty_dir")
         .await
         .expect("lookup empty_dir failed");
-    let entries = client.readdir(&handle).await.expect("readdir failed");
+    let entries = client.readdir(handle).await.expect("readdir failed");
     assert!(entries.is_empty(), "empty dir must return no entries");
 }
 
@@ -486,8 +539,10 @@ async fn client_not_found_error_is_distinguishable_from_io_error() {
         .await
         .unwrap();
 
+    // Use a random Uuid that we know doesn't exist on the server
+    let nonexistent_handle = Uuid::now_v7();
     let err = client
-        .stat(b"does_not_exist.txt")
+        .stat(nonexistent_handle)
         .await
         .expect_err("stat of nonexistent must fail");
 
@@ -536,11 +591,18 @@ async fn client_operations_fail_after_connection_drops() {
         .await
         .unwrap();
 
+    // Get the root handle before closing connection
+    let root_handle = client.root_handle();
+
     // Explicitly close the underlying connection via the transport handle.
     client.close_connection();
 
     // Stat must fail, not block.
-    let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), client.stat(b".")).await;
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        client.stat(root_handle),
+    )
+    .await;
     assert!(
         result.is_ok(), // did not time out
         "stat must not block indefinitely after connection is closed"
@@ -566,9 +628,15 @@ async fn client_read_chunks_returns_data() {
         .await
         .unwrap();
 
+    // Lookup the file to get its Uuid handle
+    let (file_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup failed");
+
     // Read chunk 0 from hello.txt
     let result = client
-        .read_chunks(b"hello.txt", 0, 1)
+        .read_chunks(file_handle, 0, 1)
         .await
         .expect("read failed");
     assert_eq!(result.chunks.len(), 1);
@@ -592,8 +660,14 @@ async fn client_read_chunks_returns_multiple_chunks() {
         .await
         .unwrap();
 
+    // Lookup the file to get its Uuid handle
+    let (file_handle, _) = client
+        .lookup(client.root_handle(), "large.bin")
+        .await
+        .expect("lookup failed");
+
     let result = client
-        .read_chunks(b"large.bin", 0, 2)
+        .read_chunks(file_handle, 0, 2)
         .await
         .expect("read failed");
     // May return 0, 1, or 2 chunks depending on content
@@ -608,10 +682,13 @@ async fn client_read_chunks_returns_error_for_invalid_handle() {
         .await
         .unwrap();
 
-    let result = client.read_chunks(b"nonexistent.txt", 0, 1).await;
+    // Use a random Uuid that we know doesn't exist on the server
+    let nonexistent_handle = Uuid::now_v7();
+    let result = client.read_chunks(nonexistent_handle, 0, 1).await;
     assert!(result.is_err());
 }
 
+#[tokio::test]
 async fn client_merkle_drill_fetches_root_level() {
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
@@ -619,8 +696,14 @@ async fn client_merkle_drill_fetches_root_level() {
         .await
         .unwrap();
 
+    // Lookup the file to get its Uuid handle
+    let (file_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup failed");
+
     let result = client
-        .merkle_drill(b"hello.txt", 0, &[])
+        .merkle_drill(file_handle, 0, &[])
         .await
         .expect("merkle_drill failed");
     assert!(!result.hashes.is_empty());

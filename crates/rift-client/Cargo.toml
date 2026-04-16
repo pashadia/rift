@@ -23,7 +23,7 @@ async-trait.workspace = true
 rcgen.workspace = true
 dirs.workspace = true
 tokio-rusqlite = "0.7"
-ulid.workspace = true
+uuid = { workspace = true }
 scc.workspace = true
 
 rift-common = { path = "../rift-common" }

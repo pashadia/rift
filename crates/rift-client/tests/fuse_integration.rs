@@ -2,7 +2,6 @@
 #![cfg(all(target_os = "linux", feature = "fuse"))]
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fs;
 use std::process::Command;
 use std::sync::Arc;
@@ -10,9 +9,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 use rift_client::client::{ChunkReadResult, MerkleDrillResult};
-use rift_client::fuse::{path_to_handle, RiftFilesystem};
+use rift_client::fuse::RiftFilesystem;
 use rift_client::remote::RemoteShare;
 use rift_client::view::{RiftShareView, ShareView};
 use rift_common::FsError;
@@ -23,30 +23,30 @@ use rift_protocol::messages::{FileAttrs, FileType, ReaddirEntry};
 // ---------------------------------------------------------------------------
 
 struct MockRemoteShare {
-    stats: HashMap<Vec<u8>, FileAttrs>,
-    lookups: HashMap<(Vec<u8>, String), (Vec<u8>, FileAttrs)>,
-    dirs: HashMap<Vec<u8>, Vec<ReaddirEntry>>,
+    stats: HashMap<Uuid, FileAttrs>,
+    lookups: HashMap<(Uuid, String), (Uuid, FileAttrs)>,
+    dirs: HashMap<Uuid, Vec<ReaddirEntry>>,
 }
 
 impl MockRemoteShare {
-    fn new() -> Self {
+    fn new(_root_handle: Uuid) -> Self {
         Self {
             stats: HashMap::new(),
             lookups: HashMap::new(),
             dirs: HashMap::new(),
         }
     }
-    fn with_stat(mut self, handle: &[u8], attrs: FileAttrs) -> Self {
-        self.stats.insert(handle.to_vec(), attrs);
+    fn with_stat(mut self, handle: Uuid, attrs: FileAttrs) -> Self {
+        self.stats.insert(handle, attrs);
         self
     }
-    fn with_lookup(mut self, parent: &[u8], name: &str, child: &[u8], attrs: FileAttrs) -> Self {
+    fn with_lookup(mut self, parent: Uuid, name: &str, child: Uuid, attrs: FileAttrs) -> Self {
         self.lookups
-            .insert((parent.to_vec(), name.to_string()), (child.to_vec(), attrs));
+            .insert((parent, name.to_string()), (child, attrs));
         self
     }
-    fn with_dir(mut self, handle: &[u8], entries: Vec<ReaddirEntry>) -> Self {
-        self.dirs.insert(handle.to_vec(), entries);
+    fn with_dir(mut self, handle: Uuid, entries: Vec<ReaddirEntry>) -> Self {
+        self.dirs.insert(handle, entries);
         self
     }
     fn dir_attrs() -> FileAttrs {
@@ -70,32 +70,32 @@ impl MockRemoteShare {
             ..Default::default()
         }
     }
-    fn entry(name: &str, file_type: FileType) -> ReaddirEntry {
+    fn entry(name: &str, file_type: FileType, handle: Uuid) -> ReaddirEntry {
         ReaddirEntry {
             name: name.to_string(),
             file_type: file_type as i32,
-            handle: name.as_bytes().to_vec(),
+            handle: handle.as_bytes().to_vec(),
         }
     }
 }
 
 #[async_trait]
 impl RemoteShare for MockRemoteShare {
-    async fn lookup(&self, parent: &[u8], name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)> {
+    async fn lookup(&self, parent: Uuid, name: &str) -> anyhow::Result<(Uuid, FileAttrs)> {
         self.lookups
-            .get(&(parent.to_vec(), name.to_string()))
+            .get(&(parent, name.to_string()))
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
     }
-    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
+    async fn readdir(&self, handle: Uuid) -> anyhow::Result<Vec<ReaddirEntry>> {
         self.dirs
-            .get(handle)
+            .get(&handle)
             .cloned()
             .ok_or_else(|| anyhow::Error::from(FsError::NotFound))
     }
     async fn stat_batch(
         &self,
-        handles: Vec<Vec<u8>>,
+        handles: Vec<Uuid>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
         let mut results = Vec::new();
         for handle in handles {
@@ -108,7 +108,7 @@ impl RemoteShare for MockRemoteShare {
     }
     async fn read_chunks(
         &self,
-        _handle: &[u8],
+        _handle: Uuid,
         _start_chunk: u32,
         _chunk_count: u32,
     ) -> anyhow::Result<ChunkReadResult> {
@@ -119,7 +119,7 @@ impl RemoteShare for MockRemoteShare {
     }
     async fn merkle_drill(
         &self,
-        _handle: &[u8],
+        _handle: Uuid,
         _level: u32,
         _subtrees: &[u32],
     ) -> anyhow::Result<MerkleDrillResult> {
@@ -128,20 +128,6 @@ impl RemoteShare for MockRemoteShare {
             sizes: vec![],
         })
     }
-}
-
-// ---------------------------------------------------------------------------
-// Pure helper tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn path_to_handle_root_gives_dot() {
-    assert_eq!(path_to_handle(OsStr::new("/")), b".");
-}
-
-#[test]
-fn path_to_handle_strips_leading_slash() {
-    assert_eq!(path_to_handle(OsStr::new("/hello.txt")), b"hello.txt");
 }
 
 // ---------------------------------------------------------------------------
@@ -173,8 +159,8 @@ struct MountFixture {
 }
 
 impl MountFixture {
-    async fn new<R: RemoteShare + 'static>(remote: R) -> Self {
-        let view = RiftShareView::new(Arc::new(remote));
+    async fn new<R: RemoteShare + 'static>(remote: R, root_handle: Uuid) -> Self {
+        let view = RiftShareView::new(Arc::new(remote), root_handle);
         let mount_point = TempDir::new().expect("Failed to create temp mount point");
         let handle = mount(view, mount_point.path())
             .await
@@ -198,8 +184,10 @@ impl MountFixture {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mount_point_is_directory() {
     let _guard = MOUNT_LOCK.lock().await;
-    let client = MockRemoteShare::new().with_stat(b".", MockRemoteShare::dir_attrs());
-    let fixture = MountFixture::new(client).await;
+    let root_handle = Uuid::now_v7();
+    let client =
+        MockRemoteShare::new(root_handle).with_stat(root_handle, MockRemoteShare::dir_attrs());
+    let fixture = MountFixture::new(client, root_handle).await;
     let metadata = fs::metadata(fixture.path()).expect("metadata failed");
     assert!(metadata.is_dir());
 }
@@ -207,8 +195,10 @@ async fn test_mount_point_is_directory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lookup_nonexistent_file() {
     let _guard = MOUNT_LOCK.lock().await;
-    let client = MockRemoteShare::new().with_stat(b".", MockRemoteShare::dir_attrs());
-    let fixture = MountFixture::new(client).await;
+    let root_handle = Uuid::now_v7();
+    let client =
+        MockRemoteShare::new(root_handle).with_stat(root_handle, MockRemoteShare::dir_attrs());
+    let fixture = MountFixture::new(client, root_handle).await;
     let path = fixture.path().join("does_not_exist.txt");
     let err_kind = fs::metadata(&path).unwrap_err().kind();
     assert_eq!(err_kind, std::io::ErrorKind::NotFound);
@@ -231,15 +221,22 @@ async fn test_list_directory_long_format_succeeds() {
     let file_attrs = MockRemoteShare::file_attrs(123);
     let dir_attrs = MockRemoteShare::dir_attrs();
 
-    let client = MockRemoteShare::new()
-        .with_stat(b".", dir_attrs)
-        .with_dir(
-            b".",
-            vec![MockRemoteShare::entry("file1.txt", FileType::Regular)],
-        )
-        .with_stat(b"file1.txt", file_attrs);
+    let root_handle = Uuid::now_v7();
+    let file1_handle = Uuid::now_v7();
 
-    let fixture = MountFixture::new(client).await;
+    let client = MockRemoteShare::new(root_handle)
+        .with_stat(root_handle, dir_attrs)
+        .with_dir(
+            root_handle,
+            vec![MockRemoteShare::entry(
+                "file1.txt",
+                FileType::Regular,
+                file1_handle,
+            )],
+        )
+        .with_stat(file1_handle, file_attrs);
+
+    let fixture = MountFixture::new(client, root_handle).await;
     let path = fixture.path().to_path_buf();
 
     let output =
@@ -262,7 +259,8 @@ async fn test_list_subdirectory() {
     init_logging();
     let _guard = MOUNT_LOCK.lock().await;
 
-    let fixture = MountFixture::new(mock_for_subdirectory()).await;
+    let (mock, root_handle) = mock_for_subdirectory();
+    let fixture = MountFixture::new(mock, root_handle).await;
     let path = fixture.path().join("subdir");
 
     let output =
@@ -278,20 +276,30 @@ async fn test_list_subdirectory() {
     assert!(stdout.contains("nested.txt"));
 }
 
-fn mock_for_subdirectory() -> MockRemoteShare {
+fn mock_for_subdirectory() -> (MockRemoteShare, Uuid) {
     let root_attrs = MockRemoteShare::dir_attrs();
     let subdir_attrs = MockRemoteShare::dir_attrs();
     let nested_file_attrs = MockRemoteShare::file_attrs(42);
 
-    MockRemoteShare::new()
-        .with_stat(b".", root_attrs)
-        .with_lookup(b".", "subdir", b"subdir", subdir_attrs)
-        .with_stat(b"subdir", MockRemoteShare::dir_attrs())
+    let root_handle = Uuid::now_v7();
+    let subdir_handle = Uuid::now_v7();
+    let nested_handle = Uuid::now_v7();
+
+    let mock = MockRemoteShare::new(root_handle)
+        .with_stat(root_handle, root_attrs)
+        .with_lookup(root_handle, "subdir", subdir_handle, subdir_attrs)
+        .with_stat(subdir_handle, MockRemoteShare::dir_attrs())
         .with_dir(
-            b"subdir",
-            vec![MockRemoteShare::entry("nested.txt", FileType::Regular)],
+            subdir_handle,
+            vec![MockRemoteShare::entry(
+                "nested.txt",
+                FileType::Regular,
+                nested_handle,
+            )],
         )
-        .with_stat(b"nested.txt", nested_file_attrs)
+        .with_stat(nested_handle, nested_file_attrs);
+
+    (mock, root_handle)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -299,11 +307,12 @@ async fn test_list_empty_directory() {
     init_logging();
     let _guard = MOUNT_LOCK.lock().await;
 
-    let client = MockRemoteShare::new()
-        .with_stat(b".", MockRemoteShare::dir_attrs())
-        .with_dir(b".", vec![]);
+    let root_handle = Uuid::now_v7();
+    let client = MockRemoteShare::new(root_handle)
+        .with_stat(root_handle, MockRemoteShare::dir_attrs())
+        .with_dir(root_handle, vec![]);
 
-    let fixture = MountFixture::new(client).await;
+    let fixture = MountFixture::new(client, root_handle).await;
     let path = fixture.path().to_path_buf();
 
     let output =
@@ -323,8 +332,10 @@ async fn test_list_nonexistent_directory() {
     init_logging();
     let _guard = MOUNT_LOCK.lock().await;
 
-    let client = MockRemoteShare::new().with_stat(b".", MockRemoteShare::dir_attrs());
-    let fixture = MountFixture::new(client).await;
+    let root_handle = Uuid::now_v7();
+    let client =
+        MockRemoteShare::new(root_handle).with_stat(root_handle, MockRemoteShare::dir_attrs());
+    let fixture = MountFixture::new(client, root_handle).await;
     let path = fixture.path().join("nonexistent_dir");
 
     let output =

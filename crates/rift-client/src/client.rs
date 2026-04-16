@@ -30,6 +30,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use prost::Message as _;
 use tracing::instrument;
+use uuid::Uuid;
 
 use rift_common::FsError;
 use rift_protocol::messages::{
@@ -58,7 +59,7 @@ use rift_transport::{
 /// `Arc`) so it can be shared across `Arc` or moved into tasks.
 pub struct RiftClient<C: RiftConnection> {
     conn: C,
-    root_handle: Vec<u8>,
+    root_handle: Uuid,
     addr: SocketAddr,
     share_name: String,
     cert: Vec<u8>,
@@ -69,7 +70,7 @@ impl<C: RiftConnection + Clone> Clone for RiftClient<C> {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
-            root_handle: self.root_handle.clone(),
+            root_handle: self.root_handle,
             addr: self.addr,
             share_name: self.share_name.clone(),
             cert: self.cert.clone(),
@@ -105,9 +106,11 @@ impl RiftClient<QuicConnection> {
             .map_err(|e| anyhow::anyhow!("handshake for share '{}': {e}", self.share_name))?;
 
         tracing::info!("reconnected successfully");
+        let root_handle = Uuid::from_slice(&welcome.root_handle)
+            .map_err(|e| anyhow::anyhow!("invalid root handle from server: {e}"))?;
         Ok(Self {
             conn,
-            root_handle: welcome.root_handle,
+            root_handle,
             addr: self.addr,
             share_name: self.share_name.clone(),
             cert: self.cert.clone(),
@@ -163,9 +166,12 @@ impl RiftClient<QuicConnection> {
             .await
             .map_err(|e| anyhow::anyhow!("handshake for share '{share_name}': {e}"))?;
 
+        let root_handle = Uuid::from_slice(&welcome.root_handle)
+            .map_err(|e| anyhow::anyhow!("invalid root handle from server: {e}"))?;
+
         Ok(Self {
             conn,
-            root_handle: welcome.root_handle,
+            root_handle,
             addr,
             share_name: share_name.to_string(),
             cert,
@@ -231,9 +237,12 @@ impl RiftClient<QuicConnection> {
             .await
             .map_err(|e| anyhow::anyhow!("handshake for share '{share_name}': {e}"))?;
 
+        let root_handle = Uuid::from_slice(&welcome.root_handle)
+            .map_err(|e| anyhow::anyhow!("invalid root handle from server: {e}"))?;
+
         Ok(Self {
             conn,
-            root_handle: welcome.root_handle,
+            root_handle,
             addr,
             share_name: share_name.to_string(),
             cert,
@@ -247,7 +256,7 @@ impl<C: RiftConnection> RiftClient<C> {
     ///
     /// This is primarily useful for testing with mock or recording connections.
     /// For production use, prefer [`RiftClient::connect`] or [`RiftClient::connect_with_cert`].
-    pub fn from_connection(conn: C, root_handle: Vec<u8>) -> Self {
+    pub fn from_connection(conn: C, root_handle: Uuid) -> Self {
         Self {
             conn,
             root_handle,
@@ -267,8 +276,8 @@ impl<C: RiftConnection> RiftClient<C> {
     ///
     /// Pass this as the `handle` argument to `stat`, or as `parent` to
     /// `lookup` and `readdir` when operating on the share root.
-    pub fn root_handle(&self) -> &[u8] {
-        &self.root_handle
+    pub fn root_handle(&self) -> Uuid {
+        self.root_handle
     }
 
     /// Close the underlying QUIC connection.
@@ -287,13 +296,12 @@ impl<C: RiftConnection> RiftClient<C> {
     ///
     /// Sends a single `StatRequest` with all handles in one network request.
     #[instrument(skip(self), fields(handle_count = handles.len()))]
-    pub async fn stat_batch(
-        &self,
-        handles: Vec<Vec<u8>>,
-    ) -> Result<Vec<Result<FileAttrs, FsError>>> {
+    pub async fn stat_batch(&self, handles: Vec<Uuid>) -> Result<Vec<Result<FileAttrs, FsError>>> {
         if handles.is_empty() {
             return Ok(Vec::new());
         }
+
+        let handle_bytes: Vec<Vec<u8>> = handles.iter().map(|u| u.as_bytes().to_vec()).collect();
 
         let mut stream = self
             .conn
@@ -301,7 +309,9 @@ impl<C: RiftConnection> RiftClient<C> {
             .await
             .map_err(|e| anyhow::anyhow!("stat_batch: open stream: {e}"))?;
 
-        let req = StatRequest { handles };
+        let req = StatRequest {
+            handles: handle_bytes,
+        };
         stream
             .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
             .await?;
@@ -371,8 +381,8 @@ impl RiftClient<QuicConnection> {
     ///
     /// Server `ErrorCode` values are mapped to [`FsError`] variants so the
     /// FUSE layer can produce the correct POSIX errno.
-    #[instrument(skip(self), fields(handle_len = handle.len()))]
-    pub async fn stat(&self, handle: &[u8]) -> Result<FileAttrs> {
+    #[instrument(skip(self))]
+    pub async fn stat(&self, handle: Uuid) -> Result<FileAttrs> {
         let mut stream = self
             .conn
             .open_stream()
@@ -380,7 +390,7 @@ impl RiftClient<QuicConnection> {
             .map_err(|e| anyhow::anyhow!("stat: open stream: {e}"))?;
 
         let req = StatRequest {
-            handles: vec![handle.to_vec()],
+            handles: vec![handle.as_bytes().to_vec()],
         };
         stream
             .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
@@ -411,8 +421,8 @@ impl RiftClient<QuicConnection> {
     /// Resolve `name` within the directory identified by `parent`.
     ///
     /// Returns `(child_handle, child_attrs)`.
-    #[instrument(skip(self), fields(parent_len = parent.len(), name = %name))]
-    pub async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn lookup(&self, parent: Uuid, name: &str) -> Result<(Uuid, FileAttrs)> {
         let mut stream = self
             .conn
             .open_stream()
@@ -420,7 +430,7 @@ impl RiftClient<QuicConnection> {
             .map_err(|e| anyhow::anyhow!("lookup: open stream: {e}"))?;
 
         let req = LookupRequest {
-            parent_handle: parent.to_vec(),
+            parent_handle: parent.as_bytes().to_vec(),
             name: name.to_string(),
         };
         stream
@@ -441,7 +451,9 @@ impl RiftClient<QuicConnection> {
                 let attrs = entry
                     .attrs
                     .ok_or_else(|| anyhow::Error::from(FsError::Io))?;
-                Ok((entry.handle, attrs))
+                let handle = Uuid::from_slice(&entry.handle)
+                    .map_err(|e| anyhow::anyhow!("invalid handle from server: {e}"))?;
+                Ok((handle, attrs))
             }
             Some(lookup_response::Result::Error(e)) => Err(map_proto_error(e.code)),
             None => Err(anyhow::Error::from(FsError::Io)),
@@ -452,8 +464,8 @@ impl RiftClient<QuicConnection> {
     ///
     /// Returns all entries (no client-side pagination).  FUSE-level
     /// offset/pagination is handled by [`rift_fuse::compute_readdir`].
-    #[instrument(skip(self), fields(handle_len = handle.len()))]
-    pub async fn readdir(&self, handle: &[u8]) -> Result<Vec<ReaddirEntry>> {
+    #[instrument(skip(self))]
+    pub async fn readdir(&self, handle: Uuid) -> Result<Vec<ReaddirEntry>> {
         let mut stream = self
             .conn
             .open_stream()
@@ -461,7 +473,7 @@ impl RiftClient<QuicConnection> {
             .map_err(|e| anyhow::anyhow!("readdir: open stream: {e}"))?;
 
         let req = ReaddirRequest {
-            directory_handle: handle.to_vec(),
+            directory_handle: handle.as_bytes().to_vec(),
             offset: 0,
             limit: 0, // 0 = return all entries
         };
@@ -496,10 +508,10 @@ impl RiftClient<QuicConnection> {
     /// - `chunk_count`: Number of chunks to read (0 = all remaining)
     ///
     /// Returns `ChunkReadResult` with chunk data and the file's Merkle root.
-    #[instrument(skip(self), fields(handle_len = handle.len()))]
+    #[instrument(skip(self))]
     pub async fn read_chunks(
         &self,
-        handle: &[u8],
+        handle: Uuid,
         start_chunk: u32,
         chunk_count: u32,
     ) -> Result<ChunkReadResult> {
@@ -510,7 +522,7 @@ impl RiftClient<QuicConnection> {
             .map_err(|e| anyhow::anyhow!("read_chunks: open stream: {e}"))?;
 
         let req = ReadRequest {
-            handle: handle.to_vec(),
+            handle: handle.as_bytes().to_vec(),
             start_chunk,
             chunk_count,
         };
@@ -600,10 +612,10 @@ impl RiftClient<QuicConnection> {
     /// - `subtrees`: Specific subtree indices to fetch (empty = all at this level)
     ///
     /// Returns `MerkleLevelResponse` with hashes and subtree byte counts.
-    #[instrument(skip(self), fields(handle_len = handle.len(), level, subtrees_len = subtrees.len()))]
+    #[instrument(skip(self), fields(level, subtrees_len = subtrees.len()))]
     pub async fn merkle_drill(
         &self,
-        handle: &[u8],
+        handle: Uuid,
         level: u32,
         subtrees: &[u32],
     ) -> Result<MerkleLevelResponse> {
@@ -614,7 +626,7 @@ impl RiftClient<QuicConnection> {
             .map_err(|e| anyhow::anyhow!("merkle_drill: open stream: {e}"))?;
 
         let req = MerkleDrill {
-            handle: handle.to_vec(),
+            handle: handle.as_bytes().to_vec(),
             level,
             subtrees: subtrees.to_vec(),
         };
@@ -659,24 +671,24 @@ impl From<MerkleLevelResponse> for MerkleDrillResult {
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 #[async_trait::async_trait]
 impl crate::remote::RemoteShare for RiftClient<QuicConnection> {
-    async fn lookup(&self, parent: &[u8], name: &str) -> Result<(Vec<u8>, FileAttrs)> {
+    async fn lookup(&self, parent: Uuid, name: &str) -> Result<(Uuid, FileAttrs)> {
         self.lookup(parent, name).await
     }
 
-    async fn readdir(&self, handle: &[u8]) -> Result<Vec<ReaddirEntry>> {
+    async fn readdir(&self, handle: Uuid) -> Result<Vec<ReaddirEntry>> {
         self.readdir(handle).await
     }
 
     async fn stat_batch(
         &self,
-        handles: Vec<Vec<u8>>,
+        handles: Vec<Uuid>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
         self.stat_batch(handles).await
     }
 
     async fn read_chunks(
         &self,
-        handle: &[u8],
+        handle: Uuid,
         start_chunk: u32,
         chunk_count: u32,
     ) -> anyhow::Result<ChunkReadResult> {
@@ -685,7 +697,7 @@ impl crate::remote::RemoteShare for RiftClient<QuicConnection> {
 
     async fn merkle_drill(
         &self,
-        handle: &[u8],
+        handle: Uuid,
         level: u32,
         subtrees: &[u32],
     ) -> anyhow::Result<MerkleDrillResult> {

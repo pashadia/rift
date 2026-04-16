@@ -30,7 +30,7 @@ use rift_transport::{
     RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
 };
 
-use crate::{handler, metadata::db::Database};
+use crate::{handle::HandleDatabase, handler, metadata::db::Database};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -40,22 +40,24 @@ use crate::{handler, metadata::db::Database};
 ///
 /// Uses a Merkle cache database for computing root hashes. Pass `None` for `db`
 /// to disable caching (root hashes will still be computed on-demand).
-#[instrument(skip(listener, db), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
+#[instrument(skip(listener, db, handle_db), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
 pub async fn accept_loop(
     listener: QuicListener,
     share: PathBuf,
     db: Arc<Option<Database>>,
+    handle_db: Arc<HandleDatabase>,
 ) -> anyhow::Result<()> {
     loop {
         match listener.accept().await {
             Ok(conn) => {
                 let share = share.clone();
                 let db = db.clone();
+                let handle_db = handle_db.clone();
                 let peer = conn.peer_fingerprint().to_string();
                 let conn_span = debug_span!("server.connection", peer = %peer);
                 tokio::spawn(
                     async move {
-                        serve_connection(conn, share, db).await;
+                        serve_connection(conn, share, db, handle_db).await;
                     }
                     .instrument(conn_span),
                 );
@@ -73,8 +75,13 @@ pub async fn accept_loop(
 // Per-connection loop
 // ---------------------------------------------------------------------------
 
-#[instrument(skip(conn, share, db), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
-async fn serve_connection(conn: QuicConnection, share: PathBuf, db: Arc<Option<Database>>) {
+#[instrument(skip(conn, share, db, handle_db), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
+async fn serve_connection(
+    conn: QuicConnection,
+    share: PathBuf,
+    db: Arc<Option<Database>>,
+    handle_db: Arc<HandleDatabase>,
+) {
     debug!("connection established");
 
     // TODO(v1): authorise peer fingerprint against per-share permission files
@@ -85,10 +92,11 @@ async fn serve_connection(conn: QuicConnection, share: PathBuf, db: Arc<Option<D
             Ok(stream) => {
                 let share = share.clone();
                 let db = db.clone();
+                let handle_db = handle_db.clone();
                 let stream_span = debug_span!("server.stream", share = %share.display());
                 tokio::spawn(
                     async move {
-                        if let Err(e) = handle_stream(stream, share, db).await {
+                        if let Err(e) = handle_stream(stream, share, db, handle_db).await {
                             debug!("stream error: {}", e);
                         }
                     }
@@ -112,6 +120,7 @@ async fn handle_stream(
     mut stream: QuicStream,
     share: PathBuf,
     db: Arc<Option<Database>>,
+    handle_db: Arc<HandleDatabase>,
 ) -> anyhow::Result<()> {
     let (type_id, payload) = match stream.recv_frame().await {
         Ok(Some(f)) => f,
@@ -139,7 +148,6 @@ async fn handle_stream(
             let hello = RiftHello::decode(payload.as_ref())?;
 
             if hello.protocol_version != RIFT_PROTOCOL_VERSION {
-                // TODO(v1): send a typed error frame before closing.
                 anyhow::bail!(
                     "unsupported protocol version {} (expected {})",
                     hello.protocol_version,
@@ -147,15 +155,18 @@ async fn handle_stream(
                 );
             }
 
-            // TODO(v1): validate share name against configured shares.
-            // TODO(v1): check client fingerprint against permission files.
+            // Get or create handle for the share root
+            let root_handle = match handle_db.get_or_create_handle(&share, &share).await {
+                Ok(uuid) => uuid.as_bytes().to_vec(),
+                Err(_) => {
+                    anyhow::bail!("failed to get root handle for share");
+                }
+            };
+
             let welcome = RiftWelcome {
                 protocol_version: RIFT_PROTOCOL_VERSION,
                 active_capabilities: vec![],
-                // TODO(handles): Issue a server-assigned opaque root handle instead of
-                // the literal `b"."`.  Until then the handle leaks path structure and
-                // is invalidated by any rename of the share root.
-                root_handle: b".".to_vec(),
+                root_handle,
                 max_concurrent_streams: 128,
                 share: Some(ShareInfo {
                     name: hello.share_name.clone(),
@@ -173,16 +184,29 @@ async fn handle_stream(
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::stat_response(&payload, &share, db_ref).await;
-            stream
-                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
+            let response = handler::stat_response(&payload, &share, db_ref, &handle_db).await;
+            // Send response with timeout to avoid hanging if client disconnected
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.send_frame(msg::STAT_RESPONSE, &response.encode_to_vec()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    let _ = stream.finish_send().await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("send_frame error: {}", e);
+                }
+                Err(_) => {
+                    tracing::warn!("send_frame timeout - client may have disconnected");
+                }
+            }
         }
 
         msg::LOOKUP_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::lookup_response(&payload, &share, db_ref).await;
+            let response = handler::lookup_response(&payload, &share, db_ref, &handle_db).await;
             stream
                 .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -190,7 +214,7 @@ async fn handle_stream(
         }
 
         msg::READDIR_REQUEST => {
-            let response = handler::readdir_response(&payload, &share);
+            let response = handler::readdir_response(&payload, &share, &handle_db).await;
             stream
                 .send_frame(msg::READDIR_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -202,14 +226,14 @@ async fn handle_stream(
         // ------------------------------------------------------------------
         msg::READ_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            handler::read_response(&mut stream, &payload, &share, db_ref)
+            handler::read_response(&mut stream, &payload, &share, db_ref, &handle_db)
                 .await
                 .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
         }
 
         msg::MERKLE_DRILL => {
             let db_ref = db.as_ref().as_ref();
-            handler::merkle_drill_response(&mut stream, &payload, &share, db_ref)
+            handler::merkle_drill_response(&mut stream, &payload, &share, db_ref, &handle_db)
                 .await
                 .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
         }

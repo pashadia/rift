@@ -63,8 +63,8 @@ bytes = "1"
 async-trait = "0.1"
 dirs = "5"
 
-# ULID handles
-ulid = "1.1"
+# UUID v7 handles
+uuid = { version = "1", features = ["v7"] }
 
 # Concurrent hash maps
 scc = "3"

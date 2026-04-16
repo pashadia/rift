@@ -1,8 +1,3 @@
-//! Auto-reconnecting wrapper for `RiftClient`.
-//!
-//! Wraps a `RiftClient` and transparently reconnects on connection errors,
-//! retrying operations with exponential backoff.
-
 use crate::client::{ChunkReadResult, MerkleDrillResult, RiftClient};
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
@@ -10,17 +5,16 @@ use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, ReaddirEntry};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const MAX_RETRIES: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 100;
 
 fn is_connection_error(err: &anyhow::Error) -> bool {
-    // Don't retry on domain errors (FsError variants)
     if err.downcast_ref::<FsError>().is_some() {
         return false;
     }
 
-    // Check for connection-related error messages
     let msg = err.to_string().to_lowercase();
     msg.contains("connection")
         || msg.contains("timeout")
@@ -54,7 +48,6 @@ impl ReconnectingClient {
             match make_op().await {
                 Ok(result) => break Ok(result),
                 Err(e) if !is_connection_error(&e) => {
-                    // Domain error (like NotFound) - don't retry, propagate immediately
                     break Err(e);
                 }
                 Err(e) if attempts >= MAX_RETRIES => {
@@ -73,7 +66,6 @@ impl ReconnectingClient {
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
-                    // Reconnect
                     let mut guard = self.client.lock().await;
                     match guard.reconnect().await {
                         Ok(new_client) => {
@@ -109,31 +101,27 @@ impl ReconnectingClient {
 
 #[async_trait]
 impl RemoteShare for ReconnectingClient {
-    async fn lookup(&self, parent: &[u8], name: &str) -> anyhow::Result<(Vec<u8>, FileAttrs)> {
-        let parent = parent.to_vec();
+    async fn lookup(&self, parent: Uuid, name: &str) -> anyhow::Result<(Uuid, FileAttrs)> {
         let name = name.to_string();
         let client = self.client.clone();
         self.with_reconnect(move || {
-            let parent = parent.clone();
             let name = name.clone();
             let client = client.clone();
             async move {
                 let client = client.lock().await;
-                client.lookup(&parent, &name).await
+                client.lookup(parent, &name).await
             }
         })
         .await
     }
 
-    async fn readdir(&self, handle: &[u8]) -> anyhow::Result<Vec<ReaddirEntry>> {
-        let handle = handle.to_vec();
+    async fn readdir(&self, handle: Uuid) -> anyhow::Result<Vec<ReaddirEntry>> {
         let client = self.client.clone();
         self.with_reconnect(move || {
-            let handle = handle.clone();
             let client = client.clone();
             async move {
                 let client = client.lock().await;
-                client.readdir(&handle).await
+                client.readdir(handle).await
             }
         })
         .await
@@ -141,7 +129,7 @@ impl RemoteShare for ReconnectingClient {
 
     async fn stat_batch(
         &self,
-        handles: Vec<Vec<u8>>,
+        handles: Vec<Uuid>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
         let client = self.client.clone();
         self.with_reconnect(move || {
@@ -157,18 +145,16 @@ impl RemoteShare for ReconnectingClient {
 
     async fn read_chunks(
         &self,
-        handle: &[u8],
+        handle: Uuid,
         start_chunk: u32,
         chunk_count: u32,
     ) -> anyhow::Result<ChunkReadResult> {
-        let handle = handle.to_vec();
         let client = self.client.clone();
         self.with_reconnect(move || {
-            let handle = handle.clone();
             let client = client.clone();
             async move {
                 let client = client.lock().await;
-                client.read_chunks(&handle, start_chunk, chunk_count).await
+                client.read_chunks(handle, start_chunk, chunk_count).await
             }
         })
         .await
@@ -176,20 +162,18 @@ impl RemoteShare for ReconnectingClient {
 
     async fn merkle_drill(
         &self,
-        handle: &[u8],
+        handle: Uuid,
         level: u32,
         subtrees: &[u32],
     ) -> anyhow::Result<MerkleDrillResult> {
-        let handle = handle.to_vec();
         let subtrees = subtrees.to_vec();
         let client = self.client.clone();
         self.with_reconnect(move || {
-            let handle = handle.clone();
             let subtrees = subtrees.clone();
             let client = client.clone();
             async move {
                 let client = client.lock().await;
-                let resp = client.merkle_drill(&handle, level, &subtrees).await?;
+                let resp = client.merkle_drill(handle, level, &subtrees).await?;
                 Ok(resp.into())
             }
         })

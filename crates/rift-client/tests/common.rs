@@ -38,7 +38,10 @@ pub async fn start_server(share: PathBuf) -> SocketAddr {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
-        rt.block_on(async { rift_server::server::accept_loop(listener, share, db).await })
+        let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
+        rt.block_on(async {
+            rift_server::server::accept_loop(listener, share, db, handle_db).await
+        })
     });
 
     // Wait for server to be ready

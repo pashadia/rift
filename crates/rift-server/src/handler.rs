@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use prost::Message as _;
 use tracing::instrument;
 
@@ -24,46 +26,37 @@ use rift_protocol::messages::{
 };
 use rift_transport::RiftStream;
 
+use uuid::Uuid;
+
+use crate::handle::HandleDatabase;
 use crate::metadata::db::Database;
 
 // ---------------------------------------------------------------------------
 // Path resolution (security-critical)
 // ---------------------------------------------------------------------------
 
-/// Resolve an opaque `handle` (relative path bytes from the client) to a
-/// canonical filesystem path within `share`.
+/// Resolve an opaque `handle` (UUID from the client) to a
+/// canonical filesystem path within `share` using the HandleDatabase.
 ///
 /// # Security invariants
 ///
-/// - Rejects handles containing null bytes (would truncate OS paths).
-/// - Rejects empty handles.
+/// - Looks up path from HandleDatabase using UUID.
 /// - Canonicalises the result with `std::fs::canonicalize`, which resolves
 ///   all `..` components and follows symlinks.
 /// - Checks that the canonical result is prefixed by the canonical share root,
 ///   which rejects:
-///   - Direct `..` traversal (`../../etc/passwd`).
-///   - Absolute handles (`/etc/passwd` — `Path::join` replaces the base).
-///   - Intermediate symlinks pointing outside the share.
-///
-/// # TODO(handles)
-///
-/// This function exists because handles are currently relative path strings
-/// (e.g. `b"subdir/file.txt"`).  Once handles become server-assigned opaque
-/// tokens, resolution will be a lookup in a server-side handle table rather
-/// than a filesystem path join.  The security invariants enforced here will
-/// move into the handle-issuance logic instead.
-#[instrument(skip(share), fields(share = %share.display(), handle = ?handle), level = "debug")]
-pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
-    if handle.contains(&0) {
-        tracing::warn!(handle = ?handle, "rejecting null byte in handle");
-        anyhow::bail!("null byte in handle");
-    }
-    if handle.is_empty() {
-        tracing::warn!("rejecting empty handle");
-        anyhow::bail!("empty handle");
-    }
-
-    let handle_str = std::str::from_utf8(handle).context("handle is not valid UTF-8")?;
+///   - Symlinks pointing outside the share.
+///   - Paths that escape via intermediate symlinks.
+#[instrument(skip(share, handle_db), fields(share = %share.display(), handle = ?handle), level = "debug")]
+pub fn resolve(share: &Path, handle: &Uuid, handle_db: &HandleDatabase) -> anyhow::Result<PathBuf> {
+    // Look up the path from the HandleDatabase
+    let relative_path = match handle_db.get_path(handle) {
+        Some(path) => path,
+        None => {
+            tracing::warn!("handle not found in database");
+            anyhow::bail!("invalid handle: not found");
+        }
+    };
 
     // Canonicalize the share root once so the prefix check is reliable even
     // when `share` itself contains symlinks or `.` components.
@@ -71,20 +64,19 @@ pub fn resolve(share: &Path, handle: &[u8]) -> anyhow::Result<PathBuf> {
         .canonicalize()
         .context("share root does not exist or is inaccessible")?;
 
-    // `Path::join` with an absolute component replaces the entire path — an
-    // absolute handle like `/etc/passwd` would yield `/etc/passwd`, which the
-    // subsequent prefix check will reject.
-    let joined = share.join(handle_str);
+    // Join the relative path with the share root
+    let joined = share_canonical.join(&relative_path);
 
     // `canonicalize` resolves `..` and symlinks.  It fails if the path does
     // not exist, which is the correct error for lookups of missing entries.
     let canonical = joined
         .canonicalize()
-        .with_context(|| format!("path does not exist: {handle_str}"))?;
+        .with_context(|| format!("path does not exist: {}", relative_path.display()))?;
 
+    // Security check: ensure canonical path is still within share
     if !canonical.starts_with(&share_canonical) {
         tracing::warn!(path = %canonical.display(), "path escapes share root");
-        anyhow::bail!("path escapes share root: {handle_str}");
+        anyhow::bail!("path escapes share root: {}", relative_path.display());
     }
 
     Ok(canonical)
@@ -155,37 +147,32 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
 /// `StatResult` per handle (success or error).
 ///
 /// Malformed payloads return an empty result list rather than panicking.
-#[instrument(skip(share, db), fields(share = %share.display()), level = "debug")]
-pub async fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) -> StatResponse {
+#[instrument(skip(share, db, handle_db), fields(share = %share.display()), level = "debug")]
+pub async fn stat_response(
+    payload: &[u8],
+    share: &Path,
+    db: Option<&Database>,
+    handle_db: &HandleDatabase,
+) -> StatResponse {
     let req = match StatRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => return StatResponse { results: vec![] },
     };
 
-    let mut results = Vec::with_capacity(req.handles.len());
-    for handle in req.handles {
-        let canonical = match resolve(share, &handle) {
-            Ok(p) => p,
-            Err(_) => {
-                results.push(stat_error(io_error_code(&handle, share)));
-                continue;
-            }
-        };
+    // Build results. Each handle in the request must produce exactly one result
+    // in the response, preserving the 1:1 invariant. Invalid handles (wrong
+    // byte count, etc.) produce an ErrorNotFound result rather than being
+    // silently dropped.
+    let futures: Vec<_> = req
+        .handles
+        .into_iter()
+        .map(|handle_bytes| match Uuid::from_slice(&handle_bytes) {
+            Ok(uuid) => async_stat(share, handle_bytes, uuid, handle_db, db).boxed(),
+            Err(_) => async { stat_error(ErrorCode::ErrorNotFound) }.boxed(),
+        })
+        .collect();
 
-        let meta = match std::fs::metadata(&canonical) {
-            Ok(m) => m,
-            Err(_) => {
-                results.push(stat_error(io_error_code(&handle, share)));
-                continue;
-            }
-        };
-
-        let root_hash = get_or_compute_merkle_root(&canonical, &meta, db).await;
-        results.push(StatResult {
-            handle: handle,
-            result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
-        });
-    }
+    let results = futures::future::join_all(futures).await;
 
     StatResponse { results }
 }
@@ -194,11 +181,12 @@ pub async fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) 
 /// handle and its attributes.
 ///
 /// Returns `ErrorNotFound` if either the parent or the child does not exist.
-#[instrument(skip(share, db), fields(share = %share.display()), level = "debug")]
+#[instrument(skip(share, db, handle_db), fields(share = %share.display()), level = "debug")]
 pub async fn lookup_response(
     payload: &[u8],
     share: &Path,
     db: Option<&Database>,
+    handle_db: &HandleDatabase,
 ) -> LookupResponse {
     let req = match LookupRequest::decode(payload) {
         Ok(r) => r,
@@ -210,7 +198,13 @@ pub async fn lookup_response(
         return lookup_error(ErrorCode::ErrorUnsupported);
     }
 
-    let parent_canonical = match resolve(share, &req.parent_handle) {
+    // Parse the parent handle from bytes to UUID at the network boundary
+    let parent_uuid = match Uuid::from_slice(&req.parent_handle) {
+        Ok(u) => u,
+        Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
+    };
+
+    let parent_canonical = match resolve(share, &parent_uuid, handle_db) {
         Ok(p) => p,
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
@@ -237,14 +231,14 @@ pub async fn lookup_response(
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    // The handle is the path relative to the share root (e.g. "subdir/file.txt").
-    // TODO(handles): Replace with a server-assigned opaque handle.  Path-based
-    // handles are invalidated by renames and expose filesystem structure to the
-    // client.  See docs/02-protocol-design/handle-design.md.
-    let handle = child_canonical
-        .strip_prefix(&share_canonical)
-        .map(|rel| rel.to_string_lossy().into_owned().into_bytes())
-        .unwrap_or_else(|_| req.name.into_bytes());
+    // Get or create a handle for the child via HandleDatabase
+    let handle = match handle_db
+        .get_or_create_handle(&child_canonical, &share_canonical)
+        .await
+    {
+        Ok(uuid) => uuid.as_bytes().to_vec(),
+        Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
+    };
 
     let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db).await;
 
@@ -261,14 +255,24 @@ pub async fn lookup_response(
 ///
 /// Entries are returned in alphabetical order for determinism.
 /// Malformed payloads return an error response rather than panicking.
-#[instrument(skip(share), fields(share = %share.display()), level = "debug")]
-pub fn readdir_response(payload: &[u8], share: &Path) -> ReaddirResponse {
+#[instrument(skip(share, handle_db), fields(share = %share.display()), level = "debug")]
+pub async fn readdir_response(
+    payload: &[u8],
+    share: &Path,
+    handle_db: &HandleDatabase,
+) -> ReaddirResponse {
     let req = match ReaddirRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => return readdir_error(ErrorCode::ErrorUnsupported),
     };
 
-    let dir_canonical = match resolve(share, &req.directory_handle) {
+    // Parse directory handle from bytes to UUID at the network boundary
+    let dir_uuid = match Uuid::from_slice(&req.directory_handle) {
+        Ok(u) => u,
+        Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
+    };
+
+    let dir_canonical = match resolve(share, &dir_uuid, handle_db) {
         Ok(p) => p,
         Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
     };
@@ -278,45 +282,55 @@ pub fn readdir_response(payload: &[u8], share: &Path) -> ReaddirResponse {
         Err(_) => return readdir_error(ErrorCode::ErrorUnsupported),
     };
 
-    let read_dir = match std::fs::read_dir(&dir_canonical) {
-        Ok(rd) => rd,
+    // Collect entries using async functional approach with tokio
+    use tokio_stream::wrappers::ReadDirStream;
+    use tokio_stream::StreamExt;
+
+    let entries: Vec<ReaddirEntry> = match tokio::fs::read_dir(&dir_canonical).await {
+        Ok(read_dir) => {
+            // First collect all entries with their info using then, then filter out None values
+            let stream = ReadDirStream::new(read_dir);
+            let entries_with_none: Vec<Option<ReaddirEntry>> = stream
+                .then(|entry_result| {
+                    let share_canonical = share_canonical.clone();
+                    async move {
+                        let entry = entry_result.ok()?;
+                        let file_type = entry.file_type().await.ok()?;
+                        let proto_type = if file_type.is_dir() {
+                            FileType::Directory as i32
+                        } else if file_type.is_symlink() {
+                            FileType::Symlink as i32
+                        } else {
+                            FileType::Regular as i32
+                        };
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let entry_path = entry.path();
+
+                        // Get or create handle via HandleDatabase
+                        let handle = handle_db
+                            .get_or_create_handle(&entry_path, &share_canonical)
+                            .await
+                            .ok()?
+                            .as_bytes()
+                            .to_vec();
+
+                        Some(ReaddirEntry {
+                            name,
+                            file_type: proto_type,
+                            handle,
+                        })
+                    }
+                })
+                .collect()
+                .await;
+            // Filter out None values functionally
+            entries_with_none.into_iter().flatten().collect()
+        }
         Err(e) => return readdir_error(io_err_kind_to_code(e.kind())),
     };
 
-    // TODO: This collects the entire directory into memory before pagination.
-    // For large directories this is wasteful and can hit the 16 MB codec limit.
-    // Future work: stream entries directly, or maintain a server-side cursor
-    // keyed by the `offset` field so only the requested window is materialised.
-    let mut entries: Vec<ReaddirEntry> = read_dir
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let file_type = entry.file_type().ok()?;
-            let proto_type = if file_type.is_dir() {
-                FileType::Directory as i32
-            } else if file_type.is_symlink() {
-                FileType::Symlink as i32
-            } else {
-                FileType::Regular as i32
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // TODO(handles): Replace with a server-assigned opaque handle.
-            // Currently the handle is the path relative to the share root so
-            // the client can use it in subsequent calls.  Path-based handles
-            // are invalidated by renames and leak filesystem structure.
-            // See docs/02-protocol-design/handle-design.md.
-            let handle = entry
-                .path()
-                .strip_prefix(&share_canonical)
-                .map(|rel| rel.to_string_lossy().into_owned().into_bytes())
-                .unwrap_or_else(|_| name.as_bytes().to_vec());
-            Some(ReaddirEntry {
-                name,
-                file_type: proto_type,
-                handle,
-            })
-        })
-        .collect();
-
+    // Sort entries by name using functional approach
+    let mut entries = entries;
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Apply offset.
@@ -358,6 +372,36 @@ fn stat_error(code: ErrorCode) -> StatResult {
     }
 }
 
+fn async_stat<'a>(
+    share: &'a Path,
+    handle_bytes: Vec<u8>,
+    uuid: Uuid,
+    handle_db: &'a HandleDatabase,
+    db: Option<&'a Database>,
+) -> BoxFuture<'a, StatResult> {
+    Box::pin(async move {
+        let canonical = match resolve(share, &uuid, handle_db) {
+            Ok(p) => p,
+            Err(_) => {
+                return stat_error(ErrorCode::ErrorNotFound);
+            }
+        };
+
+        let meta = match std::fs::metadata(&canonical) {
+            Ok(m) => m,
+            Err(_) => {
+                return stat_error(ErrorCode::ErrorNotFound);
+            }
+        };
+
+        let root_hash = get_or_compute_merkle_root(&canonical, &meta, db).await;
+        StatResult {
+            handle: handle_bytes,
+            result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
+        }
+    })
+}
+
 fn lookup_error(code: ErrorCode) -> LookupResponse {
     LookupResponse {
         result: Some(lookup_response::Result::Error(error_detail(code))),
@@ -368,21 +412,6 @@ fn readdir_error(code: ErrorCode) -> ReaddirResponse {
     ReaddirResponse {
         result: Some(readdir_response::Result::Error(error_detail(code))),
     }
-}
-
-/// Map a handle that failed resolution to an appropriate `ErrorCode`.
-///
-/// We attempt to stat the raw path to distinguish "not found" from "permission
-/// denied".  If neither is determinable, we default to `ErrorNotFound`.
-fn io_error_code(handle: &[u8], share: &Path) -> ErrorCode {
-    // Try joining without canonicalisation to get a rough error kind.
-    if let Ok(s) = std::str::from_utf8(handle) {
-        let p = share.join(s);
-        if let Err(e) = std::fs::metadata(&p) {
-            return io_err_kind_to_code(e.kind());
-        }
-    }
-    ErrorCode::ErrorNotFound
 }
 
 /// Get or compute the Merkle root hash for a file.
@@ -468,6 +497,7 @@ pub async fn read_response<S: RiftStream>(
     payload: &[u8],
     share: &Path,
     db: Option<&Database>,
+    handle_db: &HandleDatabase,
 ) -> anyhow::Result<()> {
     let req = match ReadRequest::decode(payload) {
         Ok(r) => r,
@@ -487,7 +517,26 @@ pub async fn read_response<S: RiftStream>(
         }
     };
 
-    let canonical = match resolve(share, &req.handle) {
+    // Parse handle from bytes to UUID at the network boundary
+    let handle = match Uuid::from_slice(&req.handle) {
+        Ok(u) => u,
+        Err(_) => {
+            let response = ReadResponse {
+                result: Some(read_response::Result::Error(ErrorDetail {
+                    code: ErrorCode::ErrorNotFound as i32,
+                    message: "invalid handle".to_string(),
+                    metadata: None,
+                })),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    let canonical = match resolve(share, &handle, handle_db) {
         Ok(p) => p,
         Err(_) => {
             let response = ReadResponse {
@@ -624,6 +673,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
     payload: &[u8],
     share: &Path,
     db: Option<&Database>,
+    handle_db: &HandleDatabase,
 ) -> anyhow::Result<()> {
     let req = match MerkleDrill::decode(payload) {
         Ok(r) => r,
@@ -641,7 +691,24 @@ pub async fn merkle_drill_response<S: RiftStream>(
         }
     };
 
-    let canonical = match resolve(share, &req.handle) {
+    // Parse handle from bytes to UUID at the network boundary
+    let handle = match Uuid::from_slice(&req.handle) {
+        Ok(u) => u,
+        Err(_) => {
+            let response = MerkleLevelResponse {
+                level: req.level,
+                hashes: vec![],
+                subtree_bytes: vec![],
+            };
+            stream
+                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+
+    let canonical = match resolve(share, &handle, handle_db) {
         Ok(p) => p,
         Err(_) => {
             let response = MerkleLevelResponse {

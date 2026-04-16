@@ -1,6 +1,7 @@
 use scc::HashIndex;
 use std::hash::Hash;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::FsError;
 
@@ -8,8 +9,8 @@ pub struct BidirectionalMap<K>
 where
     K: Eq + Hash + Clone,
 {
-    ulid_to_key: Arc<HashIndex<[u8; 16], K>>,
-    key_to_ulid: Arc<HashIndex<K, [u8; 16]>>,
+    handle_to_key: Arc<HashIndex<Uuid, K>>,
+    key_to_handle: Arc<HashIndex<K, Uuid>>,
 }
 
 impl<K> BidirectionalMap<K>
@@ -18,71 +19,71 @@ where
 {
     pub fn new() -> Self {
         Self {
-            ulid_to_key: Arc::new(HashIndex::new()),
-            key_to_ulid: Arc::new(HashIndex::new()),
+            handle_to_key: Arc::new(HashIndex::new()),
+            key_to_handle: Arc::new(HashIndex::new()),
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            ulid_to_key: Arc::new(HashIndex::with_capacity(capacity)),
-            key_to_ulid: Arc::new(HashIndex::with_capacity(capacity)),
+            handle_to_key: Arc::new(HashIndex::with_capacity(capacity)),
+            key_to_handle: Arc::new(HashIndex::with_capacity(capacity)),
         }
     }
 
-    pub async fn insert_async(&self, ulid: [u8; 16], key: K) -> Result<(), FsError> {
+    pub async fn insert_async(&self, handle: Uuid, key: K) -> Result<(), FsError> {
         if self
-            .ulid_to_key
-            .insert_async(ulid, key.clone())
+            .handle_to_key
+            .insert_async(handle, key.clone())
             .await
             .is_err()
         {
             return Err(FsError::Exists);
         }
-        if self.key_to_ulid.insert_async(key, ulid).await.is_err() {
+        if self.key_to_handle.insert_async(key, handle).await.is_err() {
             return Err(FsError::Exists);
         }
         Ok(())
     }
 
-    pub fn insert(&self, ulid: [u8; 16], key: K) -> Result<(), FsError> {
-        if self.ulid_to_key.insert_sync(ulid, key.clone()).is_err() {
+    pub fn insert(&self, handle: Uuid, key: K) -> Result<(), FsError> {
+        if self.handle_to_key.insert_sync(handle, key.clone()).is_err() {
             return Err(FsError::Exists);
         }
-        if self.key_to_ulid.insert_sync(key, ulid).is_err() {
+        if self.key_to_handle.insert_sync(key, handle).is_err() {
             return Err(FsError::Exists);
         }
         Ok(())
     }
 
-    pub fn get_by_ulid(&self, ulid: &[u8; 16]) -> Option<K> {
-        self.ulid_to_key.peek_with(ulid, |_, v| v.clone())
+    pub fn get_by_handle(&self, handle: &Uuid) -> Option<K> {
+        self.handle_to_key.peek_with(handle, |_, v| v.clone())
     }
 
-    pub fn get_ulid(&self, key: &K) -> Option<[u8; 16]> {
-        self.key_to_ulid.peek_with(key, |_, v| *v)
+    pub fn get_handle(&self, key: &K) -> Option<Uuid> {
+        self.key_to_handle.peek_with(key, |_, v| *v)
     }
 
-    pub async fn remove_async(&self, ulid: &[u8; 16]) -> Option<K> {
-        let key = self.ulid_to_key.peek_with(ulid, |_, v| v.clone())?;
-        let _ = self.ulid_to_key.remove_async(ulid).await;
-        let _ = self.key_to_ulid.remove_async(&key).await;
+    pub async fn remove_async(&self, handle: &Uuid) -> Option<K> {
+        let key = self.handle_to_key.peek_with(handle, |_, v| v.clone())?;
+        let _ = self.handle_to_key.remove_async(handle).await;
+        let _ = self.key_to_handle.remove_async(&key).await;
         Some(key)
     }
 
-    pub fn remove(&self, ulid: &[u8; 16]) -> Option<K> {
-        let key = self.ulid_to_key.peek_with(ulid, |_, v| v.clone())?;
-        let _ = self.ulid_to_key.remove_sync(ulid);
-        let _ = self.key_to_ulid.remove_sync(&key);
+    pub fn remove(&self, handle: &Uuid) -> Option<K> {
+        let key = self.handle_to_key.peek_with(handle, |_, v| v.clone())?;
+        let _ = self.handle_to_key.remove_sync(handle);
+        let _ = self.key_to_handle.remove_sync(&key);
         Some(key)
     }
 
     pub fn len(&self) -> usize {
-        self.ulid_to_key.len()
+        self.handle_to_key.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ulid_to_key.is_empty()
+        self.handle_to_key.is_empty()
     }
 }
 
@@ -102,25 +103,25 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_retrieve() {
         let map = BidirectionalMap::<String>::new();
-        let ulid: [u8; 16] = [0u8; 16];
+        let handle = Uuid::now_v7();
 
-        map.insert_async(ulid, "test.txt".to_string())
+        map.insert_async(handle, "test.txt".to_string())
             .await
             .unwrap();
-        assert_eq!(map.get_by_ulid(&ulid), Some("test.txt".to_string()));
-        assert_eq!(map.get_ulid(&"test.txt".to_string()), Some(ulid));
+        assert_eq!(map.get_by_handle(&handle), Some("test.txt".to_string()));
+        assert_eq!(map.get_handle(&"test.txt".to_string()), Some(handle));
     }
 
     #[tokio::test]
     async fn test_duplicate_insert_fails() {
         let map = BidirectionalMap::<String>::new();
-        let ulid: [u8; 16] = [0u8; 16];
+        let handle = Uuid::now_v7();
 
-        map.insert_async(ulid, "test.txt".to_string())
+        map.insert_async(handle, "test.txt".to_string())
             .await
             .unwrap();
         assert!(matches!(
-            map.insert_async(ulid, "other".to_string()).await,
+            map.insert_async(handle, "other".to_string()).await,
             Err(FsError::Exists)
         ));
     }
@@ -128,13 +129,13 @@ mod tests {
     #[tokio::test]
     async fn test_remove() {
         let map = BidirectionalMap::<String>::new();
-        let ulid: [u8; 16] = [0u8; 16];
+        let handle = Uuid::now_v7();
 
-        map.insert_async(ulid, "test.txt".to_string())
+        map.insert_async(handle, "test.txt".to_string())
             .await
             .unwrap();
-        assert_eq!(map.remove(&ulid), Some("test.txt".to_string()));
-        assert!(map.get_by_ulid(&ulid).is_none());
+        assert_eq!(map.remove(&handle), Some("test.txt".to_string()));
+        assert!(map.get_by_handle(&handle).is_none());
     }
 
     #[tokio::test]
@@ -142,8 +143,8 @@ mod tests {
         let map = BidirectionalMap::<String>::new();
         assert!(map.is_empty());
 
-        let ulid: [u8; 16] = [0u8; 16];
-        map.insert_async(ulid, "test.txt".to_string())
+        let handle = Uuid::now_v7();
+        map.insert_async(handle, "test.txt".to_string())
             .await
             .unwrap();
         assert_eq!(map.len(), 1);
@@ -152,14 +153,18 @@ mod tests {
     #[tokio::test]
     async fn test_bidirectional_consistency() {
         let map = BidirectionalMap::<String>::new();
-        let ulid1: [u8; 16] = [0u8; 16];
-        let ulid2: [u8; 16] = [1u8; 16];
+        let handle1 = Uuid::now_v7();
+        let handle2 = Uuid::now_v7();
 
-        map.insert_async(ulid1, "a.txt".to_string()).await.unwrap();
-        map.insert_async(ulid2, "b.txt".to_string()).await.unwrap();
+        map.insert_async(handle1, "a.txt".to_string())
+            .await
+            .unwrap();
+        map.insert_async(handle2, "b.txt".to_string())
+            .await
+            .unwrap();
 
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get_ulid(&"a.txt".to_string()), Some(ulid1));
-        assert_eq!(map.get_ulid(&"b.txt".to_string()), Some(ulid2));
+        assert_eq!(map.get_handle(&"a.txt".to_string()), Some(handle1));
+        assert_eq!(map.get_handle(&"b.txt".to_string()), Some(handle2));
     }
 }

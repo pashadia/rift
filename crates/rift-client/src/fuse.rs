@@ -1,8 +1,3 @@
-//! FUSE filesystem implementation using fuse3's async path-based API.
-//!
-//! This module is feature-gated and only compiled when the `fuse`
-//! feature is enabled.
-
 use crate::view::ShareView;
 use fuse3::path::prelude::*;
 use fuse3::{Errno, FileType as Fuse3FileType, Result as Fuse3Result};
@@ -17,22 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::instrument;
 
-/// Attribute TTL: how long the kernel may cache attrs before rechecking.
 const TTL: Duration = Duration::from_secs(1);
-
-/// Convert a fuse3 absolute POSIX path (e.g. `/subdir/file.txt`) to the
-/// relative server handle used by the protocol (e.g. `b"subdir/file.txt"`).
-///
-/// The root `/` maps to `b"."`, and an empty path also maps to `b"."`.
-pub fn path_to_handle(path: &OsStr) -> Vec<u8> {
-    let s = path.to_string_lossy();
-    let stripped = s.strip_prefix('/').unwrap_or(&s);
-    if stripped.is_empty() {
-        b".".to_vec()
-    } else {
-        stripped.as_bytes().to_vec()
-    }
-}
 
 /// Convert a proto [`FileAttrs`] to a `fuse3::path::reply::FileAttr`.
 pub fn proto_to_fuse3_attr(attrs: &FileAttrs) -> FileAttr {
@@ -73,7 +53,6 @@ fn to_errno(e: FsError) -> Errno {
     Errno::from(e.to_errno())
 }
 
-/// FUSE filesystem backed by a `ShareView`.
 pub struct RiftFilesystem<V: ShareView> {
     view: Arc<V>,
 }
@@ -102,8 +81,8 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         _flags: u32,
     ) -> Fuse3Result<ReplyAttr> {
         let path = path.ok_or_else(|| Errno::from(libc::ENOSYS))?;
-        let handle = path_to_handle(path);
-        let attrs = self.view.getattr(&handle).await.map_err(to_errno)?;
+        let rust_path = std::path::Path::new(path);
+        let attrs = self.view.getattr(rust_path).await.map_err(to_errno)?;
         Ok(ReplyAttr {
             ttl: TTL,
             attr: proto_to_fuse3_attr(&attrs),
@@ -112,11 +91,11 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
 
     #[instrument(skip(self), fields(parent = ?parent, name = ?name), level = "debug")]
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Fuse3Result<ReplyEntry> {
-        let parent_handle = path_to_handle(parent);
+        let parent_path = std::path::Path::new(parent);
         let name_str = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
-        let (_child_handle, attrs) = self
+        let attrs = self
             .view
-            .lookup(&parent_handle, name_str)
+            .lookup(parent_path, name_str)
             .await
             .map_err(to_errno)?;
         Ok(ReplyEntry {
@@ -139,12 +118,12 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         offset: i64,
     ) -> Fuse3Result<ReplyDirectory<impl Stream<Item = Fuse3Result<DirectoryEntry>> + Send + 'a>>
     {
-        let handle = path_to_handle(path);
-        let entries = self.view.readdirplus(&handle).await.map_err(to_errno)?;
+        let rust_path = std::path::Path::new(path);
+        let entries = self.view.readdir(rust_path).await.map_err(to_errno)?;
 
         let mut all = Vec::with_capacity(entries.len());
-        for (i, (entry, attrs)) in entries.into_iter().enumerate() {
-            let kind = proto_to_fuse3_attr(&attrs).kind;
+        for (i, entry) in entries.into_iter().enumerate() {
+            let kind = proto_to_fuse3_attr(&entry.attrs).kind;
             all.push(Ok(DirectoryEntry {
                 kind,
                 name: OsString::from(entry.name),
@@ -169,12 +148,12 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     ) -> Fuse3Result<
         ReplyDirectoryPlus<impl Stream<Item = Fuse3Result<DirectoryEntryPlus>> + Send + 'a>,
     > {
-        let handle = path_to_handle(path);
-        let entries = self.view.readdirplus(&handle).await.map_err(to_errno)?;
+        let rust_path = std::path::Path::new(path);
+        let entries = self.view.readdir(rust_path).await.map_err(to_errno)?;
 
         let mut all = Vec::with_capacity(entries.len());
-        for (i, (entry, attrs)) in entries.into_iter().enumerate() {
-            let fuse_attrs = proto_to_fuse3_attr(&attrs);
+        for (i, entry) in entries.into_iter().enumerate() {
+            let fuse_attrs = proto_to_fuse3_attr(&entry.attrs);
             all.push(Ok(DirectoryEntryPlus {
                 kind: fuse_attrs.kind,
                 name: OsString::from(entry.name),
@@ -200,15 +179,13 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         offset: u64,
         size: u32,
     ) -> Fuse3Result<ReplyData> {
-        let handle = path
-            .map(path_to_handle)
+        let path = path
+            .map(std::path::Path::new)
             .ok_or_else(|| Errno::from(libc::ENOENT))?;
-
-        tracing::debug!(?handle, offset, size, "read request for file");
 
         let data = self
             .view
-            .read(&handle, offset, size as u64, None)
+            .read(path, offset, size as u64, None)
             .await
             .map_err(to_errno)?;
 
