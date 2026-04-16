@@ -73,6 +73,10 @@ pub enum FsError {
     /// An I/O or transport error with no more specific mapping → `EIO`.
     #[error("I/O error")]
     Io,
+
+    /// The handle already exists → `EEXIST`.
+    #[error("handle exists")]
+    Exists,
 }
 
 impl FsError {
@@ -83,6 +87,7 @@ impl FsError {
             Self::NotADirectory => libc::ENOTDIR,
             Self::PermissionDenied => libc::EACCES,
             Self::Io => libc::EIO,
+            Self::Exists => libc::EEXIST,
         }
     }
 }

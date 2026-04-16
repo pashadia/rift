@@ -21,3 +21,4 @@ scc.workspace = true
 [dev-dependencies]
 tempfile = "3"
 proptest.workspace = true
+tokio.workspace = true

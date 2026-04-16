@@ -5,6 +5,7 @@
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod handle_map;
 pub mod types;
 
 pub use error::{FsError, RiftError};
