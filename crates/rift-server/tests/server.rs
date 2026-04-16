@@ -426,6 +426,35 @@ async fn server_stat_root_returns_directory_attrs() {
 }
 
 #[tokio::test]
+async fn server_stat_response_includes_handle() {
+    use rift_protocol::messages::stat_result;
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = StatRequest {
+        handles: vec![root_handle],
+    };
+    stream
+        .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = StatResponse::decode(&payload[..]).unwrap();
+    assert_eq!(response.results.len(), 1);
+    let result = &response.results[0];
+    let Some(stat_result::Result::Attrs(_attrs)) = &result.result else {
+        panic!("expected attrs");
+    };
+    assert!(
+        !result.handle.is_empty(),
+        "stat response should include non-empty handle for caching"
+    );
+}
+
+#[tokio::test]
 async fn server_stat_file_returns_correct_size() {
     use rift_protocol::messages::stat_result;
     let (_dir, root) = helpers::make_share();

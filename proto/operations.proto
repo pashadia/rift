@@ -29,9 +29,10 @@ message StatResponse {
   repeated StatResult results = 1;
 }
 message StatResult {
+  bytes     handle = 1;
   oneof result {
-    FileAttrs   attrs = 1;
-    ErrorDetail error = 2;
+    FileAttrs   attrs = 2;
+    ErrorDetail error = 3;
   }
 }
 

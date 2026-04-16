@@ -182,6 +182,7 @@ pub async fn stat_response(payload: &[u8], share: &Path, db: Option<&Database>) 
 
         let root_hash = get_or_compute_merkle_root(&canonical, &meta, db).await;
         results.push(StatResult {
+            handle: handle,
             result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
         });
     }
@@ -352,6 +353,7 @@ fn error_detail(code: ErrorCode) -> ErrorDetail {
 
 fn stat_error(code: ErrorCode) -> StatResult {
     StatResult {
+        handle: Vec::new(),
         result: Some(stat_result::Result::Error(error_detail(code))),
     }
 }
