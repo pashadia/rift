@@ -31,7 +31,12 @@ where
     }
 
     pub async fn insert_async(&self, ulid: [u8; 16], key: K) -> Result<(), FsError> {
-        if self.ulid_to_key.insert_async(ulid, key.clone()).await.is_err() {
+        if self
+            .ulid_to_key
+            .insert_async(ulid, key.clone())
+            .await
+            .is_err()
+        {
             return Err(FsError::Exists);
         }
         if self.key_to_ulid.insert_async(key, ulid).await.is_err() {
@@ -73,7 +78,7 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.ulid_to_key.len() as usize
+        self.ulid_to_key.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,7 +104,9 @@ mod tests {
         let map = BidirectionalMap::<String>::new();
         let ulid: [u8; 16] = [0u8; 16];
 
-        map.insert_async(ulid, "test.txt".to_string()).await.unwrap();
+        map.insert_async(ulid, "test.txt".to_string())
+            .await
+            .unwrap();
         assert_eq!(map.get_by_ulid(&ulid), Some("test.txt".to_string()));
         assert_eq!(map.get_ulid(&"test.txt".to_string()), Some(ulid));
     }
@@ -109,7 +116,9 @@ mod tests {
         let map = BidirectionalMap::<String>::new();
         let ulid: [u8; 16] = [0u8; 16];
 
-        map.insert_async(ulid, "test.txt".to_string()).await.unwrap();
+        map.insert_async(ulid, "test.txt".to_string())
+            .await
+            .unwrap();
         assert!(matches!(
             map.insert_async(ulid, "other".to_string()).await,
             Err(FsError::Exists)
@@ -121,7 +130,9 @@ mod tests {
         let map = BidirectionalMap::<String>::new();
         let ulid: [u8; 16] = [0u8; 16];
 
-        map.insert_async(ulid, "test.txt".to_string()).await.unwrap();
+        map.insert_async(ulid, "test.txt".to_string())
+            .await
+            .unwrap();
         assert_eq!(map.remove(&ulid), Some("test.txt".to_string()));
         assert!(map.get_by_ulid(&ulid).is_none());
     }
@@ -132,7 +143,9 @@ mod tests {
         assert!(map.is_empty());
 
         let ulid: [u8; 16] = [0u8; 16];
-        map.insert_async(ulid, "test.txt".to_string()).await.unwrap();
+        map.insert_async(ulid, "test.txt".to_string())
+            .await
+            .unwrap();
         assert_eq!(map.len(), 1);
     }
 

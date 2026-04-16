@@ -190,7 +190,7 @@ impl RemoteShare for ReconnectingClient {
             async move {
                 let client = client.lock().await;
                 let resp = client.merkle_drill(&handle, level, &subtrees).await?;
-                Ok(        resp.into())
+                Ok(resp.into())
             }
         })
         .await
