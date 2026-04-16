@@ -9,9 +9,9 @@ a data share from a single server over a LAN.
 ## Must Have (PoC)
 
 ### Protocol Foundation
-- [ ] QUIC transport with TLS 1.3 (mutual auth via client certs)
+- [x] QUIC transport with TLS 1.3 (mutual auth via client certs)
 - [ ] Async multiplexed request/response model
-- [ ] Protobuf control messages + raw byte data framing
+- [x] Protobuf control messages + raw byte data framing
 - [ ] Capability-based version negotiation handshake
 - [ ] Heartbeat / lease mechanism (default 30s / 60s grace)
 
@@ -20,8 +20,8 @@ a data share from a single server over a LAN.
 - [ ] readdir with READDIR_PLUS support
 - [ ] mkdir, rmdir, rename, unlink
 - [ ] hard links
-- [ ] UTF-8 filename validation
-- [ ] 64-bit offsets, nanosecond timestamps
+- [x] UTF-8 filename validation
+- [x] 64-bit offsets, nanosecond timestamps
 
 ### Write Path
 - [ ] Single-writer lock per file
@@ -49,19 +49,19 @@ a data share from a single server over a LAN.
 - [ ] Root squash support
 
 ### Server
-- [ ] `riftd` daemon serving configured shares
+- [x] `riftd` daemon serving configured shares
 - [ ] TOML configuration file
 - [ ] `rift refresh` command for out-of-band change notification
 - [ ] Lazy out-of-band change detection (mtime+size on access)
 
 ### Client
-- [ ] FUSE-based mount (`rift mount`)
+- [x] FUSE-based mount (`rift mount`)
 - [ ] Persistent client state in `/var/lib/rift/`
 - [ ] Merkle tree cache persistence
 - [ ] QUIC connection migration support
 
 ### Operations
-- [ ] `rift mount <server>:<share> <mountpoint>`
+- [x] `rift mount <server>:<share> <mountpoint>`
 - [ ] `rift export` (list/manage shares)
 - [ ] `rift refresh [<share>] [<path>]`
 
