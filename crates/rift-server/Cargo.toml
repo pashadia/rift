@@ -24,6 +24,10 @@ rcgen.workspace = true
 rustls.workspace = true
 dirs.workspace = true
 tokio-rusqlite = "0.7"
+ulid.workspace = true
+scc.workspace = true
+xattr.workspace = true
+walkdir = "1"
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }

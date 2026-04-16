@@ -15,6 +15,8 @@ toml.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 libc = "0.2"
+ulid.workspace = true
+scc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
