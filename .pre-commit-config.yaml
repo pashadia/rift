@@ -21,3 +21,10 @@ repos:
         language: system
         stages: [pre-commit]
         pass_filenames: false
+
+      - id: cargo-nextest
+        name: cargo nextest
+        entry: cargo nextest run --hide-progress-bar --failure-output final
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
