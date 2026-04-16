@@ -1,29 +1,31 @@
 use rift_common::handle_map::BidirectionalMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use walkdir::WalkDir;
 use xattr::FileExt;
 
 const RIFT_HANDLE_XATTR: &str = "user.rift.handle";
 
 pub struct HandleDatabase {
-    map: BidirectionalMap<PathBuf>,
+    map: Arc<BidirectionalMap<PathBuf>>,
 }
 
 impl HandleDatabase {
     pub fn new() -> Self {
         Self {
-            map: BidirectionalMap::new(),
+            map: Arc::new(BidirectionalMap::new()),
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            map: BidirectionalMap::with_capacity(capacity),
+            map: Arc::new(BidirectionalMap::with_capacity(capacity)),
         }
     }
 
-    pub async fn get_or_create_handle(&self, path: &Path, share_root: &Path) -> Result<[u8; 16], std::io::Error> {
-        if let Some(ulid) = self.map.get_ulid(path) {
+    pub async fn get_or_create_handle(&self, path: &Path, share_root: &Path) -> std::io::Result<[u8; 16]> {
+        let path_owned = path.to_path_buf();
+        if let Some(ulid) = self.map.get_ulid(&path_owned) {
             return Ok(ulid);
         }
 
@@ -44,17 +46,18 @@ impl HandleDatabase {
             .strip_prefix(share_root)
             .unwrap_or(path)
             .to_path_buf();
-        self.map.insert(ulid, relative_path).await?;
+        self.map.insert(ulid, relative_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         Ok(ulid)
     }
 
     pub fn get_handle(&self, path: &Path) -> Option<[u8; 16]> {
-        self.map.get_ulid(path)
+        let path_owned = path.to_path_buf();
+        self.map.get_ulid(&path_owned)
     }
 
     pub fn get_path(&self, ulid: &[u8; 16]) -> Option<PathBuf> {
-        self.map.get_by_ulid(ulid).cloned()
+        self.map.get_by_ulid(ulid)
     }
 
     pub async fn populate_from_share(&self, share_root: &Path) -> std::io::Result<()> {
@@ -77,6 +80,12 @@ impl HandleDatabase {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    pub fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+        }
     }
 }
 
