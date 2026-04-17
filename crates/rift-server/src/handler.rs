@@ -64,12 +64,22 @@ pub async fn resolve(
 
     let joined = share_canonical.join(&relative_path);
 
-    let canonical = tokio::fs::canonicalize(&joined)
-        .await
-        .with_context(|| format!("path does not exist: {}", relative_path.display()))?;
+    let canonical = match tokio::fs::canonicalize(&joined).await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(_removed) = handle_db.remove(handle) {
+                tracing::info!(handle = %handle, "evicted stale handle");
+            }
+            return Err(e)
+                .with_context(|| format!("path does not exist: {}", relative_path.display()));
+        }
+    };
 
     if !canonical.starts_with(&share_canonical) {
         tracing::warn!(path = %canonical.display(), "path escapes share root");
+        if let Some(_removed) = handle_db.remove(handle) {
+            tracing::info!(handle = %handle, "evicted handle that escaped share root");
+        }
         anyhow::bail!("path escapes share root: {}", relative_path.display());
     }
 

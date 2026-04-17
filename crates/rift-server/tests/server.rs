@@ -407,6 +407,57 @@ async fn readdir_response_applies_limit() {
 // Must-fix: resolve security with UUID handles
 // ---------------------------------------------------------------------------
 
+/// When a file is deleted after a handle was created, resolve() must evict
+/// the stale handle from the HandleDatabase so it doesn't accumulate forever.
+#[tokio::test]
+async fn resolve_evicts_stale_handle_when_file_deleted() {
+    let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    let file_path = root.join("hello.txt");
+    let file_handle = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+    assert!(handle_db.get_path(&file_handle).is_some());
+
+    std::fs::remove_file(&file_path).unwrap();
+
+    let result = rift_server::handler::resolve(&root, &file_handle, &handle_db).await;
+    assert!(result.is_err(), "resolve must fail for deleted file");
+    assert!(
+        handle_db.get_path(&file_handle).is_none(),
+        "stale handle must be evicted from database after failed resolve"
+    );
+}
+
+/// After a handle is evicted, get_or_create_handle must be able to re-create
+/// a handle for the same relative path if the file is recreated.
+#[tokio::test]
+async fn get_or_create_handle_recreates_after_eviction() {
+    let (_dir, root) = helpers::make_share();
+    let handle_db = rift_server::handle::HandleDatabase::new();
+
+    let file_path = root.join("hello.txt");
+    let handle1 = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+
+    std::fs::remove_file(&file_path).unwrap();
+    let _ = rift_server::handler::resolve(&root, &handle1, &handle_db).await;
+    assert!(handle_db.get_path(&handle1).is_none());
+
+    std::fs::write(&file_path, "recreated").unwrap();
+    let handle2 = handle_db
+        .get_or_create_handle(&file_path, &root)
+        .await
+        .unwrap();
+
+    assert_ne!(handle1, handle2, "new handle must differ from evicted one");
+    assert!(handle_db.get_path(&handle2).is_some());
+}
+
 /// A symlink whose *target* lies outside the share must be rejected.
 /// The HandleDatabase should not create handles for symlinks that point outside,
 /// and resolve() must reject them via canonicalization.

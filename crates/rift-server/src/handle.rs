@@ -67,6 +67,10 @@ impl HandleDatabase {
         self.map.get_by_handle(handle)
     }
 
+    pub fn remove(&self, handle: &Uuid) -> Option<PathBuf> {
+        self.map.remove(handle)
+    }
+
     pub async fn populate_from_share(&self, share_root: &Path) -> std::io::Result<()> {
         for entry in WalkDir::new(share_root)
             .follow_links(false)
@@ -106,6 +110,26 @@ impl Default for HandleDatabase {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_remove_handle_from_database() {
+        let tmp = TempDir::new().unwrap();
+        let db = HandleDatabase::new();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let handle = db.get_or_create_handle(&path, tmp.path()).await.unwrap();
+        assert!(db.get_path(&handle).is_some());
+
+        let removed_path = db.remove(&handle);
+        let relative_path = path.strip_prefix(tmp.path()).unwrap().to_path_buf();
+        assert_eq!(removed_path, Some(relative_path));
+        assert!(
+            db.get_path(&handle).is_none(),
+            "handle must be gone after removal"
+        );
+        assert_eq!(db.len(), 0);
+    }
 
     #[tokio::test]
     async fn test_get_or_create_new_file() {
