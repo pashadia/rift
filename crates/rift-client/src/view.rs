@@ -141,24 +141,30 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        let handles: Vec<Uuid> = entries
-            .iter()
-            .filter_map(|e| Uuid::from_slice(&e.handle).ok())
+        // Pair each entry with its parsed UUID before calling stat_batch so
+        // the two lists stay aligned even if some handles fail to parse.
+        let pairs: Vec<(_, Uuid)> = entries
+            .into_iter()
+            .filter_map(|e| {
+                let uuid = Uuid::from_slice(&e.handle).ok()?;
+                Some((e, uuid))
+            })
             .collect();
+
+        let handles: Vec<Uuid> = pairs.iter().map(|(_, u)| *u).collect();
 
         let attrs_results = self
             .remote
-            .stat_batch(handles.clone())
+            .stat_batch(handles)
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
 
         let dir_relative = path_to_relative(path);
-        let combined: Vec<DirEntry> = entries
+        let combined: Vec<DirEntry> = pairs
             .into_iter()
-            .zip(attrs_results.into_iter())
-            .filter_map(|(entry, attrs_result)| {
+            .zip(attrs_results)
+            .filter_map(|((entry, child_uuid), attrs_result)| {
                 let attrs = attrs_result.ok()?;
-                let child_uuid = Uuid::from_slice(&entry.handle).ok()?;
                 let child_path = if dir_relative.as_os_str() == "." {
                     std::path::PathBuf::from(&entry.name)
                 } else {
