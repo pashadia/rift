@@ -71,15 +71,16 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCertVerifier 
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        // TODO(v1): verify the CertificateVerify handshake transcript signature
-        // using webpki/ring to prove the client holds the private key.
-        // For the PoC: identity is established via BLAKE3 fingerprint in
-        // server-side authorization; this assertion is safe on a trusted LAN.
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            &cert.as_ref().into(),
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -138,15 +139,16 @@ impl<P: FingerprintPolicy + std::fmt::Debug + 'static> rustls::client::danger::S
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        // TODO(v1): verify the CertificateVerify handshake transcript signature
-        // using webpki/ring to prove the server holds the private key.
-        // For the PoC: identity is established via BLAKE3 fingerprint in
-        // verify_server_cert; this assertion is safe on a trusted LAN.
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            &cert.as_ref().into(),
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
