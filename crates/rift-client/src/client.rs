@@ -58,11 +58,14 @@ impl TofuState {
     }
 
     fn save_if_dirty(&self) -> Result<()> {
-        let store = self.store.lock().unwrap();
-        if store.dirty {
-            crate::known_servers::save_known_servers(&self.path, &store)?;
-        }
-        Ok(())
+        let snapshot = {
+            let store = self.store.lock().unwrap();
+            if !store.dirty {
+                return Ok(());
+            }
+            TofuStore::new(store.known.clone())
+        };
+        crate::known_servers::save_known_servers(&self.path, &snapshot)
     }
 }
 
