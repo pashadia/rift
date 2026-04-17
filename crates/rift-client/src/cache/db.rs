@@ -585,4 +585,48 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], [0x02u8; 32]);
     }
+
+    #[tokio::test]
+    async fn cache_persists_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let handle = make_handle(42);
+        let root = Blake3Hash::new(b"persistent-root");
+        let chunk_hash = [0xABu8; 32];
+        let chunk_data = b"persistent chunk data";
+
+        {
+            let cache = FileCache::open(&cache_dir).await.unwrap();
+            cache.put_root_hash(&handle, &root).await.unwrap();
+            cache
+                .put_manifest(
+                    &handle,
+                    &Manifest {
+                        root: root.clone(),
+                        chunks: vec![ChunkInfo {
+                            index: 0,
+                            offset: 0,
+                            length: chunk_data.len() as u64,
+                            hash: chunk_hash,
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            cache.put_chunk(&chunk_hash, chunk_data).await.unwrap();
+        }
+
+        let cache2 = FileCache::open(&cache_dir).await.unwrap();
+
+        let loaded_root = cache2.get_root_hash(&handle).await.unwrap();
+        assert_eq!(loaded_root, Some(root));
+
+        let loaded_manifest = cache2.get_manifest(&handle).await.unwrap().unwrap();
+        assert_eq!(loaded_manifest.chunks.len(), 1);
+        assert_eq!(loaded_manifest.chunks[0].hash, chunk_hash);
+
+        let loaded_chunk = cache2.get_chunk(&chunk_hash).await.unwrap();
+        assert_eq!(loaded_chunk, Some(chunk_data.to_vec()));
+    }
 }

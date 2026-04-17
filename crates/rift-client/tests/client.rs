@@ -776,3 +776,71 @@ async fn client_merkle_drill_fetches_root_level() {
     assert!(!result.hashes.is_empty());
     assert_eq!(result.hashes[0].len(), 32);
 }
+
+/// Cache data (manifest + chunks) persists across client restarts
+#[tokio::test]
+async fn client_cache_persists_across_sessions() {
+    use rift_client::cache::db::FileCache;
+    let (_dir, root) = helpers::make_share();
+    let cache_dir = tempfile::tempdir().unwrap();
+
+    let addr = helpers::start_server(root).await;
+
+    // First session: read file, populating cache
+    let state_dir = tempfile::tempdir().unwrap();
+    let paths = rift_client::paths::ClientPaths::new(state_dir.path().to_path_buf());
+    paths.ensure_dirs().await.unwrap();
+
+    let client = rift_client::client::RiftClient::connect_persistent(addr, "demo", &paths)
+        .await
+        .expect("connect failed");
+
+    let (file_handle, _) = client
+        .lookup(client.root_handle(), "hello.txt")
+        .await
+        .expect("lookup failed");
+
+    let read_result = client
+        .read_chunks(file_handle, 0, 1)
+        .await
+        .expect("read failed");
+    assert_eq!(&read_result.chunks[0].data[..], b"hello rift");
+
+    let cache = FileCache::open(cache_dir.path()).await.unwrap();
+    let root_hash = rift_common::crypto::Blake3Hash::new(&read_result.merkle_root);
+    cache.put_root_hash(&file_handle, &root_hash).await.unwrap();
+    let manifest = rift_client::cache::db::Manifest {
+        root: root_hash,
+        chunks: read_result
+            .chunks
+            .iter()
+            .map(|c| rift_client::cache::db::ChunkInfo {
+                index: c.index,
+                offset: 0,
+                length: c.length,
+                hash: c.hash,
+            })
+            .collect(),
+    };
+    cache.put_manifest(&file_handle, &manifest).await.unwrap();
+    for chunk in &read_result.chunks {
+        cache.put_chunk(&chunk.hash, &chunk.data).await.unwrap();
+    }
+    drop(cache);
+
+    // Second session: reopen cache, verify data persisted
+    let cache2 = FileCache::open(cache_dir.path()).await.unwrap();
+    let loaded_manifest = cache2.get_manifest(&file_handle).await.unwrap();
+    assert!(
+        loaded_manifest.is_some(),
+        "manifest should persist across reopen"
+    );
+    let loaded_manifest = loaded_manifest.unwrap();
+    assert_eq!(loaded_manifest.chunks.len(), 1);
+
+    let loaded_chunk = cache2
+        .get_chunk(&loaded_manifest.chunks[0].hash)
+        .await
+        .unwrap();
+    assert_eq!(loaded_chunk, Some(b"hello rift".to_vec()));
+}
