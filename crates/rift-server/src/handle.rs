@@ -53,10 +53,7 @@ impl HandleDatabase {
             Ok(()) => Ok(handle),
             Err(_) => {
                 let existing = self.map.get_handle(&canonical).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "insert failed and re-lookup found nothing",
-                    )
+                    std::io::Error::other("insert failed and re-lookup found nothing")
                 })?;
                 Ok(existing)
             }
@@ -96,8 +93,10 @@ impl HandleDatabase {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+}
 
-    pub fn clone(&self) -> Self {
+impl Clone for HandleDatabase {
+    fn clone(&self) -> Self {
         Self {
             map: self.map.clone(),
         }

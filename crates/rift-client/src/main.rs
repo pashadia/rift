@@ -29,12 +29,8 @@ enum Command {
         /// Local directory to mount the filesystem at
         path: PathBuf,
 
-        /// Directory for local cache (optional)
-        #[arg(long)]
-        cache_dir: Option<PathBuf>,
-
-        /// TLS certificate file (PEM). If not specified, uses ~/.config/rift/client.cert
-        /// or generates an ephemeral certificate.
+        /// TLS certificate file (PEM). If not specified, uses state_dir/client.cert
+        /// or generates a persistent certificate.
         #[arg(long)]
         cert: Option<PathBuf>,
 
@@ -42,8 +38,13 @@ enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
 
-        /// Config directory for persistent certificates (default: ~/.config/rift)
+        /// State directory for persistent certificates, cache, and TOFU data
+        /// (default: $XDG_STATE_HOME/rift, typically ~/.local/state/rift)
         #[arg(long)]
+        state_dir: Option<PathBuf>,
+
+        /// Config directory for persistent certificates (legacy, prefer --state-dir)
+        #[arg(long, hide = true)]
         config_dir: Option<PathBuf>,
     },
 }
@@ -67,14 +68,14 @@ async fn main() -> Result<()> {
             server,
             share,
             path,
-            cache_dir,
             cert,
             key,
+            state_dir,
             config_dir,
         } => {
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (server, share, path, cache_dir, cert, key, config_dir);
+                let _ = (server, share, path, cert, key, state_dir, config_dir);
                 anyhow::bail!("mount is only supported on Linux");
             }
 
@@ -83,16 +84,17 @@ async fn main() -> Result<()> {
                 use fuse3::path::Session;
                 use fuse3::MountOptions;
                 use rift_client::fuse::RiftFilesystem;
+                use rift_client::paths::ClientPaths;
 
                 let addr: SocketAddr = server
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid server address: {server}"))?;
 
-                let config_dir = config_dir.unwrap_or_else(|| {
-                    dirs::config_dir()
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join("rift")
-                });
+                let paths = match (&state_dir, &config_dir) {
+                    (Some(dir), _) => ClientPaths::new(dir.clone()),
+                    (None, Some(dir)) => ClientPaths::new(dir.clone()),
+                    (None, None) => ClientPaths::default_paths(),
+                };
 
                 let cert_key_paths = match (&cert, &key) {
                     (Some(c), Some(k)) => Some((c.as_path(), k.as_path())),
@@ -100,12 +102,13 @@ async fn main() -> Result<()> {
                     _ => anyhow::bail!("both --cert and --key must be specified together"),
                 };
 
+                paths.ensure_dirs().await?;
+
                 tracing::info!(
                     server = %addr,
                     share  = %share,
                     mountpoint = %path.display(),
-                    cache_dir = ?cache_dir,
-                    config_dir = %config_dir.display(),
+                    state_dir = %paths.base_dir().display(),
                     cert_file = ?cert_key_paths.map(|(c, _)| c.display()),
                     "connecting to server"
                 );
@@ -114,7 +117,8 @@ async fn main() -> Result<()> {
                     addr,
                     &share,
                     cert_key_paths,
-                    &config_dir,
+                    &paths.cert_path(),
+                    &paths.key_path(),
                 )
                 .await?;
                 let root_handle = client.root_handle();
@@ -122,19 +126,12 @@ async fn main() -> Result<()> {
 
                 let reconnecting = rift_client::reconnect::ReconnectingClient::new(client);
 
-                let view = if let Some(dir) = cache_dir {
-                    rift_client::view::RiftShareView::with_cache(
-                        std::sync::Arc::new(reconnecting),
-                        root_handle,
-                        dir,
-                    )
-                    .await?
-                } else {
-                    rift_client::view::RiftShareView::new(
-                        std::sync::Arc::new(reconnecting),
-                        root_handle,
-                    )
-                };
+                let view = rift_client::view::RiftShareView::with_cache(
+                    std::sync::Arc::new(reconnecting),
+                    root_handle,
+                    paths.cache_dir(),
+                )
+                .await?;
 
                 println!("Connected — server fingerprint: {fingerprint}");
 

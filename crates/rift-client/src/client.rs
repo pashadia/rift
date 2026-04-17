@@ -182,41 +182,43 @@ impl RiftClient<QuicConnection> {
     /// Connect with explicit certificate paths.
     ///
     /// - If `cert_key_paths` is `Some((cert_path, key_path))`, loads the cert/key from those files.
-    /// - If `None`, generates an ephemeral cert, optionally saving to `config_dir`.
-    /// - If `config_dir` is provided and no cert exists, saves generated cert there.
+    /// Connect to a Rift server with explicit or persistent certificates.
+    ///
+    /// - If `cert_key_paths` is provided, loads cert/key from those files.
+    /// - Otherwise, loads from `cert_path`/`key_path`, generating and saving
+    ///   a persistent self-signed certificate if they don't exist yet.
     #[instrument(fields(addr = %addr, share_name = %share_name), err)]
     pub async fn connect_with_cert(
         addr: SocketAddr,
         share_name: &str,
         cert_key_paths: Option<(&std::path::Path, &std::path::Path)>,
-        config_dir: &std::path::Path,
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
     ) -> Result<Self> {
         let (cert, key) = match cert_key_paths {
-            Some((cert_path, key_path)) => {
-                let cert = std::fs::read(cert_path)
-                    .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
-                let key = std::fs::read(key_path)
-                    .map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
+            Some((cp, kp)) => {
+                let cert =
+                    std::fs::read(cp).map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
+                let key =
+                    std::fs::read(kp).map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
                 (cert, key)
             }
             None => {
-                let cert_path = config_dir.join("client.cert");
-                let key_path = config_dir.join("client.key");
                 if cert_path.exists() && key_path.exists() {
-                    let cert = std::fs::read(&cert_path)
+                    let cert = std::fs::read(cert_path)
                         .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
-                    let key = std::fs::read(&key_path)
+                    let key = std::fs::read(key_path)
                         .map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
                     (cert, key)
                 } else {
                     let (cert, key) = generate_client_cert()?;
-                    if !config_dir.exists() {
-                        std::fs::create_dir_all(config_dir)
-                            .map_err(|e| anyhow::anyhow!("failed to create config dir: {e}"))?;
+                    if let Some(parent) = cert_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| anyhow::anyhow!("failed to create state dir: {e}"))?;
                     }
-                    std::fs::write(&cert_path, &cert)
+                    std::fs::write(cert_path, &cert)
                         .map_err(|e| anyhow::anyhow!("failed to write cert: {e}"))?;
-                    std::fs::write(&key_path, &key)
+                    std::fs::write(key_path, &key)
                         .map_err(|e| anyhow::anyhow!("failed to write key: {e}"))?;
                     (cert, key)
                 }

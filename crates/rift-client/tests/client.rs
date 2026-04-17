@@ -37,7 +37,8 @@ async fn client_persistent_cert_loaded_if_exists() {
         addr,
         "demo",
         Some((&cert_path, &key_path)),
-        config_dir.path(),
+        &cert_path,
+        &key_path,
     )
     .await
     .expect("connect failed");
@@ -57,10 +58,15 @@ async fn client_generates_cert_if_not_exists() {
 
     // Connect without persistent cert - should generate one
     let addr = helpers::start_server(root).await;
-    let client =
-        rift_client::client::RiftClient::connect_with_cert(addr, "demo", None, config_dir.path())
-            .await
-            .expect("connect failed");
+    let client = rift_client::client::RiftClient::connect_with_cert(
+        addr,
+        "demo",
+        None,
+        &config_dir.path().join("client.cert"),
+        &config_dir.path().join("client.key"),
+    )
+    .await
+    .expect("connect failed");
 
     // Verify cert was saved
     let cert_path = config_dir.path().join("client.cert");
@@ -100,7 +106,8 @@ async fn client_reconnect_after_connection_lost() {
         addr,
         "demo",
         Some((&cert_path, &key_path)),
-        config_dir.path(),
+        &cert_path,
+        &key_path,
     )
     .await
     .expect("connect failed");
@@ -151,7 +158,8 @@ async fn client_reconnect_uses_same_cert() {
         addr,
         "demo",
         Some((&cert_path, &key_path)),
-        config_dir.path(),
+        &cert_path,
+        &key_path,
     )
     .await
     .expect("connect failed");
@@ -201,7 +209,8 @@ async fn client_cli_cert_overrides_persistent() {
         addr,
         "demo",
         Some((&cli_cert_path, &cli_key_path)),
-        config_dir.path(),
+        &cli_cert_path,
+        &cli_key_path,
     )
     .await
     .expect("connect failed");
@@ -242,7 +251,8 @@ async fn client_auto_reconnect_on_operation_failure() {
         addr,
         "demo",
         Some((&cert_path, &key_path)),
-        config_dir.path(),
+        &cert_path,
+        &key_path,
     )
     .await
     .expect("connect failed");
@@ -305,7 +315,8 @@ async fn client_reconnect_preserves_cached_data() {
         addr,
         "demo",
         Some((&cert_path, &key_path)),
-        config_dir.path(),
+        &cert_path,
+        &key_path,
     )
     .await
     .expect("connect failed");

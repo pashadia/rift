@@ -5,6 +5,7 @@
 pub mod cache;
 pub mod client;
 pub mod handle;
+pub mod paths;
 pub mod reconnect;
 pub mod remote;
 pub mod view;
