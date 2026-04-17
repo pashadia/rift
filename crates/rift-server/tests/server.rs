@@ -1167,6 +1167,101 @@ mod merkle_integration {
     }
 
     #[tokio::test]
+    async fn stat_detects_out_of_band_file_modification() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"original content").unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
+
+        let req = StatRequest {
+            handles: vec![file_handle.as_bytes().to_vec()],
+        };
+
+        let response1 =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
+        let stat_result::Result::Attrs(attrs1) = response1.results[0].result.as_ref().unwrap()
+        else {
+            panic!("expected attrs");
+        };
+        let original_root_hash = attrs1.root_hash.clone();
+        assert_eq!(original_root_hash.len(), 32);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&file_path, b"modified out of band").unwrap();
+
+        let req2 = StatRequest {
+            handles: vec![file_handle.as_bytes().to_vec()],
+        };
+        let response2 = rift_server::handler::stat_response(
+            &req2.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+        )
+        .await;
+        let stat_result::Result::Attrs(attrs2) = response2.results[0].result.as_ref().unwrap()
+        else {
+            panic!("expected attrs");
+        };
+        let modified_root_hash = attrs2.root_hash.clone();
+        assert_eq!(modified_root_hash.len(), 32);
+
+        assert_ne!(
+            original_root_hash, modified_root_hash,
+            "root hash must change after out-of-band file modification"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_detects_out_of_band_file_size_change() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"short").unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        let handle_db = rift_server::handle::HandleDatabase::new();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
+
+        let req = StatRequest {
+            handles: vec![file_handle.as_bytes().to_vec()],
+        };
+
+        let response1 =
+            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db)
+                .await;
+        let stat_result::Result::Attrs(attrs1) = response1.results[0].result.as_ref().unwrap()
+        else {
+            panic!("expected attrs");
+        };
+        assert_eq!(attrs1.size, 5);
+
+        std::fs::write(&file_path, b"this is much longer content now").unwrap();
+
+        let req2 = StatRequest {
+            handles: vec![file_handle.as_bytes().to_vec()],
+        };
+        let response2 = rift_server::handler::stat_response(
+            &req2.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+        )
+        .await;
+        let stat_result::Result::Attrs(attrs2) = response2.results[0].result.as_ref().unwrap()
+        else {
+            panic!("expected attrs");
+        };
+        assert_eq!(attrs2.size, 31);
+        assert_ne!(attrs1.root_hash, attrs2.root_hash);
+    }
+
+    #[tokio::test]
     async fn stat_response_cache_miss_computes_root_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
