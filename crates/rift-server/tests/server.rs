@@ -1778,6 +1778,106 @@ async fn server_read_returns_error_for_invalid_handle() {
     }
 }
 
+#[tokio::test]
+async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    // Generate content large enough to produce 20+ chunks
+    // Default FastCDC: min=32KB, avg=128KB, max=512KB
+    // Use many unique patterns to force chunk boundaries
+    let mut content = Vec::with_capacity(5 * 1024 * 1024);
+    for i in 0..100_000 {
+        // Write varied bytes to trigger CDC boundaries
+        let chunk = format!("chunk_{:05x}_data_", i);
+        content.extend_from_slice(chunk.as_bytes());
+    }
+    std::fs::write(root.join("many_chunks.bin"), &content).unwrap();
+
+    // Verify we have at least 10 chunks with default chunker
+    use rift_common::crypto::Chunker;
+    let chunker = Chunker::default();
+    let all_chunks = chunker.chunk(&content);
+    let chunk_count = all_chunks.len();
+    
+    // Calculate how many we can read starting at offset 3
+    let start = 3;
+    let available = chunk_count.saturating_sub(start);
+    if available < 2 {
+        panic!("need at least 5 chunks for this test, got {}", chunk_count);
+    }
+    let read_count = available.min(5);
+
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup file
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "many_chunks.bin".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Read several chunks starting at offset 3 (exercises the offset calculation path)
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: start as u32,
+        chunk_count: read_count as u32,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    // Get response
+    let frame = stream.recv_frame().await.unwrap().unwrap();
+    let (_, payload) = frame;
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    let success = match response.result {
+        Some(rift_protocol::messages::read_response::Result::Ok(s)) => s,
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => panic!("read error: {:?}", e),
+        None => panic!("empty response"),
+    };
+    assert_eq!(success.chunk_count as usize, read_count);
+
+    // Verify each chunk returns correct data
+    let chunk_boundaries: Vec<(usize, usize)> = all_chunks.iter().skip(start).take(read_count).cloned().collect();
+
+    for (i, (expected_offset, expected_len)) in chunk_boundaries.iter().enumerate() {
+        // Read BlockHeader
+        let header_frame = stream.recv_frame().await.unwrap().unwrap();
+        let (_, header_payload) = header_frame;
+        let block_header = rift_protocol::messages::BlockHeader::decode(&header_payload[..]).unwrap();
+        let chunk_info = block_header.chunk.as_ref().expect("chunk missing");
+        assert_eq!(chunk_info.index as usize, start + i, "chunk index mismatch");
+        assert_eq!(chunk_info.length as usize, *expected_len, "chunk length mismatch");
+
+        // Read BlockData
+        let data_frame = stream.recv_frame().await.unwrap().unwrap();
+        let (_, data_payload) = data_frame;
+        let actual_data: &[u8] = &data_payload;
+
+        // Verify data matches expected content at that offset
+        let expected_data = &content[*expected_offset..*expected_offset + expected_len];
+        assert_eq!(actual_data, expected_data, "chunk {} data mismatch", i);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Certificate management tests
 // ---------------------------------------------------------------------------

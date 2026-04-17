@@ -577,7 +577,7 @@ pub async fn read_response<S: RiftStream>(
         .map(|(i, (offset, length))| {
             let chunk_data = &content[*offset..*offset + length];
             let hash = Blake3Hash::new(chunk_data);
-            (start + i, *length, hash)
+            (start + i, *offset, *length, hash)
         })
         .collect();
 
@@ -590,13 +590,9 @@ pub async fn read_response<S: RiftStream>(
         .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
         .await?;
 
-    for (idx, length, hash) in chunks_to_read {
+    for (idx, offset, length, hash) in chunks_to_read {
         let index = idx as u32;
-        let start_offset = chunk_boundaries[0..idx]
-            .iter()
-            .map(|(_, l)| *l)
-            .sum::<usize>();
-        let chunk_data = &content[start_offset..start_offset + length];
+        let chunk_data = &content[offset..offset + length];
 
         let block_header = BlockHeader {
             chunk: Some(ChunkInfo {
