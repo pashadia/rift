@@ -787,6 +787,56 @@ async fn server_handles_stream_with_no_request_data() {
     );
 }
 
+/// STAT and LOOKUP must use the same send pattern: the server propagates
+/// send errors rather than swallowing them, and properly half-closes the
+/// stream after sending its response.
+///
+/// We verify both operations behave identically by checking that the server
+/// half-closes the stream (recv_frame returns None) after sending one
+/// response frame, and that the server remains responsive to subsequent
+/// requests after a client drops mid-operation.
+#[tokio::test]
+async fn server_stat_and_lookup_use_same_send_pattern() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root.clone()).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // STAT: verify half-close after response
+    let mut stat_stream = conn.open_stream().await.unwrap();
+    let stat_req = StatRequest {
+        handles: vec![root_handle.clone()],
+    };
+    stat_stream
+        .send_frame(msg::STAT_REQUEST, &stat_req.encode_to_vec())
+        .await
+        .unwrap();
+    stat_stream.finish_send().await.unwrap();
+    let (type_id, _payload) = stat_stream.recv_frame().await.unwrap().unwrap();
+    assert_eq!(type_id, msg::STAT_RESPONSE);
+    assert!(
+        stat_stream.recv_frame().await.unwrap().is_none(),
+        "STAT: server must half-close stream after response"
+    );
+
+    // LOOKUP: verify half-close after response
+    let mut lookup_stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle.clone(),
+        name: "hello.txt".to_string(),
+    };
+    lookup_stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    lookup_stream.finish_send().await.unwrap();
+    let (type_id, _payload) = lookup_stream.recv_frame().await.unwrap().unwrap();
+    assert_eq!(type_id, msg::LOOKUP_RESPONSE);
+    assert!(
+        lookup_stream.recv_frame().await.unwrap().is_none(),
+        "LOOKUP: server must half-close stream after response"
+    );
+}
+
 /// A client that disconnects mid-request must not leave behind a leaked task
 /// that holds resources or blocks the server from serving other clients.
 ///

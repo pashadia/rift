@@ -185,23 +185,10 @@ async fn handle_stream(
         msg::STAT_REQUEST => {
             let db_ref = db.as_ref().as_ref();
             let response = handler::stat_response(&payload, &share, db_ref, &handle_db).await;
-            // Send response with timeout to avoid hanging if client disconnected
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                stream.send_frame(msg::STAT_RESPONSE, &response.encode_to_vec()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    let _ = stream.finish_send().await;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("send_frame error: {}", e);
-                }
-                Err(_) => {
-                    tracing::warn!("send_frame timeout - client may have disconnected");
-                }
-            }
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
         }
 
         msg::LOOKUP_REQUEST => {
