@@ -244,9 +244,6 @@ impl RiftClient<QuicConnection> {
         })
     }
 
-    /// Connect with explicit certificate paths.
-    ///
-    /// - If `cert_key_paths` is `Some((cert_path, key_path))`, loads the cert/key from those files.
     /// Connect to a Rift server with explicit or persistent certificates.
     ///
     /// - If `cert_key_paths` is provided, loads cert/key from those files.
