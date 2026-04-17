@@ -156,7 +156,7 @@ async fn handle_stream(
             }
 
             // Get or create handle for the share root
-            let root_handle = match handle_db.get_or_create_handle(&share, &share).await {
+            let root_handle = match handle_db.get_or_create_handle(&share).await {
                 Ok(uuid) => uuid.as_bytes().to_vec(),
                 Err(_) => {
                     anyhow::bail!("failed to get root handle for share");

@@ -50,7 +50,7 @@ pub async fn resolve(
     handle: &Uuid,
     handle_db: &HandleDatabase,
 ) -> anyhow::Result<PathBuf> {
-    let relative_path = match handle_db.get_path(handle) {
+    let stored_path = match handle_db.get_path(handle) {
         Some(path) => path,
         None => {
             tracing::warn!("handle not found in database");
@@ -62,16 +62,14 @@ pub async fn resolve(
         .await
         .context("share root does not exist or is inaccessible")?;
 
-    let joined = share_canonical.join(&relative_path);
-
-    let canonical = match tokio::fs::canonicalize(&joined).await {
+    let canonical = match tokio::fs::canonicalize(&stored_path).await {
         Ok(p) => p,
         Err(e) => {
             if let Some(_removed) = handle_db.remove(handle) {
                 tracing::info!(handle = %handle, "evicted stale handle");
             }
             return Err(e)
-                .with_context(|| format!("path does not exist: {}", relative_path.display()));
+                .with_context(|| format!("path does not exist: {}", stored_path.display()));
         }
     };
 
@@ -80,7 +78,7 @@ pub async fn resolve(
         if let Some(_removed) = handle_db.remove(handle) {
             tracing::info!(handle = %handle, "evicted handle that escaped share root");
         }
-        anyhow::bail!("path escapes share root: {}", relative_path.display());
+        anyhow::bail!("path escapes share root: {}", stored_path.display());
     }
 
     Ok(canonical)
@@ -235,11 +233,7 @@ pub async fn lookup_response(
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    // Get or create a handle for the child via HandleDatabase
-    let handle = match handle_db
-        .get_or_create_handle(&child_canonical, &share_canonical)
-        .await
-    {
+    let handle = match handle_db.get_or_create_handle(&child_canonical).await {
         Ok(uuid) => uuid.as_bytes().to_vec(),
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
@@ -281,11 +275,6 @@ pub async fn readdir_response(
         Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
     };
 
-    let share_canonical = match tokio::fs::canonicalize(share).await {
-        Ok(p) => p,
-        Err(_) => return readdir_error(ErrorCode::ErrorUnsupported),
-    };
-
     // Collect entries using async functional approach with tokio
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
@@ -295,35 +284,31 @@ pub async fn readdir_response(
             // First collect all entries with their info using then, then filter out None values
             let stream = ReadDirStream::new(read_dir);
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
-                .then(|entry_result| {
-                    let share_canonical = share_canonical.clone();
-                    async move {
-                        let entry = entry_result.ok()?;
-                        let file_type = entry.file_type().await.ok()?;
-                        let proto_type = if file_type.is_dir() {
-                            FileType::Directory as i32
-                        } else if file_type.is_symlink() {
-                            FileType::Symlink as i32
-                        } else {
-                            FileType::Regular as i32
-                        };
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        let entry_path = entry.path();
+                .then(|entry_result| async move {
+                    let entry = entry_result.ok()?;
+                    let file_type = entry.file_type().await.ok()?;
+                    let proto_type = if file_type.is_dir() {
+                        FileType::Directory as i32
+                    } else if file_type.is_symlink() {
+                        FileType::Symlink as i32
+                    } else {
+                        FileType::Regular as i32
+                    };
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let entry_path = entry.path();
 
-                        // Get or create handle via HandleDatabase
-                        let handle = handle_db
-                            .get_or_create_handle(&entry_path, &share_canonical)
-                            .await
-                            .ok()?
-                            .as_bytes()
-                            .to_vec();
+                    let handle = handle_db
+                        .get_or_create_handle(&entry_path)
+                        .await
+                        .ok()?
+                        .as_bytes()
+                        .to_vec();
 
-                        Some(ReaddirEntry {
-                            name,
-                            file_type: proto_type,
-                            handle,
-                        })
-                    }
+                    Some(ReaddirEntry {
+                        name,
+                        file_type: proto_type,
+                        handle,
+                    })
                 })
                 .collect()
                 .await;

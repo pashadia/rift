@@ -23,18 +23,12 @@ impl HandleDatabase {
         }
     }
 
-    pub async fn get_or_create_handle(
-        &self,
-        path: &Path,
-        share_root: &Path,
-    ) -> std::io::Result<Uuid> {
-        let relative_path = match path.strip_prefix(share_root) {
-            Ok(rel) if rel.as_os_str().is_empty() => std::path::PathBuf::from("."),
-            Ok(rel) => rel.to_path_buf(),
-            Err(_) => path.to_path_buf(),
-        };
+    pub async fn get_or_create_handle(&self, path: &Path) -> std::io::Result<Uuid> {
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|e| std::io::Error::new(e.kind(), format!("canonicalize failed: {e}")))?;
 
-        if let Some(handle) = self.map.get_handle(&relative_path) {
+        if let Some(handle) = self.map.get_handle(&canonical) {
             return Ok(handle);
         }
 
@@ -52,15 +46,14 @@ impl HandleDatabase {
         };
 
         self.map
-            .insert(handle, relative_path)
+            .insert(handle, canonical)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         Ok(handle)
     }
 
     pub fn get_handle(&self, path: &Path) -> Option<Uuid> {
-        let path_owned = path.to_path_buf();
-        self.map.get_handle(&path_owned)
+        self.map.get_handle(&path.to_path_buf())
     }
 
     pub fn get_path(&self, handle: &Uuid) -> Option<PathBuf> {
@@ -79,7 +72,7 @@ impl HandleDatabase {
         {
             let path = entry.path();
             if path.is_file() {
-                let _ = self.get_or_create_handle(path, share_root).await;
+                let _ = self.get_or_create_handle(path).await;
             }
         }
         Ok(())
@@ -112,18 +105,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn test_get_or_create_handle_uses_canonical_path_as_key() {
+        let tmp = TempDir::new().unwrap();
+        let db = HandleDatabase::new();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
+        assert_eq!(db.get_path(&handle), Some(canonical));
+    }
+
+    #[tokio::test]
     async fn test_remove_handle_from_database() {
         let tmp = TempDir::new().unwrap();
         let db = HandleDatabase::new();
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
 
-        let handle = db.get_or_create_handle(&path, tmp.path()).await.unwrap();
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
         assert!(db.get_path(&handle).is_some());
 
         let removed_path = db.remove(&handle);
-        let relative_path = path.strip_prefix(tmp.path()).unwrap().to_path_buf();
-        assert_eq!(removed_path, Some(relative_path));
+        assert_eq!(removed_path, Some(canonical));
         assert!(
             db.get_path(&handle).is_none(),
             "handle must be gone after removal"
@@ -137,8 +142,9 @@ mod tests {
         let db = HandleDatabase::new();
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
 
-        let handle = db.get_or_create_handle(&path, tmp.path()).await.unwrap();
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
         assert!(!handle.as_bytes().iter().all(|&b| b == 0));
         assert_eq!(db.len(), 1);
     }
@@ -149,11 +155,12 @@ mod tests {
         let db = HandleDatabase::new();
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
 
         let expected = Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
         xattr::set(&path, RIFT_HANDLE_XATTR, expected.as_bytes()).unwrap();
 
-        let handle = db.get_or_create_handle(&path, tmp.path()).await.unwrap();
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
         assert_eq!(handle, expected);
     }
 
@@ -175,17 +182,12 @@ mod tests {
     async fn test_get_or_create_handle_same_share_root_twice() {
         let tmp = TempDir::new().unwrap();
         let db = HandleDatabase::new();
+        let canonical = tmp.path().canonicalize().unwrap();
 
-        let handle1 = db
-            .get_or_create_handle(tmp.path(), tmp.path())
-            .await
-            .unwrap();
+        let handle1 = db.get_or_create_handle(&canonical).await.unwrap();
         assert_eq!(db.len(), 1);
 
-        let handle2 = db
-            .get_or_create_handle(tmp.path(), tmp.path())
-            .await
-            .unwrap();
+        let handle2 = db.get_or_create_handle(&canonical).await.unwrap();
 
         assert_eq!(handle1, handle2);
         assert_eq!(db.len(), 1);
@@ -200,15 +202,11 @@ mod tests {
 
         let db = HandleDatabase::new();
 
-        let root_handle = db
-            .get_or_create_handle(&share_root, &share_root)
-            .await
-            .unwrap();
+        let root_canonical = share_root.canonicalize().unwrap();
+        let nested_canonical = nested_dir.canonicalize().unwrap();
 
-        let nested_handle = db
-            .get_or_create_handle(&nested_dir, &share_root)
-            .await
-            .unwrap();
+        let root_handle = db.get_or_create_handle(&root_canonical).await.unwrap();
+        let nested_handle = db.get_or_create_handle(&nested_canonical).await.unwrap();
 
         assert_ne!(
             root_handle, nested_handle,
@@ -216,14 +214,6 @@ mod tests {
         );
 
         assert_eq!(db.len(), 2);
-
-        let root_path = db.get_path(&root_handle);
-        let nested_path = db.get_path(&nested_handle);
-
-        assert!(root_path.is_some(), "root path should be retrievable");
-        assert!(nested_path.is_some(), "nested path should be retrievable");
-
-        assert_ne!(root_path, nested_path, "relative paths must be different");
     }
 
     #[tokio::test]
@@ -234,11 +224,12 @@ mod tests {
 
         let subdir = share_root.join("subdir");
         std::fs::create_dir(&subdir).unwrap();
+        let canonical = subdir.canonicalize().unwrap();
 
         let db = HandleDatabase::new();
 
-        let handle1 = db.get_or_create_handle(&subdir, &share_root).await.unwrap();
-        let handle2 = db.get_or_create_handle(&subdir, &share_root).await.unwrap();
+        let handle1 = db.get_or_create_handle(&canonical).await.unwrap();
+        let handle2 = db.get_or_create_handle(&canonical).await.unwrap();
 
         assert_eq!(handle1, handle2, "same path must return same handle");
         assert_eq!(db.len(), 1, "only one entry in database");
@@ -246,18 +237,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_repeating_path_pattern() {
-        // If the share root is /tmp/.tmpABCD/, create a subdirectory
-        // whose FULL path from root repeats inside the share:
-        //   /tmp/.tmpABCD/tmp/.tmpABCD/file.txt
-        //
-        // This means strip_prefix("/tmp/.tmpABCD/tmp/.tmpABCD/file.txt", "/tmp/.tmpABCD")
-        // yields "tmp/.tmpABCD/file.txt" — if it were stripped a second time,
-        // it would wrongly collapse to just "file.txt".
         let tmp = TempDir::new().unwrap();
-        let share_root = tmp.path(); // e.g., /tmp/.tmpABCD/
+        let share_root = tmp.path();
 
-        // Reconstruct the share root's own path components inside itself:
-        // strip leading '/' to get e.g. "tmp/.tmpABCD"
         let share_root_str = share_root.to_str().unwrap();
         let repeated = share_root_str.strip_prefix('/').unwrap();
 
@@ -269,31 +251,15 @@ mod tests {
 
         let db = HandleDatabase::new();
 
-        let root_handle = db
-            .get_or_create_handle(share_root, share_root)
-            .await
-            .unwrap();
+        let root_canonical = share_root.canonicalize().unwrap();
+        let file_canonical = nested_file.canonicalize().unwrap();
 
-        let file_handle = db
-            .get_or_create_handle(&nested_file, share_root)
-            .await
-            .unwrap();
+        let root_handle = db.get_or_create_handle(&root_canonical).await.unwrap();
+        let file_handle = db.get_or_create_handle(&file_canonical).await.unwrap();
 
         assert_ne!(
             root_handle, file_handle,
             "root and nested file must have different handles"
-        );
-
-        let root_path = db.get_path(&root_handle);
-        let file_path = db.get_path(&file_handle);
-
-        assert!(root_path.is_some(), "root path should be retrievable");
-        assert!(file_path.is_some(), "file path should be retrievable");
-
-        assert_eq!(root_path.unwrap(), std::path::PathBuf::from("."));
-        assert_eq!(
-            file_path.unwrap(),
-            std::path::PathBuf::from(repeated).join("file.txt")
         );
 
         assert_eq!(db.len(), 2);

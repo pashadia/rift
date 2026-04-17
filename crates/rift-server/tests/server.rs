@@ -105,7 +105,7 @@ async fn resolve_returns_share_root_for_uuid_handle() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     // Get handle for root directory
-    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+    let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
     // Act: Resolve using UUID handle
     let resolved = rift_server::handler::resolve(&root, &root_handle, &handle_db)
@@ -123,10 +123,7 @@ async fn resolve_resolves_relative_path() {
 
     // Get handle for the file
     let file_path = root.join("hello.txt");
-    let file_handle = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
     let resolved = rift_server::handler::resolve(&root, &file_handle, &handle_db)
         .await
@@ -192,10 +189,7 @@ async fn stat_response_valid_handle_returns_attrs() {
 
     // Get handle for the file
     let file_path = root.join("hello.txt");
-    let file_handle = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
     let req = StatRequest {
         handles: vec![file_handle.as_bytes().to_vec()],
@@ -237,10 +231,7 @@ async fn stat_response_multiple_handles() {
 
     // Get handles
     let file_path = root.join("hello.txt");
-    let file_handle = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
     let invalid_handle = Uuid::from_bytes([0xFF; 16]);
 
     let req = StatRequest {
@@ -269,7 +260,7 @@ async fn lookup_response_finds_existing_entry() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     // Get handle for root directory
-    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+    let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
     let req = LookupRequest {
         parent_handle: root_handle.as_bytes().to_vec(),
@@ -295,7 +286,7 @@ async fn lookup_response_missing_entry_returns_error() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     // Get handle for root directory
-    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+    let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
     let req = LookupRequest {
         parent_handle: root_handle.as_bytes().to_vec(),
@@ -316,7 +307,7 @@ async fn readdir_response_lists_directory_entries() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     // Populate HandleDatabase with root
-    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+    let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
     let req = ReaddirRequest {
         directory_handle: root_handle.as_bytes().to_vec(),
@@ -343,7 +334,7 @@ async fn readdir_response_applies_offset() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     // Populate HandleDatabase with root
-    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+    let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
     // Fetch all entries first to know the total count.
     let req_all = ReaddirRequest {
@@ -384,7 +375,7 @@ async fn readdir_response_applies_limit() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     // Populate HandleDatabase with root
-    let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+    let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
     let req = ReaddirRequest {
         directory_handle: root_handle.as_bytes().to_vec(),
@@ -415,10 +406,7 @@ async fn resolve_evicts_stale_handle_when_file_deleted() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     let file_path = root.join("hello.txt");
-    let file_handle = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
     assert!(handle_db.get_path(&file_handle).is_some());
 
     std::fs::remove_file(&file_path).unwrap();
@@ -439,20 +427,14 @@ async fn get_or_create_handle_recreates_after_eviction() {
     let handle_db = rift_server::handle::HandleDatabase::new();
 
     let file_path = root.join("hello.txt");
-    let handle1 = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let handle1 = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
     std::fs::remove_file(&file_path).unwrap();
     let _ = rift_server::handler::resolve(&root, &handle1, &handle_db).await;
     assert!(handle_db.get_path(&handle1).is_none());
 
     std::fs::write(&file_path, "recreated").unwrap();
-    let handle2 = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let handle2 = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
     assert_ne!(handle1, handle2, "new handle must differ from evicted one");
     assert!(handle_db.get_path(&handle2).is_some());
@@ -471,10 +453,7 @@ async fn resolve_rejects_symlink_target_outside_share() {
     // Create a file, get its handle
     let file_path = root.join("testfile.txt");
     std::fs::write(&file_path, "test").unwrap();
-    let file_handle = handle_db
-        .get_or_create_handle(&file_path, &root)
-        .await
-        .unwrap();
+    let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
     // Replace file with symlink pointing outside
     std::fs::remove_file(&file_path).unwrap();
@@ -500,10 +479,7 @@ async fn resolve_rejects_intermediate_symlink_escape() {
     let inner_dir = root.join("inner");
     std::fs::create_dir(&inner_dir).unwrap();
 
-    let inner_handle = handle_db
-        .get_or_create_handle(&inner_dir, &root)
-        .await
-        .unwrap();
+    let inner_handle = handle_db.get_or_create_handle(&inner_dir).await.unwrap();
 
     std::fs::remove_dir(&inner_dir).unwrap();
     std::os::unix::fs::symlink(outside.path(), &inner_dir).unwrap();
@@ -1038,10 +1014,7 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let file_handle = handle_db
-            .get_or_create_handle(&file_path, &root)
-            .await
-            .unwrap();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
         let root_hash = Blake3Hash::new(b"test-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
@@ -1077,10 +1050,7 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello").unwrap();
 
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let file_handle = handle_db
-            .get_or_create_handle(&file_path, &root)
-            .await
-            .unwrap();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
@@ -1106,10 +1076,7 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let subdir_handle = handle_db
-            .get_or_create_handle(&subdir, &root)
-            .await
-            .unwrap();
+        let subdir_handle = handle_db.get_or_create_handle(&subdir).await.unwrap();
 
         let req = StatRequest {
             handles: vec![subdir_handle.as_bytes().to_vec()],
@@ -1135,10 +1102,7 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let file_handle = handle_db
-            .get_or_create_handle(&file_path, &root)
-            .await
-            .unwrap();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
@@ -1174,10 +1138,7 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let file_handle = handle_db
-            .get_or_create_handle(&file_path, &root)
-            .await
-            .unwrap();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
         let stale_root = Blake3Hash::new(b"stale-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
@@ -1214,10 +1175,7 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let file_handle = handle_db
-            .get_or_create_handle(&file_path, &root)
-            .await
-            .unwrap();
+        let file_handle = handle_db.get_or_create_handle(&file_path).await.unwrap();
 
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
@@ -1242,7 +1200,7 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+        let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
         let root_hash = Blake3Hash::new(b"hello-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
@@ -1285,7 +1243,7 @@ mod merkle_integration {
         std::fs::write(&file_path, b"hello rift").unwrap();
 
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
+        let root_handle = handle_db.get_or_create_handle(&root).await.unwrap();
 
         let req = LookupRequest {
             parent_handle: root_handle.as_bytes().to_vec(),
@@ -1313,8 +1271,8 @@ mod merkle_integration {
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
-        let file1_handle = handle_db.get_or_create_handle(&file1, &root).await.unwrap();
-        let file2_handle = handle_db.get_or_create_handle(&file2, &root).await.unwrap();
+        let file1_handle = handle_db.get_or_create_handle(&file1).await.unwrap();
+        let file2_handle = handle_db.get_or_create_handle(&file2).await.unwrap();
 
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
