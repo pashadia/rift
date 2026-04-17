@@ -108,7 +108,9 @@ async fn resolve_returns_share_root_for_uuid_handle() {
     let root_handle = handle_db.get_or_create_handle(&root, &root).await.unwrap();
 
     // Act: Resolve using UUID handle
-    let resolved = rift_server::handler::resolve(&root, &root_handle, &handle_db).unwrap();
+    let resolved = rift_server::handler::resolve(&root, &root_handle, &handle_db)
+        .await
+        .unwrap();
 
     // Assert: Should resolve to canonical root path
     assert_eq!(resolved, root.canonicalize().unwrap());
@@ -126,7 +128,9 @@ async fn resolve_resolves_relative_path() {
         .await
         .unwrap();
 
-    let resolved = rift_server::handler::resolve(&root, &file_handle, &handle_db).unwrap();
+    let resolved = rift_server::handler::resolve(&root, &file_handle, &handle_db)
+        .await
+        .unwrap();
     assert_eq!(resolved, file_path.canonicalize().unwrap());
 }
 
@@ -135,9 +139,8 @@ async fn resolve_rejects_invalid_uuid_not_in_database() {
     let (_dir, root) = helpers::make_share();
     let handle_db = rift_server::handle::HandleDatabase::new();
 
-    // Use a random UUID that's not in the database
     let invalid_handle = Uuid::from_bytes([0xFF; 16]);
-    let result = rift_server::handler::resolve(&root, &invalid_handle, &handle_db);
+    let result = rift_server::handler::resolve(&root, &invalid_handle, &handle_db).await;
     assert!(result.is_err(), "UUID not in database must be rejected");
 }
 
@@ -427,7 +430,7 @@ async fn resolve_rejects_symlink_target_outside_share() {
     std::os::unix::fs::symlink(outside.path(), &file_path).unwrap();
 
     // Try to resolve using the old handle - should fail due to canonicalization check
-    let result = rift_server::handler::resolve(&root, &file_handle, &handle_db);
+    let result = rift_server::handler::resolve(&root, &file_handle, &handle_db).await;
     assert!(
         result.is_err(),
         "symlink whose target is outside the share must be rejected"
@@ -443,26 +446,21 @@ async fn resolve_rejects_intermediate_symlink_escape() {
     let outside = TempDir::new().unwrap();
     let handle_db = rift_server::handle::HandleDatabase::new();
 
-    // Create a real directory inside the share
     let inner_dir = root.join("inner");
     std::fs::create_dir(&inner_dir).unwrap();
 
-    // Get handle for the inner directory
     let inner_handle = handle_db
         .get_or_create_handle(&inner_dir, &root)
         .await
         .unwrap();
 
-    // Replace inner directory with symlink pointing outside
     std::fs::remove_dir(&inner_dir).unwrap();
     std::os::unix::fs::symlink(outside.path(), &inner_dir).unwrap();
 
-    // Create a file "inside" the symlinked directory (will actually be outside)
     let outside_file = outside.path().join("secret.txt");
     std::fs::write(&outside_file, "secret").unwrap();
 
-    // Try to resolve the inner dir handle - should fail due to canonicalization
-    let result = rift_server::handler::resolve(&root, &inner_handle, &handle_db);
+    let result = rift_server::handler::resolve(&root, &inner_handle, &handle_db).await;
     assert!(
         result.is_err(),
         "path through an escaping symlink must be rejected"

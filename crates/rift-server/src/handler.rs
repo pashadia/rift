@@ -1,12 +1,9 @@
 //! Pure request-handler functions for the Rift server.
 //!
-//! Each `*_response` function is intentionally stateless and synchronous:
-//! it decodes a proto request from raw bytes, performs the filesystem work,
-//! and returns a proto response.  The async dispatch layer in `server.rs`
-//! handles I/O and calls these functions.
-//!
-//! Keeping the logic pure (no stream access, no async) makes unit tests fast
-//! and free of runtime setup.
+//! Each `*_response` function decodes a proto request from raw bytes,
+//! performs the filesystem work using async I/O, and returns a proto
+//! response.  The async dispatch layer in `server.rs` handles the
+//! transport and calls these functions.
 
 use std::path::{Path, PathBuf};
 
@@ -41,15 +38,18 @@ use crate::metadata::db::Database;
 /// # Security invariants
 ///
 /// - Looks up path from HandleDatabase using UUID.
-/// - Canonicalises the result with `std::fs::canonicalize`, which resolves
+/// - Canonicalises the result with `tokio::fs::canonicalize`, which resolves
 ///   all `..` components and follows symlinks.
 /// - Checks that the canonical result is prefixed by the canonical share root,
 ///   which rejects:
 ///   - Symlinks pointing outside the share.
 ///   - Paths that escape via intermediate symlinks.
 #[instrument(skip(share, handle_db), fields(share = %share.display(), handle = ?handle), level = "debug")]
-pub fn resolve(share: &Path, handle: &Uuid, handle_db: &HandleDatabase) -> anyhow::Result<PathBuf> {
-    // Look up the path from the HandleDatabase
+pub async fn resolve(
+    share: &Path,
+    handle: &Uuid,
+    handle_db: &HandleDatabase,
+) -> anyhow::Result<PathBuf> {
     let relative_path = match handle_db.get_path(handle) {
         Some(path) => path,
         None => {
@@ -58,22 +58,16 @@ pub fn resolve(share: &Path, handle: &Uuid, handle_db: &HandleDatabase) -> anyho
         }
     };
 
-    // Canonicalize the share root once so the prefix check is reliable even
-    // when `share` itself contains symlinks or `.` components.
-    let share_canonical = share
-        .canonicalize()
+    let share_canonical = tokio::fs::canonicalize(share)
+        .await
         .context("share root does not exist or is inaccessible")?;
 
-    // Join the relative path with the share root
     let joined = share_canonical.join(&relative_path);
 
-    // `canonicalize` resolves `..` and symlinks.  It fails if the path does
-    // not exist, which is the correct error for lookups of missing entries.
-    let canonical = joined
-        .canonicalize()
+    let canonical = tokio::fs::canonicalize(&joined)
+        .await
         .with_context(|| format!("path does not exist: {}", relative_path.display()))?;
 
-    // Security check: ensure canonical path is still within share
     if !canonical.starts_with(&share_canonical) {
         tracing::warn!(path = %canonical.display(), "path escapes share root");
         anyhow::bail!("path escapes share root: {}", relative_path.display());
@@ -204,19 +198,19 @@ pub async fn lookup_response(
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
 
-    let parent_canonical = match resolve(share, &parent_uuid, handle_db) {
+    let parent_canonical = match resolve(share, &parent_uuid, handle_db).await {
         Ok(p) => p,
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
 
-    let share_canonical = match share.canonicalize() {
+    let share_canonical = match tokio::fs::canonicalize(share).await {
         Ok(p) => p,
         Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
     };
 
     let child_path = parent_canonical.join(&req.name);
 
-    let child_canonical = match child_path.canonicalize() {
+    let child_canonical = match tokio::fs::canonicalize(&child_path).await {
         Ok(p) => p,
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
@@ -226,7 +220,7 @@ pub async fn lookup_response(
         return lookup_error(ErrorCode::ErrorNotFound);
     }
 
-    let meta = match std::fs::metadata(&child_canonical) {
+    let meta = match tokio::fs::metadata(&child_canonical).await {
         Ok(m) => m,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
@@ -272,12 +266,12 @@ pub async fn readdir_response(
         Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
     };
 
-    let dir_canonical = match resolve(share, &dir_uuid, handle_db) {
+    let dir_canonical = match resolve(share, &dir_uuid, handle_db).await {
         Ok(p) => p,
         Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
     };
 
-    let share_canonical = match share.canonicalize() {
+    let share_canonical = match tokio::fs::canonicalize(share).await {
         Ok(p) => p,
         Err(_) => return readdir_error(ErrorCode::ErrorUnsupported),
     };
@@ -380,14 +374,14 @@ fn async_stat<'a>(
     db: Option<&'a Database>,
 ) -> BoxFuture<'a, StatResult> {
     Box::pin(async move {
-        let canonical = match resolve(share, &uuid, handle_db) {
+        let canonical = match resolve(share, &uuid, handle_db).await {
             Ok(p) => p,
             Err(_) => {
                 return stat_error(ErrorCode::ErrorNotFound);
             }
         };
 
-        let meta = match std::fs::metadata(&canonical) {
+        let meta = match tokio::fs::metadata(&canonical).await {
             Ok(m) => m,
             Err(_) => {
                 return stat_error(ErrorCode::ErrorNotFound);
@@ -430,7 +424,6 @@ async fn get_or_compute_merkle_root(
         return root_hash_for_type(true);
     }
 
-    // Try cache first
     if let Some(database) = db {
         match database.get_merkle(path).await {
             Ok(Some(entry)) => return entry.root,
@@ -439,8 +432,7 @@ async fn get_or_compute_merkle_root(
         }
     }
 
-    // Compute from content
-    let content = match std::fs::read(path) {
+    let content = match tokio::fs::read(path).await {
         Ok(c) => c,
         Err(_) => return root_hash_for_type(true),
     };
@@ -459,9 +451,8 @@ async fn get_or_compute_merkle_root(
     let merkle = MerkleTree::default();
     let root = merkle.build(&leaf_hashes);
 
-    // Cache the result
     if let Some(database) = db {
-        if let Ok(file_meta) = std::fs::metadata(path) {
+        if let Ok(file_meta) = tokio::fs::metadata(path).await {
             let mtime_ns = match file_meta.modified() {
                 Ok(t) => t
                     .duration_since(std::time::UNIX_EPOCH)
@@ -536,7 +527,7 @@ pub async fn read_response<S: RiftStream>(
         }
     };
 
-    let canonical = match resolve(share, &handle, handle_db) {
+    let canonical = match resolve(share, &handle, handle_db).await {
         Ok(p) => p,
         Err(_) => {
             let response = ReadResponse {
@@ -554,7 +545,7 @@ pub async fn read_response<S: RiftStream>(
         }
     };
 
-    let content = match std::fs::read(&canonical) {
+    let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
         Err(e) => {
             let response = ReadResponse {
@@ -637,7 +628,7 @@ pub async fn read_response<S: RiftStream>(
     let root = merkle.build(&leaf_hashes);
 
     if let Some(database) = db {
-        if let Ok(file_meta) = std::fs::metadata(&canonical) {
+        if let Ok(file_meta) = tokio::fs::metadata(&canonical).await {
             let mtime_ns = match file_meta.modified() {
                 Ok(t) => t
                     .duration_since(std::time::UNIX_EPOCH)
@@ -708,7 +699,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
         }
     };
 
-    let canonical = match resolve(share, &handle, handle_db) {
+    let canonical = match resolve(share, &handle, handle_db).await {
         Ok(p) => p,
         Err(_) => {
             let response = MerkleLevelResponse {
@@ -724,7 +715,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
         }
     };
 
-    let content = match std::fs::read(&canonical) {
+    let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
         Err(_) => {
             let response = MerkleLevelResponse {
@@ -767,9 +758,8 @@ pub async fn merkle_drill_response<S: RiftStream>(
             .await?;
         stream.finish_send().await?;
 
-        // Cache if we have a database
         if let Some(database) = db {
-            if let Ok(meta) = std::fs::metadata(&canonical) {
+            if let Ok(meta) = tokio::fs::metadata(&canonical).await {
                 let mtime_ns = meta
                     .modified()
                     .map(|t| {
