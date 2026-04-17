@@ -41,6 +41,7 @@ where
             return Err(FsError::Exists);
         }
         if self.key_to_handle.insert_async(key, handle).await.is_err() {
+            let _ = self.handle_to_key.remove_async(&handle).await;
             return Err(FsError::Exists);
         }
         Ok(())
@@ -51,6 +52,7 @@ where
             return Err(FsError::Exists);
         }
         if self.key_to_handle.insert_sync(key, handle).is_err() {
+            let _ = self.handle_to_key.remove_sync(&handle);
             return Err(FsError::Exists);
         }
         Ok(())
@@ -166,5 +168,30 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.get_handle(&"a.txt".to_string()), Some(handle1));
         assert_eq!(map.get_handle(&"b.txt".to_string()), Some(handle2));
+    }
+
+    #[tokio::test]
+    async fn test_insert_rollback_on_partial_failure() {
+        let map = BidirectionalMap::<String>::new();
+        let handle1 = Uuid::now_v7();
+        let handle2 = Uuid::now_v7();
+
+        map.insert_async(handle1, "test.txt".to_string())
+            .await
+            .unwrap();
+
+        // handle2 + "test.txt": key_to_handle rejects duplicate key,
+        // handle_to_key must be rolled back so no orphaned entry remains.
+        assert!(matches!(
+            map.insert_async(handle2, "test.txt".to_string()).await,
+            Err(FsError::Exists)
+        ));
+
+        assert!(
+            map.get_by_handle(&handle2).is_none(),
+            "handle2 must not have an orphaned entry in handle_to_key"
+        );
+        assert_eq!(map.len(), 1, "map must contain exactly one entry");
+        assert_eq!(map.get_handle(&"test.txt".to_string()), Some(handle1));
     }
 }

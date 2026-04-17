@@ -45,11 +45,22 @@ impl HandleDatabase {
             }
         };
 
-        self.map
-            .insert(handle, canonical)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        Ok(handle)
+        // "insert then re-lookup on Exists" pattern: under concurrent access,
+        // two tasks may both pass the get_handle() check above and attempt
+        // insert. The first wins; the second gets FsError::Exists and must
+        // return the winning handle to satisfy the "get_or_create" contract.
+        match self.map.insert(handle, canonical.clone()) {
+            Ok(()) => Ok(handle),
+            Err(_) => {
+                let existing = self.map.get_handle(&canonical).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "insert failed and re-lookup found nothing",
+                    )
+                })?;
+                Ok(existing)
+            }
+        }
     }
 
     pub fn get_handle(&self, path: &Path) -> Option<Uuid> {
@@ -263,5 +274,49 @@ mod tests {
         );
 
         assert_eq!(db.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_get_or_create_same_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("concurrent.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let db = Arc::new(HandleDatabase::new());
+
+        // Run 100 concurrent get_or_create_handle calls for the same path.
+        // Without the insert-recovery fix, some will return Err.
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            let db_clone = Arc::clone(&db);
+            let c = canonical.clone();
+            handles.push(tokio::spawn(async move {
+                db_clone.get_or_create_handle(&c).await
+            }));
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let successful: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
+        assert_eq!(
+            successful.len(),
+            100,
+            "all 100 concurrent calls must succeed, got {} errors",
+            100 - successful.len()
+        );
+
+        let first = results[0].as_ref().unwrap();
+        for result in &results[1..] {
+            assert_eq!(
+                result.as_ref().unwrap(),
+                first,
+                "all handles must be identical"
+            );
+        }
+        assert_eq!(db.len(), 1, "only one entry in database");
     }
 }
