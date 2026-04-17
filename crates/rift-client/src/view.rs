@@ -223,8 +223,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                                     return Ok(data[start..end].to_vec());
                                 }
                             }
-                            Err(_) => {
-                                tracing::debug!("cache miss for {} chunks", 0);
+                            Err(ref missing) => {
+                                tracing::debug!("cache miss for {} chunks", missing.len());
                             }
                         }
                     } else {
