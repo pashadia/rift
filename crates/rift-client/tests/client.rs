@@ -12,6 +12,62 @@ use rift_common::FsError;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// TOFU (Trust-On-First-Use) policy
+// ---------------------------------------------------------------------------
+
+/// Client uses TofuPolicy on connect and persists known-servers.toml
+#[tokio::test]
+async fn client_tofu_pins_fingerprint_on_first_connect() {
+    let (_dir, root) = helpers::make_share();
+    let state_dir = tempfile::tempdir().unwrap();
+    let paths = rift_client::paths::ClientPaths::new(state_dir.path().to_path_buf());
+
+    paths.ensure_dirs().await.unwrap();
+
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect_persistent(addr, "demo", &paths)
+        .await
+        .expect("connect failed");
+
+    assert_ne!(client.root_handle(), uuid::Uuid::nil());
+
+    let known_servers_path = paths.known_servers_path();
+    assert!(
+        known_servers_path.exists(),
+        "known-servers.toml should be created"
+    );
+
+    let store = rift_client::known_servers::load_known_servers(&known_servers_path).unwrap();
+    let key = format!("{addr}");
+    assert!(
+        store.known.contains_key(&key),
+        "TOFU store should contain server entry for {key}"
+    );
+}
+
+/// Client reloads TOFU state on reconnect and accepts known server
+#[tokio::test]
+async fn client_tofu_accepts_known_server_on_reconnect() {
+    let (_dir, root) = helpers::make_share();
+    let state_dir = tempfile::tempdir().unwrap();
+    let paths = rift_client::paths::ClientPaths::new(state_dir.path().to_path_buf());
+
+    paths.ensure_dirs().await.unwrap();
+
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect_persistent(addr, "demo", &paths)
+        .await
+        .expect("connect failed");
+
+    let original_root = client.root_handle();
+    client.close_connection();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let new_client = client.reconnect().await.expect("reconnect failed");
+    assert_eq!(new_client.root_handle(), original_root);
+}
+
+// ---------------------------------------------------------------------------
 // Persistent certificate management
 // ---------------------------------------------------------------------------
 

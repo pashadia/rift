@@ -25,6 +25,7 @@
 //! `Handle` captured at `connect()` time from the calling tokio context.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -41,8 +42,29 @@ use rift_protocol::messages::{
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
-    RiftStream,
+    RiftStream, TofuPolicy, TofuStore,
 };
+
+use crate::paths::ClientPaths;
+
+struct TofuState {
+    store: Arc<std::sync::Mutex<TofuStore>>,
+    path: PathBuf,
+}
+
+impl TofuState {
+    fn new(store: Arc<std::sync::Mutex<TofuStore>>, path: PathBuf) -> Self {
+        Self { store, path }
+    }
+
+    fn save_if_dirty(&self) -> Result<()> {
+        let store = self.store.lock().unwrap();
+        if store.dirty {
+            crate::known_servers::save_known_servers(&self.path, &store)?;
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RiftClient
@@ -64,6 +86,7 @@ pub struct RiftClient<C: RiftConnection> {
     share_name: String,
     cert: Vec<u8>,
     key: Vec<u8>,
+    tofu_state: Option<TofuState>,
 }
 
 impl<C: RiftConnection + Clone> Clone for RiftClient<C> {
@@ -75,6 +98,16 @@ impl<C: RiftConnection + Clone> Clone for RiftClient<C> {
             share_name: self.share_name.clone(),
             cert: self.cert.clone(),
             key: self.key.clone(),
+            tofu_state: self.tofu_state.clone(),
+        }
+    }
+}
+
+impl Clone for TofuState {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            path: self.path.clone(),
         }
     }
 }
@@ -84,6 +117,7 @@ impl RiftClient<QuicConnection> {
     ///
     /// Returns a new client with a fresh connection. The new client preserves
     /// the server address, share name, and TLS certificate from the original.
+    /// If TOFU state is present, uses `TofuPolicy`; otherwise `AcceptAnyPolicy`.
     pub async fn reconnect(&self) -> Result<Self> {
         tracing::info!(
             addr = %self.addr,
@@ -92,9 +126,33 @@ impl RiftClient<QuicConnection> {
         );
 
         let ep = client_endpoint(&self.cert, &self.key)?;
-        let conn = connect(&ep, self.addr, "rift-server", Arc::new(AcceptAnyPolicy))
-            .await
-            .map_err(|e| anyhow::anyhow!("QUIC reconnect to {}: {e}", self.addr))?;
+
+        let conn = if let Some(ref tofu) = self.tofu_state {
+            let known = {
+                let store = tofu.store.lock().unwrap();
+                store.known.clone()
+            };
+            let policy = TofuPolicy::new(format!("{}", self.addr), known);
+            let store_arc = policy.store();
+            let conn = connect(&ep, self.addr, "rift-server", Arc::new(policy))
+                .await
+                .map_err(|e| anyhow::anyhow!("QUIC reconnect to {}: {e}", self.addr))?;
+
+            {
+                let mut original = tofu.store.lock().unwrap();
+                let updated = store_arc.lock().unwrap();
+                original.known = updated.known.clone();
+                if updated.dirty {
+                    original.dirty = true;
+                }
+            }
+
+            conn
+        } else {
+            connect(&ep, self.addr, "rift-server", Arc::new(AcceptAnyPolicy))
+                .await
+                .map_err(|e| anyhow::anyhow!("QUIC reconnect to {}: {e}", self.addr))?
+        };
 
         let mut ctrl = conn
             .open_stream()
@@ -108,14 +166,22 @@ impl RiftClient<QuicConnection> {
         tracing::info!("reconnected successfully");
         let root_handle = Uuid::from_slice(&welcome.root_handle)
             .map_err(|e| anyhow::anyhow!("invalid root handle from server: {e}"))?;
-        Ok(Self {
+
+        let new_client = Self {
             conn,
             root_handle,
             addr: self.addr,
             share_name: self.share_name.clone(),
             cert: self.cert.clone(),
             key: self.key.clone(),
-        })
+            tofu_state: self.tofu_state.clone(),
+        };
+
+        if let Some(ref tofu) = new_client.tofu_state {
+            tofu.save_if_dirty()?;
+        }
+
+        Ok(new_client)
     }
 }
 
@@ -138,16 +204,11 @@ pub struct ChunkData {
 pub type DefaultRiftClient = RiftClient<QuicConnection>;
 
 impl RiftClient<QuicConnection> {
-    /// Connect to a Rift server, authenticate, and mount `share_name`.
+    /// Connect to a Rift server with an ephemeral certificate and no TOFU.
     ///
-    /// Generates an ephemeral self-signed TLS certificate for this session.
-    ///
-    /// # TODO
-    /// - `TODO(v1)`: load a persistent cert from `~/.config/rift/client.{cert,key}`
-    ///   so the client fingerprint is stable across reconnects and the server
-    ///   admin's permission files continue to authorise the client.
-    /// - `TODO(v1)`: use [`rift_transport::TofuPolicy`] loaded from
-    ///   `~/.config/rift/known-servers.toml` instead of [`AcceptAnyPolicy`].
+    /// Suitable for testing only. For production use, prefer
+    /// [`RiftClient::connect_persistent`] which provides a stable fingerprint
+    /// and Trust-On-First-Use server verification.
     #[instrument(fields(addr = %addr, share_name = %share_name), err)]
     pub async fn connect(addr: SocketAddr, share_name: &str) -> Result<Self> {
         let (cert, key) = generate_client_cert()?;
@@ -176,6 +237,7 @@ impl RiftClient<QuicConnection> {
             share_name: share_name.to_string(),
             cert,
             key,
+            tofu_state: None,
         })
     }
 
@@ -249,7 +311,90 @@ impl RiftClient<QuicConnection> {
             share_name: share_name.to_string(),
             cert,
             key,
+            tofu_state: None,
         })
+    }
+
+    /// Connect with persistent client certificate and TOFU policy.
+    ///
+    /// Uses [`ClientPaths`] to resolve cert/key and known-servers.toml paths.
+    /// - Loads or generates a persistent client certificate (stable fingerprint).
+    /// - Uses [`TofuPolicy`] loaded from `known-servers.toml` for server verification.
+    /// - Saves TOFU state after successful connection.
+    ///
+    /// If `cert_key_paths` is provided, overrides the default cert/key paths
+    /// (useful for `--cert`/`--key` CLI flags).
+    #[instrument(fields(addr = %addr, share_name = %share_name), err)]
+    pub async fn connect_persistent(
+        addr: SocketAddr,
+        share_name: &str,
+        paths: &ClientPaths,
+    ) -> Result<Self> {
+        let cert_path = paths.cert_path();
+        let key_path = paths.key_path();
+
+        let (cert, key) = if cert_path.exists() && key_path.exists() {
+            let cert = std::fs::read(&cert_path)
+                .map_err(|e| anyhow::anyhow!("failed to read cert: {e}"))?;
+            let key =
+                std::fs::read(&key_path).map_err(|e| anyhow::anyhow!("failed to read key: {e}"))?;
+            (cert, key)
+        } else {
+            let (cert, key) = generate_client_cert()?;
+            if let Some(parent) = cert_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("failed to create state dir: {e}"))?;
+            }
+            std::fs::write(&cert_path, &cert)
+                .map_err(|e| anyhow::anyhow!("failed to write cert: {e}"))?;
+            std::fs::write(&key_path, &key)
+                .map_err(|e| anyhow::anyhow!("failed to write key: {e}"))?;
+            (cert, key)
+        };
+
+        let known_servers_path = paths.known_servers_path();
+        let tofu_store = crate::known_servers::load_known_servers(&known_servers_path)?;
+        let host_key = format!("{addr}");
+        let policy = TofuPolicy::new(host_key, {
+            let store = tofu_store;
+            store.known
+        });
+        let store_arc = policy.store();
+
+        let ep = client_endpoint(&cert, &key)?;
+        let conn = connect(&ep, addr, "rift-server", Arc::new(policy))
+            .await
+            .map_err(|e| anyhow::anyhow!("QUIC connect to {addr}: {e}"))?;
+
+        let mut ctrl = conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("open control stream: {e}"))?;
+
+        let welcome = client_handshake(&mut ctrl, share_name, &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake for share '{share_name}': {e}"))?;
+
+        let root_handle = Uuid::from_slice(&welcome.root_handle)
+            .map_err(|e| anyhow::anyhow!("invalid root handle from server: {e}"))?;
+
+        let tofu_state = TofuState::new(store_arc, known_servers_path);
+
+        let client = Self {
+            conn,
+            root_handle,
+            addr,
+            share_name: share_name.to_string(),
+            cert,
+            key,
+            tofu_state: Some(tofu_state),
+        };
+
+        if let Some(ref tofu) = client.tofu_state {
+            tofu.save_if_dirty()?;
+        }
+
+        Ok(client)
     }
 }
 
@@ -257,7 +402,7 @@ impl<C: RiftConnection> RiftClient<C> {
     /// Construct a client from an already-established connection and root handle.
     ///
     /// This is primarily useful for testing with mock or recording connections.
-    /// For production use, prefer [`RiftClient::connect`] or [`RiftClient::connect_with_cert`].
+    /// For production use, prefer [`RiftClient::connect_persistent`].
     pub fn from_connection(conn: C, root_handle: Uuid) -> Self {
         Self {
             conn,
@@ -266,6 +411,7 @@ impl<C: RiftConnection> RiftClient<C> {
             share_name: String::new(),
             cert: Vec::new(),
             key: Vec::new(),
+            tofu_state: None,
         }
     }
 
@@ -733,13 +879,11 @@ fn map_proto_error(code: i32) -> anyhow::Error {
 // Certificate generation
 // ---------------------------------------------------------------------------
 
-/// Generate an ephemeral self-signed TLS certificate for this client session.
+/// Generate an ephemeral self-signed TLS certificate.
 ///
-/// # TODO(v1)
-/// Load a persistent certificate from `~/.config/rift/client.{cert,key}` so
-/// the client's BLAKE3 fingerprint is stable across restarts.  The server's
-/// per-share permission files authorise clients by fingerprint, so an
-/// ephemeral cert forces re-authorisation after every restart.
+/// Used by [`RiftClient::connect`] for quick testing. Production clients
+/// should use [`RiftClient::connect_persistent`] instead, which loads or
+/// generates a persistent certificate with a stable fingerprint.
 fn generate_client_cert() -> Result<(Vec<u8>, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["rift-client".to_string()])?;
     Ok((cert.cert.der().to_vec(), cert.key_pair.serialize_der()))

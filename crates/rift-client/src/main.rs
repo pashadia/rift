@@ -29,15 +29,6 @@ enum Command {
         /// Local directory to mount the filesystem at
         path: PathBuf,
 
-        /// TLS certificate file (PEM). If not specified, uses state_dir/client.cert
-        /// or generates a persistent certificate.
-        #[arg(long)]
-        cert: Option<PathBuf>,
-
-        /// TLS private key file (PEM). Required if --cert is specified.
-        #[arg(long)]
-        key: Option<PathBuf>,
-
         /// State directory for persistent certificates, cache, and TOFU data
         /// (default: $XDG_STATE_HOME/rift, typically ~/.local/state/rift)
         #[arg(long)]
@@ -68,14 +59,12 @@ async fn main() -> Result<()> {
             server,
             share,
             path,
-            cert,
-            key,
             state_dir,
             config_dir,
         } => {
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (server, share, path, cert, key, state_dir, config_dir);
+                let _ = (server, share, path, state_dir, config_dir);
                 anyhow::bail!("mount is only supported on Linux");
             }
 
@@ -96,12 +85,6 @@ async fn main() -> Result<()> {
                     (None, None) => ClientPaths::default_paths(),
                 };
 
-                let cert_key_paths = match (&cert, &key) {
-                    (Some(c), Some(k)) => Some((c.as_path(), k.as_path())),
-                    (None, None) => None,
-                    _ => anyhow::bail!("both --cert and --key must be specified together"),
-                };
-
                 paths.ensure_dirs().await?;
 
                 tracing::info!(
@@ -109,18 +92,12 @@ async fn main() -> Result<()> {
                     share  = %share,
                     mountpoint = %path.display(),
                     state_dir = %paths.base_dir().display(),
-                    cert_file = ?cert_key_paths.map(|(c, _)| c.display()),
                     "connecting to server"
                 );
 
-                let client = rift_client::client::RiftClient::connect_with_cert(
-                    addr,
-                    &share,
-                    cert_key_paths,
-                    &paths.cert_path(),
-                    &paths.key_path(),
-                )
-                .await?;
+                let client =
+                    rift_client::client::RiftClient::connect_persistent(addr, &share, &paths)
+                        .await?;
                 let root_handle = client.root_handle();
                 let fingerprint = client.server_fingerprint().to_string();
 
