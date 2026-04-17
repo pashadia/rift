@@ -94,6 +94,12 @@ impl Database {
     ///
     /// Overwrites any existing entry for this file.
     ///
+    /// `path` must be a canonical path (i.e. the result of `canonicalize()`).
+    /// The handler always canonicalises paths before calling this function.
+    /// Tests that pre-populate the cache must do the same, or cache lookups
+    /// will silently miss on systems where temp directories involve symlinks
+    /// (e.g. macOS `/var` → `/private/var`).
+    ///
     /// Takes explicit mtime_ns and file_size rather than reading from the
     /// filesystem, so callers can pass verified/cached values.
     pub async fn put_merkle(

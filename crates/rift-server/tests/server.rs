@@ -1011,6 +1011,7 @@ mod merkle_integration {
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"hello").unwrap();
+        let file_path = tokio::fs::canonicalize(&file_path).await.unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
@@ -1099,6 +1100,7 @@ mod merkle_integration {
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"hello").unwrap();
+        let file_path = tokio::fs::canonicalize(&file_path).await.unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
@@ -1292,6 +1294,7 @@ mod merkle_integration {
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("hello.txt");
         std::fs::write(&file_path, b"hello rift").unwrap();
+        let file_path = tokio::fs::canonicalize(&file_path).await.unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
@@ -1363,6 +1366,7 @@ mod merkle_integration {
         let file2 = root.join("uncached.txt");
         std::fs::write(&file1, b"cached").unwrap();
         std::fs::write(&file2, b"uncached").unwrap();
+        let file1 = tokio::fs::canonicalize(&file1).await.unwrap();
 
         let db = Database::open_in_memory().await.unwrap();
         let handle_db = rift_server::handle::HandleDatabase::new();
@@ -1475,6 +1479,7 @@ async fn server_sends_root_hash_when_db_configured() {
     let root = temp_dir.path().to_path_buf();
     let file_path = root.join("hello.txt");
     std::fs::write(&file_path, b"hello rift").unwrap();
+    let file_path = tokio::fs::canonicalize(&file_path).await.unwrap();
 
     let db = Database::open_in_memory().await.unwrap();
     let root_hash = Blake3Hash::new(b"test-content");
