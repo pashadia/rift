@@ -1,6 +1,5 @@
 //! Rift Client Binary
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -62,14 +61,14 @@ async fn main() -> Result<()> {
             state_dir,
             config_dir,
         } => {
-            #[cfg(not(target_os = "linux"))]
-            {
+            if !cfg!(target_os = "linux") {
                 let _ = (server, share, path, state_dir, config_dir);
                 anyhow::bail!("mount is only supported on Linux");
             }
 
             #[cfg(all(target_os = "linux", feature = "fuse"))]
             {
+                use std::net::SocketAddr;
                 use fuse3::path::Session;
                 use fuse3::MountOptions;
                 use rift_client::fuse::RiftFilesystem;
