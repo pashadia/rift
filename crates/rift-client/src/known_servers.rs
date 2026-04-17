@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -16,13 +17,12 @@ pub fn load_known_servers(path: &Path) -> Result<TofuStore> {
 }
 
 pub fn save_known_servers(path: &Path, store: &TofuStore) -> Result<()> {
-    let store_lock = store;
-    let known = &store_lock.known;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = toml::to_string_pretty(known)?;
-    std::fs::write(path, content)?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let content = toml::to_string_pretty(&store.known)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.persist(path)?;
     Ok(())
 }
 
