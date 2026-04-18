@@ -263,8 +263,9 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         }
         chunk_starts.push(acc); // sentinel = total file size
 
-        let start_chunk =
-            chunk_starts.partition_point(|&s| s <= offset).saturating_sub(1) as u32;
+        let start_chunk = chunk_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1) as u32;
         let end_chunk = chunk_starts.partition_point(|&s| s < end) as u32;
         let chunk_count = end_chunk - start_chunk;
 
@@ -291,10 +292,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                     .iter()
                     .map(|c| crate::cache::db::ChunkInfo {
                         index: c.index,
-                        offset: chunk_starts
-                            .get(c.index as usize)
-                            .copied()
-                            .unwrap_or(0),
+                        offset: chunk_starts.get(c.index as usize).copied().unwrap_or(0),
                         length: c.length,
                         hash: c.hash,
                     })
@@ -646,8 +644,8 @@ mod tests {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let chunk2_hash = [0x12u8; 32];
-        let root_hash   = [0xABu8; 32];
-        let sizes       = vec![100u64, 200, 150];
+        let root_hash = [0xABu8; 32];
+        let sizes = vec![100u64, 200, 150];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
@@ -706,7 +704,8 @@ mod tests {
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
-        view.handles.insert(std::path::PathBuf::from("file"), Uuid::now_v7());
+        view.handles
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7());
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -718,7 +717,10 @@ mod tests {
             .await
             .expect("offset beyond EOF must return Ok(empty), not an error");
 
-        assert!(result.is_empty(), "reading past EOF must return empty bytes");
+        assert!(
+            result.is_empty(),
+            "reading past EOF must return empty bytes"
+        );
         assert_eq!(
             remote.get_read_chunks_call_count().await,
             0,
@@ -732,16 +734,19 @@ mod tests {
     #[tokio::test]
     async fn read_length_clamped_to_file_end() {
         let chunk1_hash = [0x11u8; 32];
-        let root_hash   = [0xABu8; 32];
-        let sizes       = vec![100u64, 200];
+        let root_hash = [0xABu8; 32];
+        let sizes = vec![100u64, 200];
         let file_size: u64 = sizes.iter().sum(); // 300
 
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
-        view.handles.insert(std::path::PathBuf::from("file"), Uuid::now_v7());
+        view.handles
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7());
 
-        remote.set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))])).await;
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
                 hashes: vec![[0x10u8; 32].to_vec(), chunk1_hash.to_vec()],
@@ -769,10 +774,17 @@ mod tests {
 
         // offset=250 → 150 bytes into chunk 1; file ends at byte 300 → 50 bytes
         let expected: Vec<u8> = (150u8..200u8).collect();
-        assert_eq!(result, expected, "must return only remaining bytes up to EOF");
+        assert_eq!(
+            result, expected,
+            "must return only remaining bytes up to EOF"
+        );
 
         let args = remote.get_last_read_chunks_args().await.unwrap();
-        assert_eq!(args, (1, 1), "only chunk 1 needed for offset=250 in a [100,200] file");
+        assert_eq!(
+            args,
+            (1, 1),
+            "only chunk 1 needed for offset=250 in a [100,200] file"
+        );
     }
 
     /// After a read, the manifest stored in cache must hold the correct byte offset
@@ -784,8 +796,8 @@ mod tests {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let chunk2_hash = [0x12u8; 32];
-        let root_hash   = [0xABu8; 32];
-        let sizes       = vec![100u64, 200, 150];
+        let root_hash = [0xABu8; 32];
+        let sizes = vec![100u64, 200, 150];
         let file_size: u64 = sizes.iter().sum();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -798,9 +810,12 @@ mod tests {
             .expect("with_cache should succeed");
 
         let file_uuid = Uuid::now_v7();
-        view.handles.insert(std::path::PathBuf::from("file"), file_uuid);
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
 
-        remote.set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))])).await;
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
                 hashes: vec![
@@ -815,9 +830,24 @@ mod tests {
         remote
             .set_read_chunks(Ok(ChunkReadResult {
                 chunks: vec![
-                    ChunkData { index: 0, length: 100, hash: chunk0_hash, data: vec![0xAAu8; 100] },
-                    ChunkData { index: 1, length: 200, hash: chunk1_hash, data: vec![0xBBu8; 200] },
-                    ChunkData { index: 2, length: 150, hash: chunk2_hash, data: vec![0xCCu8; 150] },
+                    ChunkData {
+                        index: 0,
+                        length: 100,
+                        hash: chunk0_hash,
+                        data: vec![0xAAu8; 100],
+                    },
+                    ChunkData {
+                        index: 1,
+                        length: 200,
+                        hash: chunk1_hash,
+                        data: vec![0xBBu8; 200],
+                    },
+                    ChunkData {
+                        index: 2,
+                        length: 150,
+                        hash: chunk2_hash,
+                        data: vec![0xCCu8; 150],
+                    },
                 ],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -838,9 +868,15 @@ mod tests {
             .expect("manifest should exist");
 
         assert_eq!(manifest.chunks.len(), 3);
-        assert_eq!(manifest.chunks[0].offset, 0,   "chunk 0 offset must be 0");
-        assert_eq!(manifest.chunks[1].offset, 100,  "chunk 1 offset must be 100, not index×128KB");
-        assert_eq!(manifest.chunks[2].offset, 300,  "chunk 2 offset must be 300, not index×128KB");
+        assert_eq!(manifest.chunks[0].offset, 0, "chunk 0 offset must be 0");
+        assert_eq!(
+            manifest.chunks[1].offset, 100,
+            "chunk 1 offset must be 100, not index×128KB"
+        );
+        assert_eq!(
+            manifest.chunks[2].offset, 300,
+            "chunk 2 offset must be 300, not index×128KB"
+        );
     }
 
     /// Two chunks [100, 200]. offset=100 is the exact start of chunk 1.
@@ -849,16 +885,19 @@ mod tests {
     async fn read_starting_at_exact_chunk_boundary() {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
-        let root_hash   = [0xABu8; 32];
-        let sizes       = vec![100u64, 200];
+        let root_hash = [0xABu8; 32];
+        let sizes = vec![100u64, 200];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
-        view.handles.insert(std::path::PathBuf::from("file"), Uuid::now_v7());
+        view.handles
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7());
 
-        remote.set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))])).await;
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
                 hashes: vec![chunk0_hash.to_vec(), chunk1_hash.to_vec()],
@@ -883,11 +922,17 @@ mod tests {
             .await
             .expect("read should succeed");
 
-        assert_eq!(result, vec![0xBBu8; 10],
-            "offset==chunk boundary: should return first 10 bytes of chunk 1");
+        assert_eq!(
+            result,
+            vec![0xBBu8; 10],
+            "offset==chunk boundary: should return first 10 bytes of chunk 1"
+        );
         let args = remote.get_last_read_chunks_args().await.unwrap();
-        assert_eq!(args, (1, 1),
-            "offset==100 is the start of chunk 1; only that chunk should be fetched");
+        assert_eq!(
+            args,
+            (1, 1),
+            "offset==100 is the start of chunk 1; only that chunk should be fetched"
+        );
     }
 
     /// Two chunks [100, 200]. Read offset=80, length=50 spans the chunk 0/1 boundary.
@@ -899,8 +944,8 @@ mod tests {
         // chunk1: bytes 100..299 with value 0xBB
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
-        let root_hash   = [0xABu8; 32];
-        let sizes       = vec![100u64, 200];
+        let root_hash = [0xABu8; 32];
+        let sizes = vec![100u64, 200];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
@@ -923,8 +968,18 @@ mod tests {
         remote
             .set_read_chunks(Ok(ChunkReadResult {
                 chunks: vec![
-                    ChunkData { index: 0, length: 100, hash: chunk0_hash, data: vec![0xAAu8; 100] },
-                    ChunkData { index: 1, length: 200, hash: chunk1_hash, data: vec![0xBBu8; 200] },
+                    ChunkData {
+                        index: 0,
+                        length: 100,
+                        hash: chunk0_hash,
+                        data: vec![0xAAu8; 100],
+                    },
+                    ChunkData {
+                        index: 1,
+                        length: 200,
+                        hash: chunk1_hash,
+                        data: vec![0xBBu8; 200],
+                    },
                 ],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -938,12 +993,17 @@ mod tests {
         // 20 bytes from chunk 0 (tail), then 30 bytes from chunk 1 (head)
         let mut expected = vec![0xAAu8; 20];
         expected.extend(vec![0xBBu8; 30]);
-        assert_eq!(result, expected,
-            "cross-chunk read should concatenate tail of chunk0 and head of chunk1");
+        assert_eq!(
+            result, expected,
+            "cross-chunk read should concatenate tail of chunk0 and head of chunk1"
+        );
 
         let args = remote.get_last_read_chunks_args().await.unwrap();
-        assert_eq!(args, (0, 2),
-            "start_chunk=0 and chunk_count=2 expected for a cross-boundary read");
+        assert_eq!(
+            args,
+            (0, 2),
+            "start_chunk=0 and chunk_count=2 expected for a cross-boundary read"
+        );
     }
 
     /// Three chunks with variable sizes [100, 200, 150].
@@ -959,7 +1019,7 @@ mod tests {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let chunk2_hash = [0x12u8; 32];
-        let root_hash   = [0xABu8; 32];
+        let root_hash = [0xABu8; 32];
 
         // sizes: chunk0=100, chunk1=200, chunk2=150  →  total=450
         let sizes = vec![100u64, 200, 150];
@@ -1007,8 +1067,10 @@ mod tests {
         // offset=120 is 20 bytes into chunk 1 (which starts at byte 100).
         // Expected bytes: chunk1_data[20..70] == [20, 21, ..., 69]
         let expected: Vec<u8> = (20u8..70u8).collect();
-        assert_eq!(result, expected,
-            "bytes at file offset 120..170 should be chunk1[20..70]");
+        assert_eq!(
+            result, expected,
+            "bytes at file offset 120..170 should be chunk1[20..70]"
+        );
     }
 
     #[tokio::test]

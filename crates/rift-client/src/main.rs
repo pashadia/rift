@@ -68,11 +68,11 @@ async fn main() -> Result<()> {
 
             #[cfg(all(target_os = "linux", feature = "fuse"))]
             {
-                use std::net::SocketAddr;
                 use fuse3::path::Session;
                 use fuse3::MountOptions;
                 use rift_client::fuse::RiftFilesystem;
                 use rift_client::paths::ClientPaths;
+                use std::net::SocketAddr;
 
                 let addr: SocketAddr = server
                     .parse()

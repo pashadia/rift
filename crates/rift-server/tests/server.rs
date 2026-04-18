@@ -1801,7 +1801,7 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
     let chunker = Chunker::default();
     let all_chunks = chunker.chunk(&content);
     let chunk_count = all_chunks.len();
-    
+
     // Calculate how many we can read starting at offset 3
     let start = 3;
     let available = chunk_count.saturating_sub(start);
@@ -1850,22 +1850,33 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
     let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
     let success = match response.result {
         Some(rift_protocol::messages::read_response::Result::Ok(s)) => s,
-        Some(rift_protocol::messages::read_response::Result::Error(e)) => panic!("read error: {:?}", e),
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            panic!("read error: {:?}", e)
+        }
         None => panic!("empty response"),
     };
     assert_eq!(success.chunk_count as usize, read_count);
 
     // Verify each chunk returns correct data
-    let chunk_boundaries: Vec<(usize, usize)> = all_chunks.iter().skip(start).take(read_count).cloned().collect();
+    let chunk_boundaries: Vec<(usize, usize)> = all_chunks
+        .iter()
+        .skip(start)
+        .take(read_count)
+        .cloned()
+        .collect();
 
     for (i, (expected_offset, expected_len)) in chunk_boundaries.iter().enumerate() {
         // Read BlockHeader
         let header_frame = stream.recv_frame().await.unwrap().unwrap();
         let (_, header_payload) = header_frame;
-        let block_header = rift_protocol::messages::BlockHeader::decode(&header_payload[..]).unwrap();
+        let block_header =
+            rift_protocol::messages::BlockHeader::decode(&header_payload[..]).unwrap();
         let chunk_info = block_header.chunk.as_ref().expect("chunk missing");
         assert_eq!(chunk_info.index as usize, start + i, "chunk index mismatch");
-        assert_eq!(chunk_info.length as usize, *expected_len, "chunk length mismatch");
+        assert_eq!(
+            chunk_info.length as usize, *expected_len,
+            "chunk length mismatch"
+        );
 
         // Read BlockData
         let data_frame = stream.recv_frame().await.unwrap().unwrap();
