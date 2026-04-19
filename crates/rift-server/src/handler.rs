@@ -297,8 +297,13 @@ pub async fn readdir_response(
                     let name = entry.file_name().to_string_lossy().into_owned();
                     let entry_path = entry.path();
 
+                    let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
+                        Ok(p) => p,
+                        Err(_) => return None,
+                    };
+
                     let handle = handle_db
-                        .get_or_create_handle(&entry_path)
+                        .get_or_create_handle(&entry_canonical)
                         .await
                         .ok()?
                         .as_bytes()
