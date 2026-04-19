@@ -180,10 +180,29 @@ mod tests {
             .await
             .unwrap();
 
-        // handle2 + "test.txt": key_to_handle rejects duplicate key,
-        // handle_to_key must be rolled back so no orphaned entry remains.
         assert!(matches!(
             map.insert_async(handle2, "test.txt".to_string()).await,
+            Err(FsError::Exists)
+        ));
+
+        assert!(
+            map.get_by_handle(&handle2).is_none(),
+            "handle2 must not have an orphaned entry in handle_to_key"
+        );
+        assert_eq!(map.len(), 1, "map must contain exactly one entry");
+        assert_eq!(map.get_handle(&"test.txt".to_string()), Some(handle1));
+    }
+
+    #[test]
+    fn test_insert_sync_rollback_on_partial_failure() {
+        let map = BidirectionalMap::<String>::new();
+        let handle1 = Uuid::now_v7();
+        let handle2 = Uuid::now_v7();
+
+        map.insert(handle1, "test.txt".to_string()).unwrap();
+
+        assert!(matches!(
+            map.insert(handle2, "test.txt".to_string()),
             Err(FsError::Exists)
         ));
 

@@ -13,11 +13,11 @@ use clap::Parser;
 struct Args {
     /// Directory to export as a Rift share.
     #[arg(long)]
-    share: PathBuf,
+    share: Option<PathBuf>,
 
     /// Address to listen on.
-    #[arg(long, default_value = "0.0.0.0:4433")]
-    addr: SocketAddr,
+    #[arg(long)]
+    addr: Option<SocketAddr>,
 
     /// TLS certificate file. If not specified, uses ~/.config/rift/server.cert
     /// or generates a new one on first boot.
@@ -27,6 +27,10 @@ struct Args {
     /// TLS private key file. Required if --cert is specified.
     #[arg(long)]
     key: Option<PathBuf>,
+
+    /// Path to TOML configuration file.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -43,25 +47,66 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if !args.share.exists() {
-        anyhow::bail!("share path does not exist: {}", args.share.display());
+    let server_config = match &args.config {
+        Some(path) => rift_server::config::load_config(path)?,
+        None => {
+            let mut config = rift_common::config::ServerConfig::default();
+            if let Some(addr) = args.addr {
+                config.listen_addr = addr.to_string();
+            }
+            if let Some(share) = &args.share {
+                if !share.exists() {
+                    anyhow::bail!("share path does not exist: {}", share.display());
+                }
+                config.shares.push(rift_common::config::ShareConfig {
+                    name: "default".to_string(),
+                    path: share.clone(),
+                    read_only: false,
+                    permissions: Default::default(),
+                });
+            }
+            config.cert_path = args.cert.clone();
+            config.key_path = args.key.clone();
+            config
+        }
+    };
+
+    if server_config.shares.is_empty() {
+        anyhow::bail!("no shares configured; use --share or --config to define at least one share");
     }
 
-    let (cert_der, key_der) = rift_server::cert::get_or_create_cert(args.cert, args.key)?;
+    for share in &server_config.shares {
+        if !share.path.exists() {
+            anyhow::bail!("share path does not exist: {}", share.path.display());
+        }
+    }
+
+    let listen_addr: SocketAddr = server_config.listen_addr.parse()?;
+    let (cert_der, key_der) =
+        rift_server::cert::get_or_create_cert(server_config.cert_path, server_config.key_path)?;
 
     let fingerprint = rift_transport::cert_fingerprint(&cert_der);
-    tracing::info!(addr = %args.addr, share = %args.share.display(), "starting rift-server");
+    tracing::info!(addr = %listen_addr, "starting rift-server");
     println!("Server fingerprint : {fingerprint}");
-    println!("Listening on       : {}", args.addr);
-    println!("Exporting          : {}", args.share.display());
+    println!("Listening on       : {listen_addr}");
 
-    let listener = rift_transport::server_endpoint(args.addr, &cert_der, &key_der)?;
+    for share in &server_config.shares {
+        println!(
+            "Exporting          : {} ({})",
+            share.name,
+            share.path.display()
+        );
+    }
+
+    let listener = rift_transport::server_endpoint(listen_addr, &cert_der, &key_der)?;
 
     let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
     let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
 
+    let share_path = server_config.shares[0].path.clone();
+
     tokio::select! {
-        result = rift_server::server::accept_loop(listener, args.share, db, handle_db) => result,
+        result = rift_server::server::accept_loop(listener, share_path, db, handle_db) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("\nShutting down.");
             Ok(())
