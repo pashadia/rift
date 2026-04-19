@@ -58,11 +58,14 @@ impl TofuState {
     }
 
     fn save_if_dirty(&self) -> Result<()> {
-        let store = self.store.lock().unwrap();
-        if store.dirty {
-            crate::known_servers::save_known_servers(&self.path, &store)?;
-        }
-        Ok(())
+        let snapshot = {
+            let store = self.store.lock().unwrap();
+            if !store.dirty {
+                return Ok(());
+            }
+            TofuStore::new(store.known.clone())
+        };
+        crate::known_servers::save_known_servers(&self.path, &snapshot)
     }
 }
 
@@ -241,9 +244,6 @@ impl RiftClient<QuicConnection> {
         })
     }
 
-    /// Connect with explicit certificate paths.
-    ///
-    /// - If `cert_key_paths` is `Some((cert_path, key_path))`, loads the cert/key from those files.
     /// Connect to a Rift server with explicit or persistent certificates.
     ///
     /// - If `cert_key_paths` is provided, loads cert/key from those files.
@@ -280,7 +280,7 @@ impl RiftClient<QuicConnection> {
                     }
                     std::fs::write(cert_path, &cert)
                         .map_err(|e| anyhow::anyhow!("failed to write cert: {e}"))?;
-                    std::fs::write(key_path, &key)
+                    write_private_key(key_path, &key)
                         .map_err(|e| anyhow::anyhow!("failed to write key: {e}"))?;
                     (cert, key)
                 }
@@ -347,7 +347,7 @@ impl RiftClient<QuicConnection> {
             }
             std::fs::write(&cert_path, &cert)
                 .map_err(|e| anyhow::anyhow!("failed to write cert: {e}"))?;
-            std::fs::write(&key_path, &key)
+            write_private_key(&key_path, &key)
                 .map_err(|e| anyhow::anyhow!("failed to write key: {e}"))?;
             (cert, key)
         };
@@ -887,6 +887,27 @@ fn map_proto_error(code: i32) -> anyhow::Error {
 fn generate_client_cert() -> Result<(Vec<u8>, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["rift-client".to_string()])?;
     Ok((cert.cert.der().to_vec(), cert.key_pair.serialize_der()))
+}
+
+/// Write a private key file with owner-only read/write permissions (0o600 on Unix).
+#[cfg(unix)]
+fn write_private_key(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(data)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_key(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data)?;
+    Ok(())
 }
 
 #[cfg(test)]

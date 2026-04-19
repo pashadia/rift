@@ -204,22 +204,23 @@ impl FileCache {
             .collect();
 
         self.call(move |conn: &mut rusqlite::Connection| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT OR REPLACE INTO manifests (handle, root_hash, updated_at) VALUES (?1, ?2, ?3)",
                 (&handle_str, &root_bytes, now),
             )?;
 
-            conn.execute("DELETE FROM chunk_refs WHERE handle = ?1", [&handle_str])?;
+            tx.execute("DELETE FROM chunk_refs WHERE handle = ?1", [&handle_str])?;
 
-            for (index, offset, length, hash) in chunks {
-                conn.execute(
+            for (index, offset, length, hash) in &chunks {
+                tx.execute(
                     "INSERT INTO chunk_refs (handle, chunk_index, byte_offset, byte_length, chunk_hash)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (&handle_str, index, offset, length, &hash),
+                    (&handle_str, index, offset, length, hash),
                 )?;
             }
 
-            Ok(())
+            tx.commit()
         })
         .await?;
         Ok(())
