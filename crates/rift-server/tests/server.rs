@@ -724,22 +724,22 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
     // Test TWO scenarios:
     // 1. Basic symlink (symlink -> file)
     // 2. Nested symlink (symlink -> symlink)
-    
+
     use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReaddirRequest};
-    
+
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
-    
+
     // Basic: file -> symlink pointing to it
     std::fs::write(root.join("target_file.txt"), b"hello").unwrap();
     std::os::unix::fs::symlink("target_file.txt", root.join("link_file.txt")).unwrap();
-    
+
     // Nested: symlink -> another symlink
     std::os::unix::fs::symlink("link_file.txt", root.join("double_link.txt")).unwrap();
-    
+
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
-    
+
     // First, use readdir to get the entries
     let mut stream = conn.open_stream().await.unwrap();
     let readdir_req = ReaddirRequest {
@@ -752,7 +752,7 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
         .await
         .unwrap();
     stream.finish_send().await.unwrap();
-    
+
     let frame = stream.recv_frame().await.unwrap().unwrap();
     let (_, payload) = frame;
     let readdir_resp = rift_protocol::messages::ReaddirResponse::decode(&payload[..]).unwrap();
@@ -760,22 +760,35 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
         Some(rift_protocol::messages::readdir_response::Result::Entries(s)) => s.entries,
         _ => panic!("expected entries"),
     };
-    
+
     // Get handles from readdir
-    let link_entry = readdir_entries.iter().find(|e| e.name == "link_file.txt")
+    let link_entry = readdir_entries
+        .iter()
+        .find(|e| e.name == "link_file.txt")
         .expect("link_file.txt should be in readdir result");
-    let double_entry = readdir_entries.iter().find(|e| e.name == "double_link.txt")
+    let double_entry = readdir_entries
+        .iter()
+        .find(|e| e.name == "double_link.txt")
         .expect("double_link.txt should be in readdir result");
-    
+
     let link_handle = link_entry.handle.clone();
     let double_handle = double_entry.handle.clone();
-    
+
     // All three (link, double_link, and target) should have SAME handle
-    assert_eq!(link_handle, double_handle, 
-        "nested symlink should have same handle as target");
-    assert_eq!(link_handle, readdir_entries.iter().find(|e| e.name == "target_file.txt").unwrap().handle,
-        "symlink and target should have same handle");
-    
+    assert_eq!(
+        link_handle, double_handle,
+        "nested symlink should have same handle as target"
+    );
+    assert_eq!(
+        link_handle,
+        readdir_entries
+            .iter()
+            .find(|e| e.name == "target_file.txt")
+            .unwrap()
+            .handle,
+        "symlink and target should have same handle"
+    );
+
     // Now use lookup for the nested symlink
     let mut stream = conn.open_stream().await.unwrap();
     let lookup_req = LookupRequest {
@@ -787,7 +800,7 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
         .await
         .unwrap();
     stream.finish_send().await.unwrap();
-    
+
     let frame = stream.recv_frame().await.unwrap().unwrap();
     let (_, payload) = frame;
     let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
@@ -795,10 +808,12 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
         Some(lookup_response::Result::Entry(e)) => e.handle,
         _ => panic!("expected entry"),
     };
-    
+
     // Lookup should return same handle as readdir
-    assert_eq!(double_handle, lookup_handle, 
-        "readdir and lookup should return same handle for nested symlink");
+    assert_eq!(
+        double_handle, lookup_handle,
+        "readdir and lookup should return same handle for nested symlink"
+    );
 }
 
 // ---------------------------------------------------------------------------
