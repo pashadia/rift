@@ -15,12 +15,13 @@ use tracing::instrument;
 
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
-    lookup_response, mkdir_response, msg, read_response, readdir_response, rmdir_response,
-    stat_result, unlink_response, BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, FileAttrs,
-    FileType, LookupRequest, LookupResponse, LookupResult, MerkleDrill, MerkleLevelResponse,
-    MkdirRequest, MkdirResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry,
-    ReaddirRequest, ReaddirResponse, ReaddirSuccess, RmdirRequest, RmdirResponse, StatRequest,
-    StatResponse, StatResult, TransferComplete, UnlinkRequest, UnlinkResponse,
+    lookup_response, mkdir_response, msg, read_response, readdir_response, rename_response,
+    rmdir_response, stat_result, unlink_response, BlockHeader, ChunkInfo, ErrorCode, ErrorDetail,
+    FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult, MerkleDrill,
+    MerkleLevelResponse, MkdirRequest, MkdirResponse, ReadRequest, ReadResponse, ReadSuccess,
+    ReaddirEntry, ReaddirRequest, ReaddirResponse, ReaddirSuccess, RenameRequest, RenameResponse,
+    RmdirRequest, RmdirResponse, StatRequest, StatResponse, StatResult, TransferComplete,
+    UnlinkRequest, UnlinkResponse,
 };
 use rift_transport::RiftStream;
 
@@ -367,7 +368,7 @@ pub async fn mkdir_response(
 
 pub async fn unlink_response(
     payload: &[u8],
-    share: &Path,
+    _share: &Path,
     _handle_db: &HandleDatabase,
 ) -> UnlinkResponse {
     let _req = match UnlinkRequest::decode(payload) {
@@ -376,6 +377,19 @@ pub async fn unlink_response(
     };
 
     unlink_error(ErrorCode::ErrorUnsupported)
+}
+
+pub async fn rename_response(
+    payload: &[u8],
+    _share: &Path,
+    _handle_db: &HandleDatabase,
+) -> RenameResponse {
+    let _req = match RenameRequest::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return rename_error(ErrorCode::ErrorUnsupported),
+    };
+
+    rename_error(ErrorCode::ErrorUnsupported)
 }
 
 pub async fn rmdir_response(
@@ -467,6 +481,12 @@ fn unlink_error(code: ErrorCode) -> UnlinkResponse {
 fn rmdir_error(code: ErrorCode) -> RmdirResponse {
     RmdirResponse {
         result: Some(rmdir_response::Result::Error(error_detail(code))),
+    }
+}
+
+fn rename_error(code: ErrorCode) -> RenameResponse {
+    RenameResponse {
+        result: Some(rename_response::Result::Error(error_detail(code))),
     }
 }
 
