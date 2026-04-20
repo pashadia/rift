@@ -808,3 +808,327 @@ pub async fn merkle_drill_response<S: RiftStream>(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message as _;
+    use tempfile::TempDir;
+
+    use rift_common::crypto::Blake3Hash;
+    use rift_protocol::messages::{
+        lookup_response, readdir_response, stat_result, FileType, LookupRequest, ReaddirRequest,
+        StatRequest,
+    };
+
+    use crate::handle::HandleDatabase;
+
+    // -----------------------------------------------------------------------
+    // Group A: metadata_to_attrs() and build_attrs()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metadata_to_attrs_regular_file_has_file_type() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("file.txt");
+        let content = b"hello rift handler";
+        std::fs::write(&path, content).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let attrs = metadata_to_attrs(&meta);
+
+        assert_eq!(attrs.file_type, FileType::Regular as i32);
+        assert_eq!(attrs.size, content.len() as u64);
+    }
+
+    #[test]
+    fn metadata_to_attrs_directory_has_dir_type() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("mydir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let meta = std::fs::metadata(&dir).unwrap();
+        let attrs = metadata_to_attrs(&meta);
+
+        assert_eq!(attrs.file_type, FileType::Directory as i32);
+    }
+
+    #[test]
+    fn build_attrs_includes_root_hash() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hashfile.txt");
+        std::fs::write(&path, b"some content").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let expected_hash = Blake3Hash::new(b"test");
+        let attrs = build_attrs(&meta, expected_hash.clone());
+
+        assert_eq!(attrs.root_hash, expected_hash.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn build_attrs_empty_file_has_zero_size() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.txt");
+        std::fs::write(&path, b"").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let attrs = build_attrs(&meta, Blake3Hash::new(b"dummy"));
+
+        assert_eq!(attrs.size, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Group B: resolve()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_valid_handle_returns_correct_path() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("target.txt");
+        std::fs::write(&file, b"content").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let resolved = resolve(&share, &uuid, &handle_db).await.unwrap();
+
+        assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_invalid_byte_length_returns_error() {
+        // resolve() takes &Uuid (always 16 bytes when constructed). The byte-
+        // length validation happens at the network boundary via Uuid::from_slice.
+        // Verify that guard correctly rejects short bytes.
+        let bad_bytes: &[u8] = &[0u8; 4];
+        assert!(
+            Uuid::from_slice(bad_bytes).is_err(),
+            "4 bytes must not parse as UUID"
+        );
+
+        // Also confirm that a valid-but-unregistered UUID passed to resolve()
+        // returns an error (exercises the "not found" code path).
+        let tmp = TempDir::new().unwrap();
+        let handle_db = HandleDatabase::new();
+        let unknown = Uuid::from_bytes([0xAA; 16]);
+        assert!(resolve(tmp.path(), &unknown, &handle_db).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_uuid_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let handle_db = HandleDatabase::new();
+        // A valid-format UUID that was never registered in the database
+        let unknown = Uuid::from_bytes([0x42; 16]);
+        let result = resolve(tmp.path(), &unknown, &handle_db).await;
+        assert!(result.is_err(), "unknown UUID must produce an error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group C: stat_response()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stat_response_returns_attrs_for_valid_handle() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("stat_me.txt");
+        let content = b"stat content";
+        std::fs::write(&file, content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let req = StatRequest {
+            handles: vec![uuid.as_bytes().to_vec()],
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = stat_response(&payload, &share, None, &handle_db).await;
+
+        assert_eq!(resp.results.len(), 1);
+        match &resp.results[0].result {
+            Some(stat_result::Result::Attrs(attrs)) => {
+                assert_eq!(attrs.size, content.len() as u64);
+                assert_eq!(attrs.file_type, FileType::Regular as i32);
+            }
+            other => panic!("expected Attrs, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_response_malformed_payload_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let handle_db = HandleDatabase::new();
+
+        // Garbage bytes that cannot decode as StatRequest
+        let garbage = vec![0xFF, 0xFE, 0x00, 0xAB, 0xCD];
+        let resp = stat_response(&garbage, &share, None, &handle_db).await;
+
+        // Malformed payload → decoder error → StatResponse { results: vec![] }
+        assert_eq!(resp.results.len(), 0, "malformed payload must yield empty results");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group D: lookup_response()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn lookup_response_existing_entry_returns_handle() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let child = share.join("child.txt");
+        std::fs::write(&child, b"data").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        // Register the parent directory so resolve() can find it
+        let parent_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = LookupRequest {
+            parent_handle: parent_uuid.as_bytes().to_vec(),
+            name: "child.txt".to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = lookup_response(&payload, &share, None, &handle_db).await;
+
+        match resp.result {
+            Some(lookup_response::Result::Entry(entry)) => {
+                assert!(!entry.handle.is_empty(), "handle must be non-empty");
+                let attrs = entry.attrs.expect("attrs must be present");
+                assert_eq!(attrs.size, 4, "size must match \"data\" content");
+            }
+            other => panic!("expected Entry, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_response_missing_entry_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        let handle_db = HandleDatabase::new();
+        let parent_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = LookupRequest {
+            parent_handle: parent_uuid.as_bytes().to_vec(),
+            name: "nonexistent.txt".to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = lookup_response(&payload, &share, None, &handle_db).await;
+
+        match resp.result {
+            Some(lookup_response::Result::Error(_)) => {}
+            other => panic!("expected Error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_response_malformed_payload_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let handle_db = HandleDatabase::new();
+
+        let garbage = vec![0xFF, 0xAB, 0x00, 0x01, 0x02];
+        let resp = lookup_response(&garbage, &share, None, &handle_db).await;
+
+        // Must return an error variant, not panic
+        match resp.result {
+            Some(lookup_response::Result::Error(_)) => {}
+            other => panic!("expected Error for garbage payload, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group E: readdir_response()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn readdir_response_lists_all_entries() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        std::fs::write(share.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(share.join("beta.txt"), b"b").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        match resp.result {
+            Some(readdir_response::Result::Entries(success)) => {
+                let names: Vec<&str> =
+                    success.entries.iter().map(|e| e.name.as_str()).collect();
+                assert!(names.contains(&"alpha.txt"), "must list alpha.txt");
+                assert!(names.contains(&"beta.txt"), "must list beta.txt");
+                assert_eq!(names.len(), 2);
+            }
+            other => panic!("expected Entries, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_response_empty_directory() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        // No files created — directory is empty
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        match resp.result {
+            Some(readdir_response::Result::Entries(success)) => {
+                assert!(success.entries.is_empty(), "empty dir must have no entries");
+            }
+            other => panic!("expected Entries, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_response_malformed_payload_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let handle_db = HandleDatabase::new();
+
+        let garbage = vec![0xFF, 0x00, 0xAB];
+        let resp = readdir_response(&garbage, &share, &handle_db).await;
+
+        // Must return an error variant, not panic
+        match resp.result {
+            Some(readdir_response::Result::Error(_)) => {}
+            other => panic!("expected Error for garbage payload, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Note on Group F (mkdir / unlink / rmdir):
+    // No handler functions for these operations exist in handler.rs yet.
+    // The protocol constants (MKDIR_REQUEST, UNLINK_REQUEST, RMDIR_REQUEST)
+    // are defined in rift-protocol but no server-side stubs are implemented.
+    // Tests will be added once the stubs land.
+    // -----------------------------------------------------------------------
+}
