@@ -99,4 +99,60 @@ mod tests {
 
         assert_eq!(result, 0);
     }
+
+    #[tokio::test]
+    async fn database_open_creates_file_if_not_exists() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        assert!(!db_path.exists(), "file must not exist before open");
+        Database::open(&db_path).await.unwrap();
+        assert!(db_path.exists(), "file must exist after open");
+    }
+
+    #[tokio::test]
+    async fn database_open_existing_file_succeeds() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        // First open creates the file
+        let db1 = Database::open(&db_path).await.unwrap();
+        drop(db1);
+
+        // Second open on the same file must succeed
+        let result = Database::open(&db_path).await;
+        assert!(result.is_ok(), "second open should succeed");
+    }
+
+    #[tokio::test]
+    async fn database_open_invalid_path_returns_error() {
+        let result = Database::open(std::path::Path::new("/nonexistent_root/impossible/x.db")).await;
+        assert!(result.is_err(), "opening an invalid path must return Err");
+    }
+
+    #[tokio::test]
+    async fn database_call_executes_closure() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let value: i64 = db
+            .call(|conn| conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)))
+            .await
+            .unwrap();
+
+        assert_eq!(value, 1i64);
+    }
+
+    #[tokio::test]
+    async fn database_call_propagates_closure_error() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let result: tokio_rusqlite::Result<i64> = db
+            .call(|_conn| Err(rusqlite::Error::QueryReturnedNoRows))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "closure error must propagate out of call()"
+        );
+    }
 }
