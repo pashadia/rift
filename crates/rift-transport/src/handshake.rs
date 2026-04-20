@@ -129,24 +129,20 @@ mod tests {
     // recv_hello edge cases
     // ---------------------------------------------------------------------------
 
-    /// Sending a RIFT_HELLO frame with an empty payload should cause a prost decode
-    /// error since `RiftHello` requires at minimum a valid protobuf encoding.
-    /// An empty byte slice is technically a valid protobuf encoding (all fields
-    /// default), so this test verifies that recv_hello handles it without panicking
-    /// and returns Ok with default values — or, if prost rejects it, returns Err.
+    /// Sending a RIFT_HELLO frame with an empty payload decodes as a RiftHello
+    /// with all-default fields (prost treats empty bytes as valid protobuf).
+    /// recv_hello should therefore succeed and return a default RiftHello.
     #[tokio::test]
-    async fn recv_hello_with_empty_payload_returns_error() {
+    async fn recv_hello_with_empty_payload_returns_default_hello() {
         let (client, server) = InMemoryConnection::pair();
 
         let server_task = tokio::spawn(async move {
             let mut s = server.accept_stream().await.unwrap();
-            // An empty payload decodes as a RiftHello with all defaults —
-            // prost accepts it. We verify recv_hello doesn't panic and returns
-            // a result (Ok or Err — either is valid depending on prost behaviour).
+            // prost decodes empty bytes as default struct — this should succeed
             let result = recv_hello(&mut s).await;
-            // The result must not panic; we just check it's a result.
-            // (prost treats empty bytes as valid with all-default fields)
-            let _ = result; // no panic = success
+            assert!(result.is_ok(), "empty payload should decode as default RiftHello");
+            let hello = result.unwrap();
+            assert_eq!(hello.share_name, ""); // default string is empty
         });
 
         let mut cs = client.open_stream().await.unwrap();
