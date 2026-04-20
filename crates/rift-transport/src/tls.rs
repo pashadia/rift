@@ -262,6 +262,55 @@ where
 // Internal TLS config builder
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gen_cert(cn: &str) -> (Vec<u8>, Vec<u8>) {
+        let cert = rcgen::generate_simple_self_signed(vec![cn.to_string()])
+            .expect("rcgen cert generation failed");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.key_pair.serialize_der();
+        (cert_der, key_der)
+    }
+
+    // Quinn endpoint construction requires a tokio runtime to be active even
+    // for synchronous calls, because quinn registers IO handles with the
+    // current tokio reactor internally.
+
+    #[tokio::test]
+    async fn server_endpoint_with_valid_cert_returns_ok() {
+        let (cert, key) = gen_cert("test-server");
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let result = server_endpoint(addr, &cert, &key);
+        assert!(result.is_ok(), "expected Ok from server_endpoint, got: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_with_valid_cert_returns_ok() {
+        let (cert, key) = gen_cert("test-client");
+        let result = client_endpoint(&cert, &key);
+        assert!(result.is_ok(), "expected Ok from client_endpoint, got: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_no_cert_returns_ok() {
+        let result = client_endpoint_no_cert();
+        assert!(result.is_ok(), "expected Ok from client_endpoint_no_cert, got: {:?}", result.err());
+    }
+
+    // This test does NOT need a runtime: the error is caught before quinn
+    // even touches the socket (private-key parsing fails first).
+    #[test]
+    fn server_endpoint_with_invalid_cert_bytes_returns_error() {
+        let cert = b"not a cert";
+        let key = b"not a key either";
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let result = server_endpoint(addr, cert, key);
+        assert!(result.is_err(), "expected Err for invalid cert bytes");
+    }
+}
+
 fn build_client_tls_config<P>(
     verifier: PolicyServerCertVerifier<P>,
     cert_der: &Option<Vec<u8>>,
