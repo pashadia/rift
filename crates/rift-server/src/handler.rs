@@ -902,18 +902,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_invalid_byte_length_returns_error() {
-        // resolve() takes &Uuid (always 16 bytes when constructed). The byte-
-        // length validation happens at the network boundary via Uuid::from_slice.
-        // Verify that guard correctly rejects short bytes.
-        let bad_bytes: &[u8] = &[0u8; 4];
-        assert!(
-            Uuid::from_slice(bad_bytes).is_err(),
-            "4 bytes must not parse as UUID"
-        );
-
-        // Also confirm that a valid-but-unregistered UUID passed to resolve()
-        // returns an error (exercises the "not found" code path).
+    async fn resolve_unknown_uuid_bytes_returns_error() {
+        // A valid-format UUID that was never registered in the database must
+        // cause resolve() to return an error (exercises the "not found" path).
         let tmp = TempDir::new().unwrap();
         let handle_db = HandleDatabase::new();
         let unknown = Uuid::from_bytes([0xAA; 16]);
@@ -963,7 +954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stat_response_malformed_payload_does_not_panic() {
+    async fn stat_response_malformed_payload_returns_empty_results() {
         let tmp = TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
         let handle_db = HandleDatabase::new();
@@ -1032,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_response_malformed_payload_does_not_panic() {
+    async fn lookup_response_malformed_payload_returns_error() {
         let tmp = TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
         let handle_db = HandleDatabase::new();
@@ -1109,7 +1100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readdir_response_malformed_payload_does_not_panic() {
+    async fn readdir_response_malformed_payload_returns_error() {
         let tmp = TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
         let handle_db = HandleDatabase::new();
