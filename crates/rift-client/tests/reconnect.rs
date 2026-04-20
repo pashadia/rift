@@ -101,16 +101,16 @@ async fn reconnecting_client_close_for_test_does_not_hang() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // The operation must fail (or, after retry exhaustion, return Err).
-    // We allow up to 10 seconds for the retry back-off to complete.
+    // We allow up to 5 seconds for the retry back-off to complete.
     let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(10),
+        tokio::time::Duration::from_secs(5),
         reconnecting.stat_batch(vec![root_handle]),
     )
     .await;
 
     assert!(
         result.is_ok(),
-        "stat_batch must not block indefinitely after connection is closed (timed out after 10s)"
+        "stat_batch must not block indefinitely after connection is closed (timed out after 5s)"
     );
     // result.unwrap() is the inner anyhow::Result — Ok or Err both fine;
     // only a timeout (outer Err) would indicate a hang.

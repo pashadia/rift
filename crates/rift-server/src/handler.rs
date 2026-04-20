@@ -816,7 +816,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as _;
+    use prost::Message;
     use tempfile::TempDir;
 
     use rift_common::crypto::Blake3Hash;
