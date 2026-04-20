@@ -618,6 +618,7 @@ mod tests {
         match decoded.result.unwrap() {
             unlink_response::Result::Error(e) => {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+                assert_eq!(e.message, "permission denied");
             }
             _ => panic!("wrong result variant"),
         }
@@ -662,6 +663,7 @@ mod tests {
         match decoded.result.unwrap() {
             rmdir_response::Result::Error(e) => {
                 assert_eq!(e.code, ErrorCode::ErrorNotEmpty as i32);
+                assert_eq!(e.message, "directory not empty");
             }
             _ => panic!("wrong result variant"),
         }
@@ -710,9 +712,30 @@ mod tests {
         match decoded.result.unwrap() {
             rename_response::Result::Error(e) => {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+                assert_eq!(e.message, "permission denied");
             }
             _ => panic!("wrong result variant"),
         }
+    }
+
+    #[test]
+    fn setattr_request_with_mtime() {
+        use prost_types::Timestamp;
+        let msg = SetAttrRequest {
+            handle: b"file-handle".to_vec(),
+            mode: None,
+            mtime: Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 42,
+            }),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = SetAttrRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.handle, b"file-handle");
+        assert!(decoded.mode.is_none());
+        let ts = decoded.mtime.unwrap();
+        assert_eq!(ts.seconds, 1_700_000_000);
+        assert_eq!(ts.nanos, 42);
     }
 
     #[test]
@@ -768,6 +791,7 @@ mod tests {
         match decoded.result.unwrap() {
             set_attr_response::Result::Error(e) => {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+                assert_eq!(e.message, "permission denied");
             }
             _ => panic!("wrong result variant"),
         }
@@ -802,6 +826,7 @@ mod tests {
         match decoded.result.unwrap() {
             read_response::Result::Error(e) => {
                 assert_eq!(e.code, ErrorCode::ErrorStaleHandle as i32);
+                assert_eq!(e.message, "stale handle");
             }
             _ => panic!("wrong result variant"),
         }
@@ -811,8 +836,8 @@ mod tests {
     fn write_commit_round_trip() {
         let msg = WriteCommit {};
         let encoded = msg.encode_to_vec();
-        let decoded = WriteCommit::decode(encoded.as_slice()).unwrap();
-        let _ = decoded;
+        // WriteCommit is an empty protobuf message; encoding/decoding without panic is the invariant.
+        let _decoded = WriteCommit::decode(&encoded[..]).unwrap();
     }
 
     #[test]
@@ -901,6 +926,7 @@ mod tests {
         };
         let encoded = msg.encode_to_vec();
         let decoded = FileDeletedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
         assert_eq!(decoded.handle, b"deleted-handle");
         assert_eq!(decoded.name, "gone.txt");
         assert_eq!(decoded.sequence, 99);
@@ -940,6 +966,7 @@ mod tests {
         };
         let encoded = msg.encode_to_vec();
         let decoded = DirCreatedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
         assert_eq!(decoded.handle, b"new-dir-handle");
         assert_eq!(decoded.name, "subdir");
         assert_eq!(decoded.sequence, 5);
@@ -956,6 +983,7 @@ mod tests {
         };
         let encoded = msg.encode_to_vec();
         let decoded = DirDeletedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
         assert_eq!(decoded.handle, b"removed-dir");
         assert_eq!(decoded.name, "old_subdir");
         assert_eq!(decoded.sequence, 21);
