@@ -4,7 +4,6 @@ use rift_protocol::messages::{FileAttrs, ReaddirEntry};
 use uuid::Uuid;
 
 use crate::client::{ChunkReadResult, MerkleDrillResult};
-
 /// The `RemoteShare` trait is a pure, 1:1 mapping of the network protocol's
 /// capabilities. It speaks in terms of UUID handles and protocol-level operations.
 /// It is the boundary for all network communication.
@@ -30,11 +29,11 @@ pub trait RemoteShare: Send + Sync + 'static {
         chunk_count: u32,
     ) -> anyhow::Result<ChunkReadResult>;
 
-    /// Drills the Merkle tree to get hashes at a specific level.
+    /// Drills the Merkle tree to get children of a specific node.
+    /// `hash`: empty = request root's children, otherwise the hash to query.
     async fn merkle_drill(
         &self,
         handle: Uuid,
-        level: u32,
-        parent_indices: &[u32],
+        hash: &[u8],
     ) -> anyhow::Result<MerkleDrillResult>;
 }

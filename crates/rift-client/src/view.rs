@@ -250,16 +250,19 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         let drill_result = self
             .remote
-            .merkle_drill(handle, 1, &[])
+            .merkle_drill(handle, &[])
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
 
         // Build cumulative byte-start table from actual FastCDC chunk sizes.
-        let mut chunk_starts: Vec<u64> = Vec::with_capacity(drill_result.sizes.len() + 1);
+        // Children that are leaves have length; subtrees don't contribute to chunk sizes.
+        let mut chunk_starts: Vec<u64> = Vec::new();
         let mut acc = 0u64;
-        for &sz in &drill_result.sizes {
-            chunk_starts.push(acc);
-            acc += sz;
+        for child in &drill_result.children {
+            if !child.is_subtree {
+                chunk_starts.push(acc);
+                acc += child.length;
+            }
         }
         chunk_starts.push(acc); // sentinel = total file size
 
@@ -352,7 +355,7 @@ impl<R: RemoteShare> RiftShareView<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ChunkData, ChunkReadResult, MerkleDrillResult};
+    use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
     use async_trait::async_trait;
     use rift_protocol::messages::ReaddirEntry;
     use std::sync::Arc;
@@ -464,8 +467,7 @@ mod tests {
         async fn merkle_drill(
             &self,
             _handle: Uuid,
-            _level: u32,
-            _parent_indices: &[u32],
+            _hash: &[u8],
         ) -> anyhow::Result<MerkleDrillResult> {
             self.merkle_drill_result
                 .lock()
@@ -607,8 +609,13 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![root_hash.to_vec()],
-                sizes: vec![],
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: root_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
             }))
             .await;
         remote
@@ -661,12 +668,12 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![
-                    chunk0_hash.to_vec(),
-                    chunk1_hash.to_vec(),
-                    chunk2_hash.to_vec(),
+                parent_hash: vec![0u8; 32],
+                children: vec![
+                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk2_hash.to_vec(), length: sizes[2], chunk_index: 2 },
                 ],
-                sizes: sizes.clone(),
             }))
             .await;
         remote
@@ -733,6 +740,7 @@ mod tests {
     /// POSIX read(2): a short return at EOF is correct, not an error.
     #[tokio::test]
     async fn read_length_clamped_to_file_end() {
+        let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let root_hash = [0xABu8; 32];
         let sizes = vec![100u64, 200];
@@ -749,8 +757,11 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![[0x10u8; 32].to_vec(), chunk1_hash.to_vec()],
-                sizes: sizes.clone(),
+                parent_hash: vec![0u8; 32],
+                children: vec![
+                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                ],
             }))
             .await;
         // chunk1 has sequential bytes so we can verify the slice position
@@ -818,12 +829,11 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![
-                    chunk0_hash.to_vec(),
-                    chunk1_hash.to_vec(),
-                    chunk2_hash.to_vec(),
+                parent_hash: vec![0u8; 32],
+                children: vec![
+                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
                 ],
-                sizes: sizes.clone(),
             }))
             .await;
         // Simulating a read that spans chunks 0, 1, 2 (whole file).
@@ -900,8 +910,11 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![chunk0_hash.to_vec(), chunk1_hash.to_vec()],
-                sizes: sizes.clone(),
+                parent_hash: vec![0u8; 32],
+                children: vec![
+                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                ],
             }))
             .await;
         // Return 0xBB for the first 10 bytes of chunk 1
@@ -961,8 +974,11 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![chunk0_hash.to_vec(), chunk1_hash.to_vec()],
-                sizes: sizes.clone(),
+                parent_hash: vec![0u8; 32],
+                children: vec![
+                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                ],
             }))
             .await;
         remote
@@ -1038,12 +1054,11 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                hashes: vec![
-                    chunk0_hash.to_vec(),
-                    chunk1_hash.to_vec(),
-                    chunk2_hash.to_vec(),
+                parent_hash: vec![0u8; 32],
+                children: vec![
+                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
+                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
                 ],
-                sizes: sizes.clone(),
             }))
             .await;
         // The fixed code requests only chunk 1; return it regardless of index params.

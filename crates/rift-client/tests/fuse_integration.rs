@@ -120,12 +120,11 @@ impl RemoteShare for MockRemoteShare {
     async fn merkle_drill(
         &self,
         _handle: Uuid,
-        _level: u32,
-        _subtrees: &[u32],
+        _hash: &[u8],
     ) -> anyhow::Result<MerkleDrillResult> {
         Ok(MerkleDrillResult {
-            hashes: vec![],
-            sizes: vec![],
+            parent_hash: vec![],
+            children: vec![],
         })
     }
 }

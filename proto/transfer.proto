@@ -55,21 +55,32 @@ message WriteSuccess {
   bytes handle   = 2;
 }
 
-// MERKLE_DRILL (0x50)
+// MERKLE_DRILL (0x50) — hash-based tree traversal
 message MerkleDrill {
-  bytes           handle   = 1;
-  uint32          level    = 2;
-  repeated uint32 subtrees = 3;
+  bytes handle = 1;
+  bytes hash    = 2;  // empty = request root's children
 }
 
-// MERKLE_LEVEL_RESPONSE (0x51)
-message MerkleLevelResponse {
-  uint32          level         = 1;
-  repeated bytes  hashes        = 2;
-  repeated uint64 subtree_bytes = 3;
+// MERKLE_DRILL_RESPONSE (0x51)
+message MerkleDrillResponse {
+  bytes parent_hash              = 1;
+  repeated MerkleChildProto children = 2;
 }
 
-// MERKLE_LEAVES_RESPONSE (0x52)
+// Merkle child types for drill response
+enum MerkleChildType {
+  MERKLE_CHILD_SUBTREE = 0;
+  MERKLE_CHILD_LEAF    = 1;
+}
+
+message MerkleChildProto {
+  MerkleChildType child_type  = 1;
+  bytes           hash        = 2;
+  uint64          length      = 3;  // 0 for Subtree
+  uint32          chunk_index = 4;  // 0 for Subtree
+}
+
+// MERKLE_LEAVES_RESPONSE (0x52) — kept for block-level detail queries
 message MerkleLeavesResponse {
   repeated SubtreeLeaves subtrees = 1;
 }
