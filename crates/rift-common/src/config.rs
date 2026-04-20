@@ -113,15 +113,17 @@ mod tests {
 
     #[test]
     fn test_share_permission_debug_is_non_empty() {
-        let perm = SharePermission { access: AccessLevel::ReadOnly };
-        assert!(format!("{:?}", perm).len() > 0);
+        let s = format!("{:?}", SharePermission { access: AccessLevel::ReadOnly });
+        assert!(s.contains("ReadOnly"), "Debug output should contain variant name, got: {s}");
     }
 
     #[test]
     fn test_access_level_partial_eq() {
-        assert_ne!(AccessLevel::ReadOnly, AccessLevel::ReadWrite);
-        assert_eq!(AccessLevel::ReadOnly, AccessLevel::ReadOnly);
-        assert_eq!(AccessLevel::ReadWrite, AccessLevel::ReadWrite);
+        // SharePermission deserialized from TOML without an explicit `access` field
+        // must default to ReadWrite via #[serde(default)] on the field.
+        let perm: SharePermission = toml::from_str("").unwrap();
+        assert_eq!(perm.access, AccessLevel::ReadWrite,
+            "SharePermission without explicit access field should default to ReadWrite");
     }
 
     #[test]
