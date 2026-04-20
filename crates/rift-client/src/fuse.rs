@@ -210,6 +210,48 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
 mod tests {
     use super::*;
     use rift_protocol::messages::FileType;
+    use async_trait::async_trait;
+    use crate::view::{DirEntry, ShareView};
+    use rift_common::FsError;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Minimal no-op view used to test RiftFilesystem construction without a real FUSE mount.
+    struct MinimalView;
+
+    #[async_trait]
+    impl ShareView for MinimalView {
+        async fn getattr(&self, _path: &Path) -> Result<FileAttrs, FsError> {
+            Err(FsError::NotFound)
+        }
+        async fn lookup(&self, _parent: &Path, _name: &str) -> Result<FileAttrs, FsError> {
+            Err(FsError::NotFound)
+        }
+        async fn readdir(&self, _path: &Path) -> Result<Vec<DirEntry>, FsError> {
+            Err(FsError::NotFound)
+        }
+        async fn read(
+            &self,
+            _path: &Path,
+            _offset: u64,
+            _length: u64,
+            _cached_root_hash: Option<&[u8]>,
+        ) -> Result<Vec<u8>, FsError> {
+            Err(FsError::NotFound)
+        }
+    }
+
+    /// Verify that RiftFilesystem::new does not panic and accepts any ShareView.
+    ///
+    /// NOTE: The fuse3 trait methods (getattr, lookup, readdir, read, opendir, etc.)
+    /// require a real FUSE mount to be invoked — they are tested end-to-end in
+    /// tests/fuse_integration.rs (Linux only).
+    #[test]
+    fn new_creates_filesystem() {
+        let view = Arc::new(MinimalView);
+        let _fs = RiftFilesystem::new(view);
+        // Successful construction: no panic, no assertion needed.
+    }
 
     #[test]
     fn proto_to_fuse3_attr_directory() {
@@ -245,6 +287,68 @@ mod tests {
         };
         let attr = proto_to_fuse3_attr(&attrs);
         assert!(matches!(attr.kind, Fuse3FileType::RegularFile));
+    }
+
+    /// blocks must be size rounded UP to the nearest 512-byte boundary.
+    #[test]
+    fn proto_to_fuse3_attr_blocks_round_up_to_512() {
+        // 0 bytes → 0 blocks
+        let attrs = FileAttrs { size: 0, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 0);
+
+        // exactly 512 bytes → 1 block
+        let attrs = FileAttrs { size: 512, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 1);
+
+        // 513 bytes → 2 blocks (rounds up)
+        let attrs = FileAttrs { size: 513, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 2);
+
+        // 1 byte → 1 block (rounds up)
+        let attrs = FileAttrs { size: 1, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 1);
+    }
+
+    /// nlinks == 0 in the proto must be coerced to 1 (POSIX minimum for a file).
+    #[test]
+    fn proto_to_fuse3_attr_nlinks_zero_coerced_to_one() {
+        let attrs = FileAttrs { nlinks: 0, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).nlink, 1);
+    }
+
+    /// Only the lower 12 bits of mode (rwxrwxrwx + setuid/setgid/sticky) are
+    /// passed through; any higher bits are masked out.
+    #[test]
+    fn proto_to_fuse3_attr_mode_masked_to_12_bits() {
+        let attrs = FileAttrs { mode: 0o10_0755, ..Default::default() }; // S_IFREG | 0755
+        let perm = proto_to_fuse3_attr(&attrs).perm;
+        assert_eq!(perm, 0o755, "upper bits above 0o7777 must be stripped");
+
+        let attrs = FileAttrs { mode: 0o644, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).perm, 0o644);
+    }
+
+    /// When a valid mtime is provided the FUSE attr's atime/mtime/ctime must
+    /// all equal that timestamp (Rift currently aliases them all to mtime).
+    #[test]
+    fn proto_to_fuse3_attr_mtime_propagated_to_all_time_fields() {
+        use prost_types::Timestamp;
+        let ts = Timestamp { seconds: 1_700_000_000, nanos: 123_000_000 };
+        let attrs = FileAttrs { mtime: Some(ts), ..Default::default() };
+        let fa = proto_to_fuse3_attr(&attrs);
+        // All three time fields must be equal (all derived from mtime).
+        assert_eq!(fa.atime, fa.mtime);
+        assert_eq!(fa.ctime, fa.mtime);
+        // The timestamp must be later than UNIX_EPOCH.
+        assert!(fa.mtime > std::time::UNIX_EPOCH, "mtime must be after epoch");
+    }
+
+    /// When mtime is absent (proto field not set) the conversion must fall back
+    /// to UNIX_EPOCH rather than panicking.
+    #[test]
+    fn proto_to_fuse3_attr_absent_mtime_falls_back_to_epoch() {
+        let attrs = FileAttrs { mtime: None, ..Default::default() };
+        assert_eq!(proto_to_fuse3_attr(&attrs).mtime, std::time::UNIX_EPOCH);
     }
 
     #[test]
