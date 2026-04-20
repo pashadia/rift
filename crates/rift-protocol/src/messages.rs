@@ -515,6 +515,466 @@ mod tests {
         assert_eq!(decoded.attrs.unwrap().size, 2048);
     }
 
+    // --- Mutation operations ---
+
+    #[test]
+    fn mkdir_request_round_trip() {
+        let msg = MkdirRequest {
+            parent_handle: b"parent-dir".to_vec(),
+            name: "new_dir".to_string(),
+            mode: 0o755,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = MkdirRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
+        assert_eq!(decoded.name, "new_dir");
+        assert_eq!(decoded.mode, 0o755);
+    }
+
+    #[test]
+    fn mkdir_response_success() {
+        let msg = MkdirResponse {
+            result: Some(mkdir_response::Result::Entry(LookupResult {
+                handle: b"new-dir-handle".to_vec(),
+                attrs: Some(FileAttrs {
+                    file_type: FileType::Directory as i32,
+                    size: 0,
+                    mtime: None,
+                    mode: 0o755,
+                    uid: 1000,
+                    gid: 1000,
+                    nlinks: 2,
+                    root_hash: vec![],
+                }),
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = MkdirResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            mkdir_response::Result::Entry(e) => {
+                assert_eq!(e.handle, b"new-dir-handle");
+                assert_eq!(e.attrs.unwrap().file_type, FileType::Directory as i32);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn mkdir_response_error() {
+        let msg = MkdirResponse {
+            result: Some(mkdir_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorPermissionDenied as i32,
+                message: "permission denied".to_string(),
+                metadata: None,
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = MkdirResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            mkdir_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+                assert_eq!(e.message, "permission denied");
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn unlink_request_round_trip() {
+        let msg = UnlinkRequest {
+            parent_handle: b"parent-dir".to_vec(),
+            name: "file.txt".to_string(),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = UnlinkRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
+        assert_eq!(decoded.name, "file.txt");
+    }
+
+    #[test]
+    fn unlink_response_success() {
+        let msg = UnlinkResponse {
+            result: Some(unlink_response::Result::Ok(())),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = UnlinkResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            unlink_response::Result::Ok(()) => {}
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn unlink_response_error() {
+        let msg = UnlinkResponse {
+            result: Some(unlink_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorPermissionDenied as i32,
+                message: "permission denied".to_string(),
+                metadata: None,
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = UnlinkResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            unlink_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn rmdir_request_round_trip() {
+        let msg = RmdirRequest {
+            parent_handle: b"parent-dir".to_vec(),
+            name: "empty_dir".to_string(),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = RmdirRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
+        assert_eq!(decoded.name, "empty_dir");
+    }
+
+    #[test]
+    fn rmdir_response_success() {
+        let msg = RmdirResponse {
+            result: Some(rmdir_response::Result::Ok(())),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = RmdirResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            rmdir_response::Result::Ok(()) => {}
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn rmdir_response_error() {
+        let msg = RmdirResponse {
+            result: Some(rmdir_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorNotEmpty as i32,
+                message: "directory not empty".to_string(),
+                metadata: None,
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = RmdirResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            rmdir_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorNotEmpty as i32);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn rename_request_round_trip() {
+        let msg = RenameRequest {
+            old_parent_handle: b"src-dir".to_vec(),
+            old_name: "old_name.txt".to_string(),
+            new_parent_handle: b"dst-dir".to_vec(),
+            new_name: "new_name.txt".to_string(),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = RenameRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.old_parent_handle, b"src-dir");
+        assert_eq!(decoded.old_name, "old_name.txt");
+        assert_eq!(decoded.new_parent_handle, b"dst-dir");
+        assert_eq!(decoded.new_name, "new_name.txt");
+    }
+
+    #[test]
+    fn rename_response_success() {
+        let msg = RenameResponse {
+            result: Some(rename_response::Result::Ok(())),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = RenameResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            rename_response::Result::Ok(()) => {}
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn rename_response_error() {
+        let msg = RenameResponse {
+            result: Some(rename_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorPermissionDenied as i32,
+                message: "permission denied".to_string(),
+                metadata: None,
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = RenameResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            rename_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn setattr_request_round_trip() {
+        let msg = SetAttrRequest {
+            handle: b"file-handle".to_vec(),
+            mode: Some(0o600),
+            mtime: None,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = SetAttrRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.handle, b"file-handle");
+        assert_eq!(decoded.mode, Some(0o600));
+        assert!(decoded.mtime.is_none());
+    }
+
+    #[test]
+    fn setattr_response_success() {
+        let msg = SetAttrResponse {
+            result: Some(set_attr_response::Result::Attrs(FileAttrs {
+                file_type: FileType::Regular as i32,
+                size: 512,
+                mtime: None,
+                mode: 0o600,
+                uid: 1000,
+                gid: 1000,
+                nlinks: 1,
+                root_hash: vec![],
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = SetAttrResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            set_attr_response::Result::Attrs(a) => {
+                assert_eq!(a.mode, 0o600);
+                assert_eq!(a.size, 512);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn setattr_response_error() {
+        let msg = SetAttrResponse {
+            result: Some(set_attr_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorPermissionDenied as i32,
+                message: "permission denied".to_string(),
+                metadata: None,
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = SetAttrResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            set_attr_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    // --- Read/write transfer ---
+
+    #[test]
+    fn read_response_success() {
+        let msg = ReadResponse {
+            result: Some(read_response::Result::Ok(ReadSuccess { chunk_count: 8 })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = ReadResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            read_response::Result::Ok(s) => assert_eq!(s.chunk_count, 8),
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn read_response_error() {
+        let msg = ReadResponse {
+            result: Some(read_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorStaleHandle as i32,
+                message: "stale handle".to_string(),
+                metadata: None,
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = ReadResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            read_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorStaleHandle as i32);
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn write_commit_round_trip() {
+        let msg = WriteCommit {};
+        let encoded = msg.encode_to_vec();
+        let decoded = WriteCommit::decode(encoded.as_slice()).unwrap();
+        let _ = decoded;
+    }
+
+    #[test]
+    fn write_response_success() {
+        let msg = WriteResponse {
+            result: Some(write_response::Result::Ok(WriteSuccess {
+                new_root: vec![0xDE; 32],
+                handle: b"file-handle".to_vec(),
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = WriteResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            write_response::Result::Ok(s) => {
+                assert_eq!(s.new_root, vec![0xDE; 32]);
+                assert_eq!(s.handle, b"file-handle");
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    #[test]
+    fn write_response_error() {
+        let msg = WriteResponse {
+            result: Some(write_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorConflict as i32,
+                message: "conflict".to_string(),
+                metadata: Some(error_detail::Metadata::Conflict(ConflictMetadata {
+                    server_root: vec![0xAB; 32],
+                })),
+            })),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = WriteResponse::decode(encoded.as_slice()).unwrap();
+        match decoded.result.unwrap() {
+            write_response::Result::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ErrorConflict as i32);
+                match e.metadata.unwrap() {
+                    error_detail::Metadata::Conflict(m) => {
+                        assert_eq!(m.server_root, vec![0xAB; 32]);
+                    }
+                    _ => panic!("wrong metadata variant"),
+                }
+            }
+            _ => panic!("wrong result variant"),
+        }
+    }
+
+    // --- Notifications ---
+
+    #[test]
+    fn file_created_notification_round_trip() {
+        let msg = FileCreatedNotification {
+            parent_handle: b"parent-dir".to_vec(),
+            handle: b"new-file-handle".to_vec(),
+            name: "created.txt".to_string(),
+            attrs: Some(FileAttrs {
+                file_type: FileType::Regular as i32,
+                size: 0,
+                mtime: None,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                nlinks: 1,
+                root_hash: vec![],
+            }),
+            root_hash: vec![0xAA; 32],
+            sequence: 7,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = FileCreatedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_handle, b"parent-dir");
+        assert_eq!(decoded.handle, b"new-file-handle");
+        assert_eq!(decoded.name, "created.txt");
+        assert_eq!(decoded.root_hash, vec![0xAA; 32]);
+        assert_eq!(decoded.sequence, 7);
+    }
+
+    #[test]
+    fn file_deleted_notification_round_trip() {
+        let msg = FileDeletedNotification {
+            parent_handle: b"parent-dir".to_vec(),
+            handle: b"deleted-handle".to_vec(),
+            name: "gone.txt".to_string(),
+            sequence: 99,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = FileDeletedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.handle, b"deleted-handle");
+        assert_eq!(decoded.name, "gone.txt");
+        assert_eq!(decoded.sequence, 99);
+    }
+
+    #[test]
+    fn file_renamed_notification_round_trip() {
+        let msg = FileRenamedNotification {
+            old_handle: b"old-handle".to_vec(),
+            new_handle: b"new-handle".to_vec(),
+            sequence: 13,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = FileRenamedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.old_handle, b"old-handle");
+        assert_eq!(decoded.new_handle, b"new-handle");
+        assert_eq!(decoded.sequence, 13);
+    }
+
+    #[test]
+    fn dir_created_notification_round_trip() {
+        let msg = DirCreatedNotification {
+            parent_handle: b"parent-dir".to_vec(),
+            handle: b"new-dir-handle".to_vec(),
+            name: "subdir".to_string(),
+            attrs: Some(FileAttrs {
+                file_type: FileType::Directory as i32,
+                size: 0,
+                mtime: None,
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                nlinks: 2,
+                root_hash: vec![],
+            }),
+            sequence: 5,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = DirCreatedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.handle, b"new-dir-handle");
+        assert_eq!(decoded.name, "subdir");
+        assert_eq!(decoded.sequence, 5);
+        assert_eq!(decoded.attrs.unwrap().file_type, FileType::Directory as i32);
+    }
+
+    #[test]
+    fn dir_deleted_notification_round_trip() {
+        let msg = DirDeletedNotification {
+            parent_handle: b"parent-dir".to_vec(),
+            handle: b"removed-dir".to_vec(),
+            name: "old_subdir".to_string(),
+            sequence: 21,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = DirDeletedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.handle, b"removed-dir");
+        assert_eq!(decoded.name, "old_subdir");
+        assert_eq!(decoded.sequence, 21);
+    }
+
+    #[test]
+    fn dir_renamed_notification_round_trip() {
+        let msg = DirRenamedNotification {
+            old_handle: b"old-dir-handle".to_vec(),
+            new_handle: b"new-dir-handle".to_vec(),
+            sequence: 34,
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = DirRenamedNotification::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.old_handle, b"old-dir-handle");
+        assert_eq!(decoded.new_handle, b"new-dir-handle");
+        assert_eq!(decoded.sequence, 34);
+    }
+
     // --- Type ID constants sanity check ---
 
     #[test]
