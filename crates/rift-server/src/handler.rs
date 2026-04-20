@@ -15,11 +15,11 @@ use tracing::instrument;
 
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
-    lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
-    ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
-    MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry,
-    ReaddirRequest, ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult,
-    TransferComplete,
+    lookup_response, mkdir_response, msg, read_response, readdir_response, stat_result,
+    BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest,
+    LookupResponse, LookupResult, MerkleDrill, MerkleLevelResponse, MkdirRequest, MkdirResponse,
+    ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest, ReaddirResponse,
+    ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
 };
 use rift_transport::RiftStream;
 
@@ -347,6 +347,23 @@ pub async fn readdir_response(
     }
 }
 
+/// Handle a `MkdirRequest`: create a directory (NOT IMPLEMENTED).
+///
+/// Returns an error response with ErrorUnsupported.
+#[instrument(skip(payload, share, _handle_db), fields(share = %share.display()), level = "debug")]
+pub async fn mkdir_response(
+    payload: &[u8],
+    share: &Path,
+    _handle_db: &HandleDatabase,
+) -> MkdirResponse {
+    let _req = match MkdirRequest::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return mkdir_error(ErrorCode::ErrorUnsupported),
+    };
+
+    mkdir_error(ErrorCode::ErrorUnsupported)
+}
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -405,6 +422,12 @@ fn lookup_error(code: ErrorCode) -> LookupResponse {
 fn readdir_error(code: ErrorCode) -> ReaddirResponse {
     ReaddirResponse {
         result: Some(readdir_response::Result::Error(error_detail(code))),
+    }
+}
+
+fn mkdir_error(code: ErrorCode) -> MkdirResponse {
+    MkdirResponse {
+        result: Some(mkdir_response::Result::Error(error_detail(code))),
     }
 }
 

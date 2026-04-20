@@ -240,6 +240,14 @@ async fn handle_stream(
             stream.finish_send().await?;
         }
 
+        msg::MKDIR_REQUEST => {
+            let response = handler::mkdir_response(&payload, &share, &handle_db).await;
+            stream
+                .send_frame(msg::MKDIR_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
         // ------------------------------------------------------------------
         // Data operations
         // ------------------------------------------------------------------
