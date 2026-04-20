@@ -373,6 +373,67 @@ mod proptests {
 }
 
 // ---------------------------------------------------------------------------
+// Tests for MerkleChild enum (bincode serialization)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod merkle_child_tests {
+    use super::*;
+
+    #[test]
+    fn merkle_child_subtree_roundtrip() {
+        let hash = Blake3Hash::new(b"subtree data");
+        let child = MerkleChild::Subtree(hash.clone());
+        let encoded = bincode::serialize(&child).unwrap();
+        let decoded: MerkleChild = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded, child);
+    }
+
+    #[test]
+    fn merkle_child_leaf_roundtrip() {
+        let hash = Blake3Hash::new(b"leaf data");
+        let child = MerkleChild::Leaf {
+            hash: hash.clone(),
+            length: 65536,
+            chunk_index: 42,
+        };
+        let encoded = bincode::serialize(&child).unwrap();
+        let decoded: MerkleChild = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded, child);
+    }
+
+    #[test]
+    fn merkle_child_deterministic_serialization() {
+        let hash = Blake3Hash::new(b"deterministic");
+        let child1 = MerkleChild::Subtree(hash.clone());
+        let child2 = MerkleChild::Subtree(hash.clone());
+        let enc1 = bincode::serialize(&child1).unwrap();
+        let enc2 = bincode::serialize(&child2).unwrap();
+        assert_eq!(enc1, enc2);
+    }
+
+    #[test]
+    fn merkle_child_leaf_preserves_all_fields() {
+        let hash = Blake3Hash::new(b"chunk");
+        let child = MerkleChild::Leaf {
+            hash: hash.clone(),
+            length: 131072,
+            chunk_index: 7,
+        };
+        let encoded = bincode::serialize(&child).unwrap();
+        let decoded: MerkleChild = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            MerkleChild::Leaf { hash: h, length, chunk_index } => {
+                assert_eq!(h, hash);
+                assert_eq!(length, 131072);
+                assert_eq!(chunk_index, 7);
+            }
+            MerkleChild::Subtree(_) => panic!("expected Leaf variant"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests for Merkle tree extensions (serialization, root_hash support)
 // ---------------------------------------------------------------------------
 

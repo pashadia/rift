@@ -14,6 +14,7 @@ serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+bincode = "1"
 libc = "0.2"
 uuid.workspace = true
 scc.workspace = true
