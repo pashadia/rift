@@ -711,6 +711,42 @@ pub async fn merkle_drill_response<S: RiftStream>(
         }
     };
 
+    // Try cache first (mtime+size fast-path)
+    if let Some(database) = db {
+        if let Ok(Some(entry)) = database.get_merkle(&canonical).await {
+            // Cache hit - return based on requested level
+            let (hashes, subtree_bytes) = match req.level {
+                0 => (
+                    vec![entry.root.as_bytes().to_vec()],
+                    vec![0u64], // root has no subtree bytes
+                ),
+                1 => {
+                    let hashes: Vec<Vec<u8>> = entry
+                        .leaf_hashes
+                        .iter()
+                        .map(|h| h.as_bytes().to_vec())
+                        .collect();
+                    let subtree_bytes: Vec<u64> = vec![0u64; hashes.len()];
+                    (hashes, subtree_bytes)
+                }
+                _ => {
+                    // For higher levels, compute from cached leaves
+                    (vec![vec![]], vec![0u64])
+                }
+            };
+            let response = MerkleLevelResponse {
+                level: req.level,
+                hashes,
+                subtree_bytes,
+            };
+            stream
+                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    }
+
     let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
         Err(_) => {

@@ -1690,6 +1690,205 @@ async fn server_computes_root_hash_when_cache_miss() {
     assert_eq!(attrs.root_hash.len(), 32);
 }
 
+#[tokio::test]
+async fn server_merkle_drill_returns_cached_root_when_cached() {
+    use rift_common::crypto::Blake3Hash;
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, MerkleDrill};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+    let file_path = root.join("hello.txt");
+    std::fs::write(&file_path, b"hello rift").unwrap();
+    let file_path = tokio::fs::canonicalize(&file_path).await.unwrap();
+
+    // Pre-populate the cache with known values
+    let db = Database::open_in_memory().await.unwrap();
+    let cached_root = Blake3Hash::new(b"my-cached-root-hash");
+    let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+    db.put_merkle(
+        &file_path,
+        helpers_with_db::file_mtime_ns(&file_path),
+        helpers_with_db::file_size(&file_path),
+        &cached_root,
+        &leaf_hashes,
+    )
+    .await
+    .unwrap();
+
+    let server_db = Arc::new(Some(db));
+    let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup the file to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Request MERKLE_DRILL level 0 (root hash) - should use cache
+    let mut stream = conn.open_stream().await.unwrap();
+    let merkle_req = MerkleDrill {
+        handle: file_handle,
+        level: 0,
+        subtrees: vec![],
+    };
+    stream
+        .send_frame(msg::MERKLE_DRILL, &merkle_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let frame = stream.recv_frame().await.unwrap().unwrap();
+    let (_, payload) = frame;
+    let response = rift_protocol::messages::MerkleLevelResponse::decode(&payload[..]).unwrap();
+
+    // Verify we got the cached root hash
+    assert_eq!(response.level, 0);
+    assert_eq!(response.hashes.len(), 1);
+    assert_eq!(response.hashes[0], cached_root.as_bytes());
+}
+
+#[tokio::test]
+async fn server_merkle_drill_returns_cached_leaves_when_cached() {
+    use rift_common::crypto::Blake3Hash;
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, MerkleDrill};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+    let file_path = root.join("hello.txt");
+    std::fs::write(&file_path, b"hello rift").unwrap();
+    let file_path = tokio::fs::canonicalize(&file_path).await.unwrap();
+
+    // Pre-populate the cache with known leaf hashes
+    let db = Database::open_in_memory().await.unwrap();
+    let cached_root = Blake3Hash::new(b"root");
+    let leaf_hashes = vec![
+        Blake3Hash::new(b"leafchunk1"),
+        Blake3Hash::new(b"leafchunk2"),
+    ];
+    db.put_merkle(
+        &file_path,
+        helpers_with_db::file_mtime_ns(&file_path),
+        helpers_with_db::file_size(&file_path),
+        &cached_root,
+        &leaf_hashes,
+    )
+    .await
+    .unwrap();
+
+    let server_db = Arc::new(Some(db));
+    let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup the file to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Request MERKLE_DRILL level 1 (leaf hashes) - should use cache
+    let mut stream = conn.open_stream().await.unwrap();
+    let merkle_req = MerkleDrill {
+        handle: file_handle,
+        level: 1,
+        subtrees: vec![],
+    };
+    stream
+        .send_frame(msg::MERKLE_DRILL, &merkle_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let frame = stream.recv_frame().await.unwrap().unwrap();
+    let (_, payload) = frame;
+    let response = rift_protocol::messages::MerkleLevelResponse::decode(&payload[..]).unwrap();
+
+    // Verify we got the cached leaf hashes
+    assert_eq!(response.level, 1);
+    assert_eq!(response.hashes.len(), 2);
+    assert_eq!(response.hashes[0], leaf_hashes[0].as_bytes());
+    assert_eq!(response.hashes[1], leaf_hashes[1].as_bytes());
+}
+
+#[tokio::test]
+async fn server_merkle_drill_computes_fresh_when_not_cached() {
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, MerkleDrill};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+    std::fs::write(root.join("hello.txt"), b"hello rift").unwrap();
+
+    // No cache pre-populated - should compute fresh
+    let db = Database::open_in_memory().await.unwrap();
+    let server_db = Arc::new(Some(db));
+    let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup the file to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Request MERKLE_DRILL level 0 - should compute fresh
+    let mut stream = conn.open_stream().await.unwrap();
+    let merkle_req = MerkleDrill {
+        handle: file_handle,
+        level: 0,
+        subtrees: vec![],
+    };
+    stream
+        .send_frame(msg::MERKLE_DRILL, &merkle_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let frame = stream.recv_frame().await.unwrap().unwrap();
+    let (_, payload) = frame;
+    let response = rift_protocol::messages::MerkleLevelResponse::decode(&payload[..]).unwrap();
+
+    // Verify computed fresh (32-byte hash)
+    assert_eq!(response.level, 0);
+    assert_eq!(response.hashes.len(), 1);
+    assert_eq!(response.hashes[0].len(), 32);
+}
+
 // ---------------------------------------------------------------------------
 // READ integration tests
 // ---------------------------------------------------------------------------
