@@ -844,3 +844,38 @@ async fn client_cache_persists_across_sessions() {
         .unwrap();
     assert_eq!(loaded_chunk, Some(b"hello rift".to_vec()));
 }
+
+// ---------------------------------------------------------------------------
+// Discover and Whoami
+// ---------------------------------------------------------------------------
+
+/// Client sends DiscoverRequest and receives list of available shares
+#[tokio::test]
+async fn client_discover_returns_share_list() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .expect("connect failed");
+
+    let shares = client.discover().await.expect("discover failed");
+    assert_eq!(shares.len(), 1, "discover should return exactly one share");
+    assert_eq!(shares[0].name, "demo", "share should be named 'demo'");
+    assert!(shares[0].is_public, "demo share should be public");
+}
+
+/// Client sends WhoamiRequest and receives its identity info
+#[tokio::test]
+async fn client_whoami_returns_identity() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let client = rift_client::client::RiftClient::connect(addr, "demo")
+        .await
+        .expect("connect failed");
+
+    let identity = client.whoami().await.expect("whoami failed");
+    assert!(
+        !identity.fingerprint.is_empty(),
+        "whoami should return a fingerprint"
+    );
+}

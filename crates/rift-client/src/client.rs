@@ -38,7 +38,7 @@ use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ErrorCode,
     FileAttrs, LookupRequest, LookupResponse, MerkleDrill, MerkleLevelResponse, ReadRequest,
     ReadResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
-    TransferComplete,
+    TransferComplete, DiscoverRequest, DiscoverResponse, WhoamiRequest, WhoamiResponse,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
@@ -202,6 +202,9 @@ pub struct ChunkData {
     pub hash: [u8; 32],
     pub data: Vec<u8>,
 }
+
+/// A share returned by DiscoverResponse.
+pub type DiscoverResponseShare = rift_protocol::messages::discover_response::Share;
 
 /// Type alias for a RiftClient backed by a real QUIC connection.
 pub type DefaultRiftClient = RiftClient<QuicConnection>;
@@ -788,6 +791,62 @@ impl RiftClient<QuicConnection> {
         })?;
 
         let response = MerkleLevelResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
+
+        Ok(response)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Discover and Whoami
+    // ---------------------------------------------------------------------------
+
+    /// Request the list of shares available to this client.
+    ///
+    /// Used to discover what shares the client is authorized to access.
+    pub async fn discover(&self) -> Result<Vec<DiscoverResponseShare>> {
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("discover: open stream: {e}"))?;
+
+        let req = DiscoverRequest {};
+        stream
+            .send_frame(msg::DISCOVER_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        let (_, payload) = stream.recv_frame().await?.ok_or_else(|| {
+            anyhow::anyhow!("discover: server closed stream without response")
+        })?;
+
+        let response =
+            DiscoverResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
+
+        Ok(response.shares)
+    }
+
+    /// Request the client's own identity as known to the server.
+    ///
+    /// Returns the client's TLS certificate fingerprint, the server-assigned
+    /// common name (if any), and the list of available shares.
+    pub async fn whoami(&self) -> Result<WhoamiResponse> {
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("whoami: open stream: {e}"))?;
+
+        let req = WhoamiRequest {};
+        stream
+            .send_frame(msg::WHOAMI_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        let (_, payload) = stream.recv_frame().await?.ok_or_else(|| {
+            anyhow::anyhow!("whoami: server closed stream without response")
+        })?;
+
+        let response = WhoamiResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
 
         Ok(response)
     }

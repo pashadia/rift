@@ -19,6 +19,8 @@ pub mod msg {
     pub const RIFT_WELCOME: u8 = 0x02;
     pub const WHOAMI_REQUEST: u8 = 0x03;
     pub const WHOAMI_RESPONSE: u8 = 0x04;
+    pub const DISCOVER_REQUEST: u8 = 0x05;
+    pub const DISCOVER_RESPONSE: u8 = 0x06;
 
     // Metadata operations
     pub const LOOKUP_REQUEST: u8 = 0x10;

@@ -16,6 +16,19 @@ message WhoamiResponse {
   repeated ShareInfo available_shares = 3;
 }
 
+message DiscoverRequest {}
+
+message DiscoverResponse {
+  message Share {
+    string name        = 1;
+    string description = 2;
+    bool   read_only   = 3;
+    bool   is_public   = 4;
+  }
+
+  repeated Share shares = 1;
+}
+
 message RiftHello {
   uint32              protocol_version = 1;
   repeated Capability capabilities     = 2;

@@ -327,8 +327,8 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - [ ] Load server config (`/etc/rift/config.toml`)
 - [ ] Load permission files (`/etc/rift/permissions/*.allow`)
 - [ ] Authorization logic (check fingerprint against permissions)
-- [ ] Handle DiscoverRequest (list authorized shares)
-- [ ] Handle WhoamiRequest (return identity info)
+- [x] Handle DiscoverRequest (list authorized shares)
+- [x] Handle WhoamiRequest (return identity info)
 - [ ] Connection logging (in-memory + persistent JSONL)
 - [x] Share management (map share names to filesystem paths)
 - [ ] File handle generation (encrypted paths)
@@ -364,8 +364,8 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - [x] Connect to server (QUIC + TLS)
 - [x] Send RiftHello, receive RiftWelcome
 - [ ] Verify server cert (CA validation or TOFU prompt)
-- [ ] Send DiscoverRequest, parse response
-- [ ] Send WhoamiRequest, parse response
+- [x] Send DiscoverRequest, parse response
+- [x] Send WhoamiRequest, parse response
 - [x] High-level API (stat, lookup, readdir, read_chunks, merkle_drill)
 - [ ] Session management (connection pooling)
 - [ ] File handle caching (reuse across operations)

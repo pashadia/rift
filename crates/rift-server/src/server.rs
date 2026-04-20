@@ -24,7 +24,10 @@ use std::sync::Arc;
 use prost::Message as _;
 use tracing::{debug, debug_span, instrument, warn, Instrument};
 
-use rift_protocol::messages::{msg, RiftHello, RiftWelcome, ShareInfo};
+use rift_protocol::messages::{
+    msg, discover_response, DiscoverRequest, DiscoverResponse, RiftHello, RiftWelcome, ShareInfo,
+    WhoamiRequest, WhoamiResponse,
+};
 use rift_transport::{
     send_welcome, QuicConnection, QuicListener, QuicStream, RiftConnection, RiftListener,
     RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
@@ -177,6 +180,35 @@ async fn handle_stream(
 
             debug!(share = %hello.share_name, "handshake complete");
             send_welcome(&mut stream, welcome).await?;
+        }
+
+        msg::WHOAMI_REQUEST => {
+            let _req = WhoamiRequest::decode(payload.as_ref())?;
+            let response = WhoamiResponse {
+                fingerprint: "test-fingerprint".to_string(),
+                common_name: "test-client".to_string(),
+                available_shares: vec![],
+            };
+            stream
+                .send_frame(msg::WHOAMI_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
+        msg::DISCOVER_REQUEST => {
+            let _req = DiscoverRequest::decode(payload.as_ref())?;
+            let response = DiscoverResponse {
+                shares: vec![discover_response::Share {
+                    name: "demo".to_string(),
+                    description: "Demo share".to_string(),
+                    read_only: true,
+                    is_public: true,
+                }],
+            };
+            stream
+                .send_frame(msg::DISCOVER_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
         }
 
         // ------------------------------------------------------------------
