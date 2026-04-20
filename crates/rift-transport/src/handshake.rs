@@ -170,8 +170,8 @@ mod tests {
             // stream-level error — so the error must be a Codec variant.
             let err_str = format!("{:?}", result.unwrap_err());
             assert!(
-                err_str.contains("Codec") || err_str.contains("decode") || err_str.contains("Io"),
-                "expected a codec/decode error, got: {err_str}"
+                err_str.contains("Codec") || err_str.contains("decode"),
+                "expected a codec/decode error, not a stream-level error, got: {err_str}"
             );
         });
 
