@@ -194,6 +194,49 @@ mod tests {
     }
 
     #[test]
+    fn test_with_capacity_creates_empty_map() {
+        use std::path::PathBuf;
+        let map = BidirectionalMap::<PathBuf>::with_capacity(10);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_with_capacity_zero_works() {
+        use std::path::PathBuf;
+        let map = BidirectionalMap::<PathBuf>::with_capacity(0);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_is_empty_true_on_new_map() {
+        use std::path::PathBuf;
+        let map = BidirectionalMap::<PathBuf>::new();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_is_empty_false_after_insert() {
+        use std::path::PathBuf;
+        let map = BidirectionalMap::<PathBuf>::new();
+        let handle = Uuid::now_v7();
+        map.insert(handle, PathBuf::from("/tmp/file.txt")).unwrap();
+        assert!(!map.is_empty());
+    }
+
+    #[test]
+    fn test_is_empty_true_after_all_removed() {
+        use std::path::PathBuf;
+        let map = BidirectionalMap::<PathBuf>::new();
+        let handle = Uuid::now_v7();
+        map.insert(handle, PathBuf::from("/tmp/file.txt")).unwrap();
+        assert!(!map.is_empty());
+        map.remove(&handle);
+        assert!(map.is_empty());
+    }
+
+    #[test]
     fn test_insert_sync_rollback_on_partial_failure() {
         let map = BidirectionalMap::<String>::new();
         let handle1 = Uuid::now_v7();

@@ -100,6 +100,38 @@ mod tests {
     }
 
     #[test]
+    fn test_share_permission_read_only() {
+        let perm = SharePermission { access: AccessLevel::ReadOnly };
+        assert_eq!(perm.access, AccessLevel::ReadOnly);
+    }
+
+    #[test]
+    fn test_share_permission_read_write() {
+        let perm = SharePermission { access: AccessLevel::ReadWrite };
+        assert_eq!(perm.access, AccessLevel::ReadWrite);
+    }
+
+    #[test]
+    fn test_share_permission_debug_is_non_empty() {
+        let perm = SharePermission { access: AccessLevel::ReadOnly };
+        assert!(format!("{:?}", perm).len() > 0);
+    }
+
+    #[test]
+    fn test_access_level_partial_eq() {
+        assert_ne!(AccessLevel::ReadOnly, AccessLevel::ReadWrite);
+        assert_eq!(AccessLevel::ReadOnly, AccessLevel::ReadOnly);
+        assert_eq!(AccessLevel::ReadWrite, AccessLevel::ReadWrite);
+    }
+
+    #[test]
+    fn test_share_permission_clone() {
+        let perm = SharePermission { access: AccessLevel::ReadOnly };
+        let cloned = perm.clone();
+        assert_eq!(cloned.access, perm.access);
+    }
+
+    #[test]
     fn test_access_level_default_is_read_write() {
         assert_eq!(AccessLevel::default(), AccessLevel::ReadWrite);
     }
