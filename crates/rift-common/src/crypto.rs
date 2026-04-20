@@ -4,7 +4,7 @@ use blake3::Hasher;
 use fastcdc::v2020::FastCDC;
 
 /// BLAKE3 hash wrapper
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Blake3Hash([u8; 32]);
 
 impl Blake3Hash {
@@ -80,6 +80,32 @@ impl Chunker {
 pub struct MerkleNode {
     pub hash: Blake3Hash,
     pub size: u64,
+}
+
+/// Metadata for a leaf (chunk) in the Merkle tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafInfo {
+    pub hash: Blake3Hash,
+    pub offset: u64,
+    pub length: u64,
+    pub chunk_index: u32,
+}
+
+/// A child node in the hash-based Merkle tree.
+///
+/// Each child is either a subtree reference (intermediate node)
+/// or a leaf (actual chunk with metadata).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MerkleChild {
+    /// Intermediate node — hash points to a subtree whose children
+    /// can be queried with another MerkleDrill.
+    Subtree(Blake3Hash),
+    /// Leaf node — actual chunk with metadata.
+    Leaf {
+        hash: Blake3Hash,
+        length: u64,
+        chunk_index: u32,
+    },
 }
 
 /// Simple 64-ary Merkle tree builder
