@@ -15,12 +15,12 @@ use tracing::instrument;
 
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
-    lookup_response, mkdir_response, msg, read_response, readdir_response, stat_result,
-    unlink_response, BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, FileAttrs, FileType,
-    LookupRequest, LookupResponse, LookupResult, MerkleDrill, MerkleLevelResponse, MkdirRequest,
-    MkdirResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest,
-    ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
-    UnlinkRequest, UnlinkResponse,
+    lookup_response, mkdir_response, msg, read_response, readdir_response, rmdir_response,
+    stat_result, unlink_response, BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, FileAttrs,
+    FileType, LookupRequest, LookupResponse, LookupResult, MerkleDrill, MerkleLevelResponse,
+    MkdirRequest, MkdirResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry,
+    ReaddirRequest, ReaddirResponse, ReaddirSuccess, RmdirRequest, RmdirResponse, StatRequest,
+    StatResponse, StatResult, TransferComplete, UnlinkRequest, UnlinkResponse,
 };
 use rift_transport::RiftStream;
 
@@ -378,6 +378,19 @@ pub async fn unlink_response(
     unlink_error(ErrorCode::ErrorUnsupported)
 }
 
+pub async fn rmdir_response(
+    payload: &[u8],
+    _share: &Path,
+    _handle_db: &HandleDatabase,
+) -> RmdirResponse {
+    let _req = match RmdirRequest::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return rmdir_error(ErrorCode::ErrorUnsupported),
+    };
+
+    rmdir_error(ErrorCode::ErrorUnsupported)
+}
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -448,6 +461,12 @@ fn mkdir_error(code: ErrorCode) -> MkdirResponse {
 fn unlink_error(code: ErrorCode) -> UnlinkResponse {
     UnlinkResponse {
         result: Some(unlink_response::Result::Error(error_detail(code))),
+    }
+}
+
+fn rmdir_error(code: ErrorCode) -> RmdirResponse {
+    RmdirResponse {
+        result: Some(rmdir_response::Result::Error(error_detail(code))),
     }
 }
 

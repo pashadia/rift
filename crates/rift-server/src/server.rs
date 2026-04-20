@@ -256,6 +256,14 @@ async fn handle_stream(
             stream.finish_send().await?;
         }
 
+        msg::RMDIR_REQUEST => {
+            let response = handler::rmdir_response(&payload, &share, &handle_db).await;
+            stream
+                .send_frame(msg::RMDIR_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
         // ------------------------------------------------------------------
         // Data operations
         // ------------------------------------------------------------------

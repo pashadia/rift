@@ -972,3 +972,48 @@ async fn server_unlink_returns_unsupported_error() {
         _ => panic!("expected error result"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// RMDIR stub
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_rmdir_returns_unsupported_error() {
+    use rift_protocol::messages::msg;
+    use rift_transport::{client_endpoint, connect, AcceptAnyPolicy};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+
+    let (cert, key) = helpers::gen_cert("rift-test-client");
+    let ep = client_endpoint(&cert, &key).expect("client_endpoint failed");
+    let conn = connect(&ep, addr, "rift-test-server", AcceptAnyPolicy.into())
+        .await
+        .expect("connect failed");
+
+    let mut ctrl = conn.open_stream().await.expect("open stream failed");
+    let welcome = rift_transport::client_handshake(&mut ctrl, "demo", &[])
+        .await
+        .expect("handshake failed");
+
+    let mut stream = conn.open_stream().await.expect("open stream failed");
+    let rmdir_req = rift_protocol::messages::RmdirRequest {
+        parent_handle: welcome.root_handle.clone(),
+        name: "somedir".to_string(),
+    };
+    stream
+        .send_frame(msg::RMDIR_REQUEST, &rmdir_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
+    assert_eq!(type_id, msg::RMDIR_RESPONSE);
+    let response = rift_protocol::messages::RmdirResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::rmdir_response::Result::Error(e)) => {
+            assert_eq!(e.code, 10, "expected ErrorUnsupported");
+        }
+        _ => panic!("expected error result"),
+    }
+}
