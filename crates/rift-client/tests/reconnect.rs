@@ -67,22 +67,15 @@ async fn reconnecting_client_wraps_existing_client() {
     );
 }
 
-/// After `close_connection_for_test`, the next operation must return `Err`.
-/// The auto-reconnect logic inside `with_reconnect` will attempt retries, but
-/// since there is no reconnect target available for the plain `connect` path
-/// it must eventually surface an error rather than deadlocking.
+/// After `close_connection_for_test`, an operation must complete within a
+/// bounded time — i.e., the client must not hang or deadlock indefinitely.
 ///
-/// To avoid relying on retry timeouts we use `ReconnectingClient::reconnect`
-/// indirectly: calling `close_connection_for_test` marks the connection
-/// closed; subsequent ops that trigger the reconnect machinery reach
-/// `reconnect()` which fails fast because there is no saved server address on
-/// a client created without `connect_with_cert` + persistent paths … *unless*
-/// the client was created with `connect_with_cert`.
-///
-/// We therefore use a persistent-cert client and verify only that an error is
-/// returned promptly (within the 2-second timeout).
+/// Because the server is still running, the `ReconnectingClient` auto-reconnect
+/// machinery will typically succeed. The test therefore only asserts liveness:
+/// `stat_batch` finishes within 10 seconds (whether it succeeds or fails is
+/// irrelevant). What it must NOT do is block forever or panic.
 #[tokio::test]
-async fn reconnecting_client_close_for_test_causes_failure() {
+async fn reconnecting_client_close_for_test_does_not_hang() {
     let (_dir, root) = common::make_share();
     let config_dir = tempfile::tempdir().unwrap();
     let (cert_path, key_path) = write_cert_pair(&config_dir);
@@ -117,11 +110,10 @@ async fn reconnecting_client_close_for_test_causes_failure() {
 
     assert!(
         result.is_ok(),
-        "stat_batch must not block indefinitely after connection is closed"
+        "stat_batch must not block indefinitely after connection is closed (timed out after 10s)"
     );
-    // The result is either Ok (reconnect succeeded) or Err (connection truly gone).
-    // Either is acceptable — what we must NOT see is a panic or a timeout.
-    // Given the server is still running a successful reconnect is also fine.
+    // result.unwrap() is the inner anyhow::Result — Ok or Err both fine;
+    // only a timeout (outer Err) would indicate a hang.
 }
 
 /// After `close_connection_for_test`, explicitly calling `reconnect()` must
