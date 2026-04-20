@@ -902,16 +902,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_unknown_uuid_bytes_returns_error() {
-        // A valid-format UUID that was never registered in the database must
-        // cause resolve() to return an error (exercises the "not found" path).
-        let tmp = TempDir::new().unwrap();
-        let handle_db = HandleDatabase::new();
-        let unknown = Uuid::from_bytes([0xAA; 16]);
-        assert!(resolve(tmp.path(), &unknown, &handle_db).await.is_err());
-    }
-
-    #[tokio::test]
     async fn resolve_unknown_uuid_returns_error() {
         let tmp = TempDir::new().unwrap();
         let handle_db = HandleDatabase::new();
