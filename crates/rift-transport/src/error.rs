@@ -55,34 +55,62 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn transport_error_display_is_non_empty() {
-        let errors: Vec<TransportError> = vec![
-            TransportError::ConnectionClosed,
-            TransportError::StreamClosed,
-            TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, "io test")),
-            TransportError::QuicConnection(quinn::ConnectionError::TimedOut),
-            TransportError::QuicConnection(quinn::ConnectionError::Reset),
-            TransportError::QuicWrite(quinn::WriteError::ClosedStream),
-            TransportError::QuicRead(quinn::ReadError::ClosedStream),
-            TransportError::QuicConnect(quinn::ConnectError::EndpointStopping),
-            TransportError::QuicConnect(quinn::ConnectError::InvalidServerName(
-                "bad name".to_string(),
-            )),
-            TransportError::Codec(rift_protocol::codec::CodecError::InvalidVarint),
-            TransportError::Codec(rift_protocol::codec::CodecError::MessageTooLarge(999)),
-            TransportError::Cert(CertError::NotTrusted {
-                fingerprint: "fp".to_string(),
-            }),
-        ];
+    fn transport_error_display_contains_meaningful_text() {
+        // #[error("connection closed")]
+        assert!(
+            format!("{}", TransportError::ConnectionClosed).contains("connection"),
+            "ConnectionClosed display should mention 'connection'"
+        );
 
-        for err in &errors {
-            let s = format!("{err}");
-            assert!(
-                !s.is_empty(),
-                "Display for {:?} should be non-empty",
-                err
-            );
-        }
+        // #[error("stream closed")]
+        assert!(
+            format!("{}", TransportError::StreamClosed).contains("stream"),
+            "StreamClosed display should mention 'stream'"
+        );
+
+        // #[error("I/O error: {0}")]
+        let io_s = format!(
+            "{}",
+            TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, "io test"))
+        );
+        assert!(io_s.contains("I/O"), "Io display should mention 'I/O', got: {io_s}");
+        assert!(io_s.contains("io test"), "Io display should contain the wrapped message, got: {io_s}");
+
+        // #[error("QUIC connection error: {0}")]
+        let s = format!("{}", TransportError::QuicConnection(quinn::ConnectionError::TimedOut));
+        assert!(s.contains("QUIC") && s.contains("connection"), "QuicConnection display wrong: {s}");
+
+        let s = format!("{}", TransportError::QuicConnection(quinn::ConnectionError::Reset));
+        assert!(s.contains("QUIC") && s.contains("connection"), "QuicConnection(Reset) display wrong: {s}");
+
+        // #[error("QUIC write error: {0}")]
+        let s = format!("{}", TransportError::QuicWrite(quinn::WriteError::ClosedStream));
+        assert!(s.contains("QUIC") && s.contains("write"), "QuicWrite display wrong: {s}");
+
+        // #[error("QUIC read error: {0}")]
+        let s = format!("{}", TransportError::QuicRead(quinn::ReadError::ClosedStream));
+        assert!(s.contains("QUIC") && s.contains("read"), "QuicRead display wrong: {s}");
+
+        // #[error("QUIC connect error: {0}")]
+        let s = format!("{}", TransportError::QuicConnect(quinn::ConnectError::EndpointStopping));
+        assert!(s.contains("QUIC") && s.contains("connect"), "QuicConnect display wrong: {s}");
+
+        let s = format!(
+            "{}",
+            TransportError::QuicConnect(quinn::ConnectError::InvalidServerName("bad name".to_string()))
+        );
+        assert!(s.contains("QUIC") && s.contains("connect"), "QuicConnect(InvalidServerName) display wrong: {s}");
+
+        // #[error("codec error: {0}")]
+        let s = format!("{}", TransportError::Codec(rift_protocol::codec::CodecError::InvalidVarint));
+        assert!(s.contains("codec"), "Codec display should mention 'codec', got: {s}");
+
+        let s = format!("{}", TransportError::Codec(rift_protocol::codec::CodecError::MessageTooLarge(999)));
+        assert!(s.contains("codec"), "Codec(MessageTooLarge) display should mention 'codec', got: {s}");
+
+        // #[error("certificate error: {0}")] wrapping CertError which has its own message
+        let s = format!("{}", TransportError::Cert(CertError::NotTrusted { fingerprint: "fp".to_string() }));
+        assert!(s.contains("certificate"), "Cert display should mention 'certificate', got: {s}");
     }
 
     // ---------------------------------------------------------------------------
@@ -117,42 +145,59 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn transport_error_debug_works() {
-        let errors: Vec<TransportError> = vec![
-            TransportError::ConnectionClosed,
-            TransportError::StreamClosed,
-            TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, "io debug")),
-            TransportError::QuicConnection(quinn::ConnectionError::TimedOut),
-            TransportError::QuicWrite(quinn::WriteError::ClosedStream),
-            TransportError::QuicRead(quinn::ReadError::ClosedStream),
-            TransportError::QuicConnect(quinn::ConnectError::EndpointStopping),
-            TransportError::Codec(rift_protocol::codec::CodecError::InvalidVarint),
-            TransportError::Cert(CertError::Malformed("bad cert".to_string())),
-        ];
-
-        for err in &errors {
-            let s = format!("{err:?}");
-            assert!(!s.is_empty(), "Debug for {err:?} should be non-empty");
-        }
+    fn transport_error_debug_contains_variant_name() {
+        assert!(
+            format!("{:?}", TransportError::ConnectionClosed).contains("ConnectionClosed"),
+            "ConnectionClosed Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::StreamClosed).contains("StreamClosed"),
+            "StreamClosed Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, "io debug"))).contains("Io"),
+            "Io Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::QuicConnection(quinn::ConnectionError::TimedOut)).contains("QuicConnection"),
+            "QuicConnection Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::QuicWrite(quinn::WriteError::ClosedStream)).contains("QuicWrite"),
+            "QuicWrite Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::QuicRead(quinn::ReadError::ClosedStream)).contains("QuicRead"),
+            "QuicRead Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::QuicConnect(quinn::ConnectError::EndpointStopping)).contains("QuicConnect"),
+            "QuicConnect Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::Codec(rift_protocol::codec::CodecError::InvalidVarint)).contains("Codec"),
+            "Codec Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", TransportError::Cert(CertError::Malformed("bad cert".to_string()))).contains("Cert"),
+            "Cert Debug should contain variant name"
+        );
     }
 
     #[test]
-    fn cert_error_debug_works() {
-        let errors = vec![
-            CertError::NotTrusted {
-                fingerprint: "fp".to_string(),
-            },
-            CertError::FingerprintChanged {
-                expected: "aabb".to_string(),
-                actual: "ccdd".to_string(),
-            },
-            CertError::Malformed("bad".to_string()),
-        ];
-
-        for err in &errors {
-            let s = format!("{err:?}");
-            assert!(!s.is_empty(), "Debug for {err:?} should be non-empty");
-        }
+    fn cert_error_debug_contains_variant_name() {
+        assert!(
+            format!("{:?}", CertError::NotTrusted { fingerprint: "fp".to_string() }).contains("NotTrusted"),
+            "NotTrusted Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", CertError::FingerprintChanged { expected: "aabb".to_string(), actual: "ccdd".to_string() }).contains("FingerprintChanged"),
+            "FingerprintChanged Debug should contain variant name"
+        );
+        assert!(
+            format!("{:?}", CertError::Malformed("bad".to_string())).contains("Malformed"),
+            "Malformed Debug should contain variant name"
+        );
     }
 
     // ---------------------------------------------------------------------------
