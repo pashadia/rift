@@ -781,6 +781,9 @@ pub trait ConnectionStats {
     fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord>;
 }
 
+// TODO: QuicConnection doesn't support stats; use RecordingConnection for stat tracking.
+// These implementations are stubs that always return zero/empty — they do NOT reflect
+// real connection activity.
 impl ConnectionStats for QuicConnection {
     fn stream_count(&self) -> usize {
         0
@@ -1180,11 +1183,13 @@ mod tests {
         let handle1 = Uuid::from_bytes([1u8; 16]);
         let handle2 = Uuid::from_bytes([2u8; 16]);
 
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             let mut stream = server_conn.accept_stream().await.unwrap();
             let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
             let req = StatRequest::decode(payload.as_ref()).unwrap();
             assert_eq!(req.handles.len(), 2);
+            assert_eq!(req.handles[0], handle1.as_bytes().as_slice());
+            assert_eq!(req.handles[1], handle2.as_bytes().as_slice());
             let response = StatResponse {
                 results: vec![
                     StatResult {
@@ -1218,6 +1223,8 @@ mod tests {
 
         let req = StatRequest::decode(frames[0].payload.as_ref()).unwrap();
         assert_eq!(req.handles.len(), 2, "request must include both handles");
+
+        server_task.await.expect("server task panicked");
     }
 
     #[tokio::test]
@@ -1331,7 +1338,7 @@ mod tests {
         });
 
         client.stat(root).await.unwrap();
-        assert!(client.stream_count() >= 1, "stream_count must be ≥ 1 after one stat");
+        assert_eq!(client.stream_count(), 1, "stream_count must be exactly 1 after one stat");
     }
 
     #[tokio::test]
