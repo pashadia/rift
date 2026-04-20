@@ -37,8 +37,8 @@ use rift_common::FsError;
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ErrorCode,
     FileAttrs, LookupRequest, LookupResponse, MerkleDrill, MerkleLevelResponse, ReadRequest,
-    ReadResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
-    TransferComplete,
+    ReadResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, ShareInfo, StatRequest,
+    StatResponse, TransferComplete, WhoamiRequest, WhoamiResponse,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
@@ -436,93 +436,8 @@ impl<C: RiftConnection> RiftClient<C> {
         self.conn.close();
     }
 
-    /// Stat multiple handles in batch.
-    ///
-    /// Returns one result per handle, in the same order as the input.
-    /// Each `Ok(attrs)` means the handle exists; `Err(FsError)` indicates
-    /// the handle does not exist or is inaccessible.
-    ///
-    /// Sends a single `StatRequest` with all handles in one network request.
-    #[instrument(skip(self), fields(handle_count = handles.len()))]
-    pub async fn stat_batch(&self, handles: Vec<Uuid>) -> Result<Vec<Result<FileAttrs, FsError>>> {
-        if handles.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let handle_bytes: Vec<Vec<u8>> = handles.iter().map(|u| u.as_bytes().to_vec()).collect();
-
-        let mut stream = self
-            .conn
-            .open_stream()
-            .await
-            .map_err(|e| anyhow::anyhow!("stat_batch: open stream: {e}"))?;
-
-        let req = StatRequest {
-            handles: handle_bytes,
-        };
-        stream
-            .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-
-        let (_, payload) = stream
-            .recv_frame()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("stat_batch: server closed stream without response"))?;
-
-        let response =
-            StatResponse::decode(payload.as_ref()).map_err(|_| anyhow::Error::from(FsError::Io))?;
-
-        let results: Vec<Result<FileAttrs, FsError>> = response
-            .results
-            .into_iter()
-            .map(|result| match result.result {
-                Some(stat_result::Result::Attrs(attrs)) => Ok(attrs),
-                Some(stat_result::Result::Error(e)) => {
-                    let err = map_proto_error(e.code);
-                    Err(err.downcast::<FsError>().unwrap_or(FsError::Io))
-                }
-                None => Err(FsError::Io),
-            })
-            .collect();
-
-        Ok(results)
-    }
-}
-
-/// A trait for connection statistics, primarily for testing.
-pub trait ConnectionStats {
-    fn stream_count(&self) -> usize;
-    fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord>;
-}
-
-impl ConnectionStats for QuicConnection {
-    fn stream_count(&self) -> usize {
-        0
-    }
-    fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord> {
-        Vec::new()
-    }
-}
-
-/// Test helpers for RiftClient backed by RecordingConnection.
-/// These are separate from the main impl block because RecordingConnection
-/// is specifically designed for testing.
-impl RiftClient<rift_transport::RecordingConnection<QuicConnection>> {
-    /// Get the number of times `open_stream` was called on the underlying connection.
-    pub fn stream_count(&self) -> usize {
-        self.conn.stream_count()
-    }
-
-    /// Access the frames recorded by the underlying connection.
-    pub fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord> {
-        self.conn.recorded_frames()
-    }
-}
-
-impl RiftClient<QuicConnection> {
     // -----------------------------------------------------------------------
-    // Async filesystem operations
+    // Async filesystem operations (generic over any RiftConnection)
     // -----------------------------------------------------------------------
 
     /// Return the attributes of the object identified by `handle`.
@@ -645,10 +560,6 @@ impl RiftClient<QuicConnection> {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Read chunks
-    // ---------------------------------------------------------------------------
-
     /// Read chunks from a file.
     ///
     /// - `handle`: The file handle
@@ -679,7 +590,6 @@ impl RiftClient<QuicConnection> {
             .await?;
         stream.finish_send().await?;
 
-        // Read response: ReadSuccess with chunk_count
         let (_, payload) = stream
             .recv_frame()
             .await?
@@ -694,10 +604,8 @@ impl RiftClient<QuicConnection> {
             None => return Err(anyhow::Error::from(FsError::Io)),
         };
 
-        // Read each chunk: BLOCK_HEADER + BLOCK_DATA
         let mut chunks = Vec::with_capacity(chunk_count as usize);
         for _i in 0..chunk_count {
-            // BlockHeader
             let header_frame = stream
                 .recv_frame()
                 .await?
@@ -718,7 +626,6 @@ impl RiftClient<QuicConnection> {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("read_chunks: invalid hash length"))?;
 
-            // BlockData (raw bytes)
             let data_frame = stream
                 .recv_frame()
                 .await?
@@ -733,7 +640,6 @@ impl RiftClient<QuicConnection> {
             });
         }
 
-        // TransferComplete with Merkle root
         let root_frame = stream
             .recv_frame()
             .await?
@@ -749,17 +655,7 @@ impl RiftClient<QuicConnection> {
         })
     }
 
-    // ---------------------------------------------------------------------------
-    // MerkleDrill
-    // ---------------------------------------------------------------------------
-
     /// Fetch Merkle tree levels from the server.
-    ///
-    /// - `handle`: The file handle
-    /// - `level`: Which level to fetch (0 = root only)
-    /// - `subtrees`: Specific subtree indices to fetch (empty = all at this level)
-    ///
-    /// Returns `MerkleLevelResponse` with hashes and subtree byte counts.
     #[instrument(skip(self), fields(level, subtrees_len = subtrees.len()))]
     pub async fn merkle_drill(
         &self,
@@ -791,7 +687,124 @@ impl RiftClient<QuicConnection> {
 
         Ok(response)
     }
+
+    /// Query the server for its identity (fingerprint, common name, available shares).
+    pub async fn whoami(&self) -> Result<WhoamiResponse> {
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("whoami: open stream: {e}"))?;
+
+        let req = WhoamiRequest {};
+        stream
+            .send_frame(msg::WHOAMI_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        let (_, payload) = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("whoami: server closed stream without response"))?;
+
+        let response = WhoamiResponse::decode(payload.as_ref())
+            .map_err(|_| anyhow::Error::from(FsError::Io))?;
+
+        Ok(response)
+    }
+
+    /// Return the list of shares available on the server.
+    ///
+    /// Sends a `WhoamiRequest` and returns `available_shares` from the response.
+    pub async fn discover(&self) -> Result<Vec<ShareInfo>> {
+        let response = self.whoami().await?;
+        Ok(response.available_shares)
+    }
+
+    /// Stat multiple handles in batch.
+    ///
+    /// Returns one result per handle, in the same order as the input.
+    /// Each `Ok(attrs)` means the handle exists; `Err(FsError)` indicates
+    /// the handle does not exist or is inaccessible.
+    ///
+    /// Sends a single `StatRequest` with all handles in one network request.
+    #[instrument(skip(self), fields(handle_count = handles.len()))]
+    pub async fn stat_batch(&self, handles: Vec<Uuid>) -> Result<Vec<Result<FileAttrs, FsError>>> {
+        if handles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let handle_bytes: Vec<Vec<u8>> = handles.iter().map(|u| u.as_bytes().to_vec()).collect();
+
+        let mut stream = self
+            .conn
+            .open_stream()
+            .await
+            .map_err(|e| anyhow::anyhow!("stat_batch: open stream: {e}"))?;
+
+        let req = StatRequest {
+            handles: handle_bytes,
+        };
+        stream
+            .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        let (_, payload) = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stat_batch: server closed stream without response"))?;
+
+        let response =
+            StatResponse::decode(payload.as_ref()).map_err(|_| anyhow::Error::from(FsError::Io))?;
+
+        let results: Vec<Result<FileAttrs, FsError>> = response
+            .results
+            .into_iter()
+            .map(|result| match result.result {
+                Some(stat_result::Result::Attrs(attrs)) => Ok(attrs),
+                Some(stat_result::Result::Error(e)) => {
+                    let err = map_proto_error(e.code);
+                    Err(err.downcast::<FsError>().unwrap_or(FsError::Io))
+                }
+                None => Err(FsError::Io),
+            })
+            .collect();
+
+        Ok(results)
+    }
 }
+
+/// A trait for connection statistics, primarily for testing.
+pub trait ConnectionStats {
+    fn stream_count(&self) -> usize;
+    fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord>;
+}
+
+impl ConnectionStats for QuicConnection {
+    fn stream_count(&self) -> usize {
+        0
+    }
+    fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord> {
+        Vec::new()
+    }
+}
+
+/// Test helpers for RiftClient backed by RecordingConnection.
+/// These are separate from the main impl block because RecordingConnection
+/// is specifically designed for testing.
+impl<C: RiftConnection> RiftClient<rift_transport::RecordingConnection<C>> {
+    /// Get the number of times `open_stream` was called on the underlying connection.
+    pub fn stream_count(&self) -> usize {
+        self.conn.stream_count()
+    }
+
+    /// Access the frames recorded by the underlying connection.
+    pub fn recorded_frames(&self) -> Vec<rift_transport::FrameRecord> {
+        self.conn.recorded_frames()
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // RemoteShare impl (Linux only)
@@ -913,7 +926,20 @@ fn write_private_key(path: &std::path::Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as ProstMessage;
     use rift_common::FsError;
+    use rift_protocol::messages::{
+        lookup_response, readdir_response, stat_result, ErrorCode, ErrorDetail, FileAttrs,
+        FileType, LookupResponse, LookupResult, ReaddirEntry, ReaddirResponse, ReaddirSuccess,
+        ShareInfo, StatRequest, StatResponse, StatResult, WhoamiResponse,
+    };
+    use rift_transport::connection::InMemoryConnection;
+    use rift_transport::RecordingConnection;
+    use uuid::Uuid;
+
+    fn dummy_root() -> Uuid {
+        Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    }
 
     #[test]
     fn map_proto_error_not_found() {
@@ -947,5 +973,400 @@ mod tests {
         let err = map_proto_error(9999);
         let fs_err = err.downcast_ref::<FsError>().unwrap();
         assert!(matches!(fs_err, FsError::Io));
+    }
+
+    // -----------------------------------------------------------------------
+    // Group A: Construction and accessors
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn from_connection_stores_root_handle() {
+        let (client_conn, _server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+        assert_eq!(client.root_handle(), root);
+    }
+
+    #[tokio::test]
+    async fn server_fingerprint_returns_peer_fingerprint() {
+        let (client_conn, _server_conn) = InMemoryConnection::pair();
+        let client = RiftClient::from_connection(client_conn, dummy_root());
+        assert_eq!(client.server_fingerprint(), "test-server-fingerprint");
+    }
+
+    #[tokio::test]
+    async fn close_connection_causes_operations_to_fail() {
+        let (client_conn, _server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+        client.close_connection();
+        let result = client.stat(root).await;
+        assert!(result.is_err(), "stat after close_connection must fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group B: stat(), lookup(), readdir()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stat_valid_handle_returns_file_attrs() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = StatResponse {
+                results: vec![StatResult {
+                    handle: vec![],
+                    result: Some(stat_result::Result::Attrs(FileAttrs {
+                        size: 42,
+                        file_type: FileType::Regular as i32,
+                        ..Default::default()
+                    })),
+                }],
+            };
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let attrs = client.stat(root).await.unwrap();
+        assert_eq!(attrs.size, 42);
+        assert_eq!(attrs.file_type, FileType::Regular as i32);
+    }
+
+    #[tokio::test]
+    async fn stat_error_response_returns_err() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = StatResponse {
+                results: vec![StatResult {
+                    handle: vec![],
+                    result: Some(stat_result::Result::Error(ErrorDetail {
+                        code: ErrorCode::ErrorNotFound as i32,
+                        message: String::new(),
+                        metadata: None,
+                    })),
+                }],
+            };
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let result = client.stat(root).await;
+        assert!(result.is_err(), "error response must yield Err");
+        let fs_err = result.unwrap_err().downcast::<FsError>().unwrap();
+        assert!(matches!(fs_err, FsError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn lookup_success_returns_handle_and_attrs() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+        let child_uuid = Uuid::from_bytes([2u8; 16]);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = LookupResponse {
+                result: Some(lookup_response::Result::Entry(LookupResult {
+                    handle: child_uuid.as_bytes().to_vec(),
+                    attrs: Some(FileAttrs {
+                        size: 100,
+                        file_type: FileType::Regular as i32,
+                        ..Default::default()
+                    }),
+                })),
+            };
+            stream
+                .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let (handle, attrs) = client.lookup(root, "file.txt").await.unwrap();
+        assert_eq!(handle, child_uuid);
+        assert_eq!(attrs.size, 100);
+        assert_eq!(attrs.file_type, FileType::Regular as i32);
+    }
+
+    #[tokio::test]
+    async fn lookup_not_found_returns_err() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = LookupResponse {
+                result: Some(lookup_response::Result::Error(ErrorDetail {
+                    code: ErrorCode::ErrorNotFound as i32,
+                    message: String::new(),
+                    metadata: None,
+                })),
+            };
+            stream
+                .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let result = client.lookup(root, "missing.txt").await;
+        assert!(result.is_err());
+        let fs_err = result.unwrap_err().downcast::<FsError>().unwrap();
+        assert!(matches!(fs_err, FsError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn readdir_returns_entry_list() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = ReaddirResponse {
+                result: Some(readdir_response::Result::Entries(ReaddirSuccess {
+                    entries: vec![
+                        ReaddirEntry {
+                            name: "alpha.txt".to_string(),
+                            file_type: FileType::Regular as i32,
+                            handle: vec![1u8; 16],
+                        },
+                        ReaddirEntry {
+                            name: "beta.txt".to_string(),
+                            file_type: FileType::Regular as i32,
+                            handle: vec![2u8; 16],
+                        },
+                    ],
+                    has_more: false,
+                })),
+            };
+            stream
+                .send_frame(msg::READDIR_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let entries = client.readdir(root).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "alpha.txt");
+        assert_eq!(entries[1].name, "beta.txt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group C: stat_batch()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stat_batch_sends_single_request_with_all_handles() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(client_conn);
+        let client = RiftClient::from_connection(recording, dummy_root());
+
+        let handle1 = Uuid::from_bytes([1u8; 16]);
+        let handle2 = Uuid::from_bytes([2u8; 16]);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+            let req = StatRequest::decode(payload.as_ref()).unwrap();
+            assert_eq!(req.handles.len(), 2);
+            let response = StatResponse {
+                results: vec![
+                    StatResult {
+                        handle: vec![1u8; 16],
+                        result: Some(stat_result::Result::Attrs(FileAttrs {
+                            size: 10,
+                            ..Default::default()
+                        })),
+                    },
+                    StatResult {
+                        handle: vec![2u8; 16],
+                        result: Some(stat_result::Result::Attrs(FileAttrs {
+                            size: 20,
+                            ..Default::default()
+                        })),
+                    },
+                ],
+            };
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let results = client.stat_batch(vec![handle1, handle2]).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        let frames = client.recorded_frames();
+        assert_eq!(frames.len(), 1, "stat_batch must send exactly 1 frame");
+        assert_eq!(frames[0].type_id, msg::STAT_REQUEST);
+
+        let req = StatRequest::decode(frames[0].payload.as_ref()).unwrap();
+        assert_eq!(req.handles.len(), 2, "request must include both handles");
+    }
+
+    #[tokio::test]
+    async fn stat_batch_empty_input_returns_empty_vec() {
+        let (client_conn, _server_conn) = InMemoryConnection::pair();
+        let client = RiftClient::from_connection(client_conn, dummy_root());
+        let results = client.stat_batch(vec![]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Group D: discover() and whoami()
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn discover_returns_share_list() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let client = RiftClient::from_connection(client_conn, dummy_root());
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = WhoamiResponse {
+                fingerprint: "server-fp".to_string(),
+                common_name: "rift-server".to_string(),
+                available_shares: vec![
+                    ShareInfo {
+                        name: "share-a".to_string(),
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    ShareInfo {
+                        name: "share-b".to_string(),
+                        read_only: false,
+                        ..Default::default()
+                    },
+                ],
+            };
+            stream
+                .send_frame(msg::WHOAMI_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let shares = client.discover().await.unwrap();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].name, "share-a");
+        assert_eq!(shares[1].name, "share-b");
+    }
+
+    #[tokio::test]
+    async fn whoami_returns_identity() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let client = RiftClient::from_connection(client_conn, dummy_root());
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = WhoamiResponse {
+                fingerprint: "fp123".to_string(),
+                common_name: "Alice".to_string(),
+                available_shares: vec![],
+            };
+            stream
+                .send_frame(msg::WHOAMI_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let identity = client.whoami().await.unwrap();
+        assert_eq!(identity.fingerprint, "fp123");
+        assert_eq!(identity.common_name, "Alice");
+        assert!(identity.available_shares.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Group E: ConnectionStats via RecordingConnection<InMemoryConnection>
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recording_client_stream_count_starts_at_zero() {
+        let (inner, _server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+        let client = RiftClient::from_connection(recording, dummy_root());
+        assert_eq!(client.stream_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn recording_client_stream_count_increments_after_operation() {
+        let (inner, server_conn) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+        let root = dummy_root();
+        let client = RiftClient::from_connection(recording, root);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = StatResponse {
+                results: vec![StatResult {
+                    handle: vec![],
+                    result: Some(stat_result::Result::Attrs(FileAttrs {
+                        size: 1,
+                        ..Default::default()
+                    })),
+                }],
+            };
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        client.stat(root).await.unwrap();
+        assert!(client.stream_count() >= 1, "stream_count must be ≥ 1 after one stat");
+    }
+
+    #[tokio::test]
+    async fn recording_client_recorded_frames_captures_sent_frames() {
+        let (inner, server_conn) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(inner);
+        let root = dummy_root();
+        let client = RiftClient::from_connection(recording, root);
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+            let response = StatResponse {
+                results: vec![StatResult {
+                    handle: vec![],
+                    result: Some(stat_result::Result::Attrs(FileAttrs {
+                        size: 7,
+                        ..Default::default()
+                    })),
+                }],
+            };
+            stream
+                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        client.stat(root).await.unwrap();
+
+        let frames = client.recorded_frames();
+        assert!(!frames.is_empty(), "recorded_frames must not be empty after stat");
+        assert_eq!(
+            frames[0].type_id,
+            msg::STAT_REQUEST,
+            "first recorded frame must be STAT_REQUEST"
+        );
     }
 }
