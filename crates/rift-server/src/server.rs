@@ -248,6 +248,14 @@ async fn handle_stream(
             stream.finish_send().await?;
         }
 
+        msg::UNLINK_REQUEST => {
+            let response = handler::unlink_response(&payload, &share, &handle_db).await;
+            stream
+                .send_frame(msg::UNLINK_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+        }
+
         // ------------------------------------------------------------------
         // Data operations
         // ------------------------------------------------------------------

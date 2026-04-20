@@ -16,10 +16,11 @@ use tracing::instrument;
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{
     lookup_response, mkdir_response, msg, read_response, readdir_response, stat_result,
-    BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest,
-    LookupResponse, LookupResult, MerkleDrill, MerkleLevelResponse, MkdirRequest, MkdirResponse,
-    ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest, ReaddirResponse,
-    ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
+    unlink_response, BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, FileAttrs, FileType,
+    LookupRequest, LookupResponse, LookupResult, MerkleDrill, MerkleLevelResponse, MkdirRequest,
+    MkdirResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry, ReaddirRequest,
+    ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult, TransferComplete,
+    UnlinkRequest, UnlinkResponse,
 };
 use rift_transport::RiftStream;
 
@@ -364,6 +365,19 @@ pub async fn mkdir_response(
     mkdir_error(ErrorCode::ErrorUnsupported)
 }
 
+pub async fn unlink_response(
+    payload: &[u8],
+    share: &Path,
+    _handle_db: &HandleDatabase,
+) -> UnlinkResponse {
+    let _req = match UnlinkRequest::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return unlink_error(ErrorCode::ErrorUnsupported),
+    };
+
+    unlink_error(ErrorCode::ErrorUnsupported)
+}
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -428,6 +442,12 @@ fn readdir_error(code: ErrorCode) -> ReaddirResponse {
 fn mkdir_error(code: ErrorCode) -> MkdirResponse {
     MkdirResponse {
         result: Some(mkdir_response::Result::Error(error_detail(code))),
+    }
+}
+
+fn unlink_error(code: ErrorCode) -> UnlinkResponse {
+    UnlinkResponse {
+        result: Some(unlink_response::Result::Error(error_detail(code))),
     }
 }
 
