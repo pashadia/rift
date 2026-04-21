@@ -652,7 +652,7 @@ mod tests {
         let chunk1_hash = [0x11u8; 32];
         let chunk2_hash = [0x12u8; 32];
         let root_hash = [0xABu8; 32];
-        let sizes = vec![100u64, 200, 150];
+        let sizes = [100u64, 200, 150];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
@@ -670,9 +670,24 @@ mod tests {
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: vec![0u8; 32],
                 children: vec![
-                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk2_hash.to_vec(), length: sizes[2], chunk_index: 2 },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.to_vec(),
+                        length: sizes[0],
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk1_hash.to_vec(),
+                        length: sizes[1],
+                        chunk_index: 1,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk2_hash.to_vec(),
+                        length: sizes[2],
+                        chunk_index: 2,
+                    },
                 ],
             }))
             .await;
@@ -743,7 +758,7 @@ mod tests {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let root_hash = [0xABu8; 32];
-        let sizes = vec![100u64, 200];
+        let sizes = [100u64, 200];
         let file_size: u64 = sizes.iter().sum(); // 300
 
         let root = Uuid::now_v7();
@@ -759,8 +774,18 @@ mod tests {
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: vec![0u8; 32],
                 children: vec![
-                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.to_vec(),
+                        length: sizes[0],
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk1_hash.to_vec(),
+                        length: sizes[1],
+                        chunk_index: 1,
+                    },
                 ],
             }))
             .await;
@@ -808,7 +833,7 @@ mod tests {
         let chunk1_hash = [0x11u8; 32];
         let chunk2_hash = [0x12u8; 32];
         let root_hash = [0xABu8; 32];
-        let sizes = vec![100u64, 200, 150];
+        let sizes = [100u64, 200, 150];
         let file_size: u64 = sizes.iter().sum();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -831,8 +856,18 @@ mod tests {
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: vec![0u8; 32],
                 children: vec![
-                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.to_vec(),
+                        length: sizes[0],
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk1_hash.to_vec(),
+                        length: sizes[1],
+                        chunk_index: 1,
+                    },
                 ],
             }))
             .await;
@@ -896,7 +931,7 @@ mod tests {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let root_hash = [0xABu8; 32];
-        let sizes = vec![100u64, 200];
+        let sizes = [100u64, 200];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
@@ -912,8 +947,18 @@ mod tests {
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: vec![0u8; 32],
                 children: vec![
-                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.to_vec(),
+                        length: sizes[0],
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk1_hash.to_vec(),
+                        length: sizes[1],
+                        chunk_index: 1,
+                    },
                 ],
             }))
             .await;
@@ -958,7 +1003,7 @@ mod tests {
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
         let root_hash = [0xABu8; 32];
-        let sizes = vec![100u64, 200];
+        let sizes = [100u64, 200];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
@@ -976,8 +1021,18 @@ mod tests {
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: vec![0u8; 32],
                 children: vec![
-                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.to_vec(),
+                        length: sizes[0],
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk1_hash.to_vec(),
+                        length: sizes[1],
+                        chunk_index: 1,
+                    },
                 ],
             }))
             .await;
@@ -1037,7 +1092,7 @@ mod tests {
         let root_hash = [0xABu8; 32];
 
         // sizes: chunk0=100, chunk1=200, chunk2=150  →  total=450
-        let sizes = vec![100u64, 200, 150];
+        let sizes = [100u64, 200, 150];
         let file_size: u64 = sizes.iter().sum();
 
         let root = Uuid::now_v7();
@@ -1055,8 +1110,18 @@ mod tests {
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: vec![0u8; 32],
                 children: vec![
-                    MerkleChildInfo { is_subtree: false, hash: chunk0_hash.to_vec(), length: sizes[0], chunk_index: 0 },
-                    MerkleChildInfo { is_subtree: false, hash: chunk1_hash.to_vec(), length: sizes[1], chunk_index: 1 },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.to_vec(),
+                        length: sizes[0],
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk1_hash.to_vec(),
+                        length: sizes[1],
+                        chunk_index: 1,
+                    },
                 ],
             }))
             .await;

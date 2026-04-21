@@ -101,20 +101,32 @@ mod tests {
 
     #[test]
     fn test_share_permission_read_only() {
-        let perm = SharePermission { access: AccessLevel::ReadOnly };
+        let perm = SharePermission {
+            access: AccessLevel::ReadOnly,
+        };
         assert_eq!(perm.access, AccessLevel::ReadOnly);
     }
 
     #[test]
     fn test_share_permission_read_write() {
-        let perm = SharePermission { access: AccessLevel::ReadWrite };
+        let perm = SharePermission {
+            access: AccessLevel::ReadWrite,
+        };
         assert_eq!(perm.access, AccessLevel::ReadWrite);
     }
 
     #[test]
     fn test_share_permission_debug_is_non_empty() {
-        let s = format!("{:?}", SharePermission { access: AccessLevel::ReadOnly });
-        assert!(s.contains("ReadOnly"), "Debug output should contain variant name, got: {s}");
+        let s = format!(
+            "{:?}",
+            SharePermission {
+                access: AccessLevel::ReadOnly
+            }
+        );
+        assert!(
+            s.contains("ReadOnly"),
+            "Debug output should contain variant name, got: {s}"
+        );
     }
 
     #[test]
@@ -122,13 +134,18 @@ mod tests {
         // SharePermission deserialized from TOML without an explicit `access` field
         // must default to ReadWrite via #[serde(default)] on the field.
         let perm: SharePermission = toml::from_str("").unwrap();
-        assert_eq!(perm.access, AccessLevel::ReadWrite,
-            "SharePermission without explicit access field should default to ReadWrite");
+        assert_eq!(
+            perm.access,
+            AccessLevel::ReadWrite,
+            "SharePermission without explicit access field should default to ReadWrite"
+        );
     }
 
     #[test]
     fn test_share_permission_clone() {
-        let perm = SharePermission { access: AccessLevel::ReadOnly };
+        let perm = SharePermission {
+            access: AccessLevel::ReadOnly,
+        };
         let cloned = perm.clone();
         assert_eq!(cloned.access, perm.access);
     }

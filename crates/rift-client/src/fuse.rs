@@ -209,10 +209,10 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_protocol::messages::FileType;
-    use async_trait::async_trait;
     use crate::view::{DirEntry, ShareView};
+    use async_trait::async_trait;
     use rift_common::FsError;
+    use rift_protocol::messages::FileType;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -293,26 +293,41 @@ mod tests {
     #[test]
     fn proto_to_fuse3_attr_blocks_round_up_to_512() {
         // 0 bytes → 0 blocks
-        let attrs = FileAttrs { size: 0, ..Default::default() };
+        let attrs = FileAttrs {
+            size: 0,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 0);
 
         // exactly 512 bytes → 1 block
-        let attrs = FileAttrs { size: 512, ..Default::default() };
+        let attrs = FileAttrs {
+            size: 512,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 1);
 
         // 513 bytes → 2 blocks (rounds up)
-        let attrs = FileAttrs { size: 513, ..Default::default() };
+        let attrs = FileAttrs {
+            size: 513,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 2);
 
         // 1 byte → 1 block (rounds up)
-        let attrs = FileAttrs { size: 1, ..Default::default() };
+        let attrs = FileAttrs {
+            size: 1,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).blocks, 1);
     }
 
     /// nlinks == 0 in the proto must be coerced to 1 (POSIX minimum for a file).
     #[test]
     fn proto_to_fuse3_attr_nlinks_zero_coerced_to_one() {
-        let attrs = FileAttrs { nlinks: 0, ..Default::default() };
+        let attrs = FileAttrs {
+            nlinks: 0,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).nlink, 1);
     }
 
@@ -320,11 +335,17 @@ mod tests {
     /// passed through; any higher bits are masked out.
     #[test]
     fn proto_to_fuse3_attr_mode_masked_to_12_bits() {
-        let attrs = FileAttrs { mode: 0o10_0755, ..Default::default() }; // S_IFREG | 0755
+        let attrs = FileAttrs {
+            mode: 0o10_0755,
+            ..Default::default()
+        }; // S_IFREG | 0755
         let perm = proto_to_fuse3_attr(&attrs).perm;
         assert_eq!(perm, 0o755, "upper bits above 0o7777 must be stripped");
 
-        let attrs = FileAttrs { mode: 0o644, ..Default::default() };
+        let attrs = FileAttrs {
+            mode: 0o644,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).perm, 0o644);
     }
 
@@ -333,21 +354,33 @@ mod tests {
     #[test]
     fn proto_to_fuse3_attr_mtime_propagated_to_all_time_fields() {
         use prost_types::Timestamp;
-        let ts = Timestamp { seconds: 1_700_000_000, nanos: 123_000_000 };
-        let attrs = FileAttrs { mtime: Some(ts), ..Default::default() };
+        let ts = Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 123_000_000,
+        };
+        let attrs = FileAttrs {
+            mtime: Some(ts),
+            ..Default::default()
+        };
         let fa = proto_to_fuse3_attr(&attrs);
         // All three time fields must be equal (all derived from mtime).
         assert_eq!(fa.atime, fa.mtime);
         assert_eq!(fa.ctime, fa.mtime);
         // The timestamp must be later than UNIX_EPOCH.
-        assert!(fa.mtime > std::time::UNIX_EPOCH, "mtime must be after epoch");
+        assert!(
+            fa.mtime > std::time::UNIX_EPOCH,
+            "mtime must be after epoch"
+        );
     }
 
     /// When mtime is absent (proto field not set) the conversion must fall back
     /// to UNIX_EPOCH rather than panicking.
     #[test]
     fn proto_to_fuse3_attr_absent_mtime_falls_back_to_epoch() {
-        let attrs = FileAttrs { mtime: None, ..Default::default() };
+        let attrs = FileAttrs {
+            mtime: None,
+            ..Default::default()
+        };
         assert_eq!(proto_to_fuse3_attr(&attrs).mtime, std::time::UNIX_EPOCH);
     }
 

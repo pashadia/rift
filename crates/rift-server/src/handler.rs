@@ -1090,7 +1090,6 @@ mod tests {
     // are defined in rift-protocol but no server-side stubs are implemented.
     // Tests will be added once the stubs land.
     // -----------------------------------------------------------------------
-    use super::*;
     use crate::metadata::db::Database;
 
     use rift_protocol::messages::msg;

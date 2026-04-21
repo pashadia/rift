@@ -259,8 +259,16 @@ impl MerkleTree {
         &self,
         leaf_hashes: &[Blake3Hash],
         chunk_boundaries: &[(usize, usize)],
-    ) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>, Vec<LeafInfo>) {
-        assert_eq!(leaf_hashes.len(), chunk_boundaries.len(), "leaf_hashes and chunk_boundaries must have same length");
+    ) -> (
+        Blake3Hash,
+        HashMap<Blake3Hash, Vec<MerkleChild>>,
+        Vec<LeafInfo>,
+    ) {
+        assert_eq!(
+            leaf_hashes.len(),
+            chunk_boundaries.len(),
+            "leaf_hashes and chunk_boundaries must have same length"
+        );
 
         let (root, mut cache) = self.build_with_cache(leaf_hashes);
 
@@ -963,7 +971,11 @@ mod merkle_cache_tests {
         let leaf = Blake3Hash::new(b"single");
         let (root, cache) = tree.build_with_cache(std::slice::from_ref(&leaf));
         assert_eq!(root, leaf);
-        assert_eq!(cache.len(), 1, "single leaf should have root → [leaf] in cache");
+        assert_eq!(
+            cache.len(),
+            1,
+            "single leaf should have root → [leaf] in cache"
+        );
         let children = &cache[&root];
         assert_eq!(children.len(), 1);
         assert!(matches!(&children[0], MerkleChild::Leaf { hash, .. } if hash == &leaf));
@@ -1079,9 +1091,8 @@ mod merkle_offset_tests {
         let tree = MerkleTree::default();
         let data: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 100]).collect();
         let leaf_hashes: Vec<Blake3Hash> = data.iter().map(|d| Blake3Hash::new(d)).collect();
-        let chunk_boundaries: Vec<(usize, usize)> = vec![
-            (0, 100), (100, 100), (200, 100), (300, 100), (400, 100),
-        ];
+        let chunk_boundaries: Vec<(usize, usize)> =
+            vec![(0, 100), (100, 100), (200, 100), (300, 100), (400, 100)];
 
         let (_, _, leaf_infos) = tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
         assert_eq!(leaf_infos.len(), 5);
@@ -1097,15 +1108,19 @@ mod merkle_offset_tests {
     fn build_with_offsets_fills_leaf_length_in_cache() {
         let tree = MerkleTree::default();
         let leaf_hashes: Vec<Blake3Hash> = (0..5).map(|i| Blake3Hash::new(&[i])).collect();
-        let chunk_boundaries: Vec<(usize, usize)> = vec![
-            (0, 50), (50, 60), (110, 70), (180, 80), (260, 90),
-        ];
+        let chunk_boundaries: Vec<(usize, usize)> =
+            vec![(0, 50), (50, 60), (110, 70), (180, 80), (260, 90)];
 
         let (_, cache, _) = tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
         // All leaf children in cache should have correct lengths
         for children in cache.values() {
             for child in children {
-                if let MerkleChild::Leaf { length, chunk_index, .. } = child {
+                if let MerkleChild::Leaf {
+                    length,
+                    chunk_index,
+                    ..
+                } = child
+                {
                     let expected_lengths = [50u64, 60, 70, 80, 90];
                     assert_eq!(*length, expected_lengths[*chunk_index as usize]);
                 }

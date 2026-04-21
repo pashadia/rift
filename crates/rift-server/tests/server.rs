@@ -2061,9 +2061,7 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
 
 mod merkle_drill_tests {
     use super::*;
-    use rift_protocol::messages::{
-        msg, MerkleChildType, MerkleDrill, MerkleDrillResponse,
-    };
+    use rift_protocol::messages::{msg, MerkleChildType, MerkleDrill, MerkleDrillResponse};
     use rift_server::metadata::db::Database;
 
     #[tokio::test]
@@ -2127,12 +2125,7 @@ mod merkle_drill_tests {
             "should have at least 1 child"
         );
         for (i, child) in response.children.iter().enumerate() {
-            assert_eq!(
-                child.hash.len(),
-                32,
-                "child {} hash should be 32 bytes",
-                i
-            );
+            assert_eq!(child.hash.len(), 32, "child {} hash should be 32 bytes", i);
         }
     }
 
@@ -2220,8 +2213,7 @@ mod merkle_drill_tests {
 
         // Verify the second response has children (grandchildren of root)
         assert_eq!(
-            second_response.parent_hash,
-            subtree_child.hash,
+            second_response.parent_hash, subtree_child.hash,
             "parent_hash should match the queried subtree hash"
         );
         assert!(
@@ -2326,7 +2318,6 @@ mod merkle_drill_tests {
             "children should be empty for invalid handle"
         );
     }
-
 }
 
 // ---------------------------------------------------------------------------

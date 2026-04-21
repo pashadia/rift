@@ -180,7 +180,7 @@ async fn client_handshake_rejects_wrong_response_type() {
     let client_conn = connector.connect().unwrap();
     let server_conn = listener.accept().await.unwrap();
 
-    let welcome_to_send = make_welcome();
+    let _welcome_to_send = make_welcome();
     let server_task = tokio::spawn(async move {
         let mut s = server_conn.accept_stream().await.unwrap();
         let hello = recv_hello(&mut s).await.unwrap();

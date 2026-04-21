@@ -140,7 +140,10 @@ mod tests {
             let mut s = server.accept_stream().await.unwrap();
             // prost decodes empty bytes as default struct — this should succeed
             let result = recv_hello(&mut s).await;
-            assert!(result.is_ok(), "empty payload should decode as default RiftHello");
+            assert!(
+                result.is_ok(),
+                "empty payload should decode as default RiftHello"
+            );
             let hello = result.unwrap();
             assert_eq!(hello.share_name, ""); // default string is empty
         });
@@ -196,7 +199,10 @@ mod tests {
             let hello = result.expect("recv_hello should succeed with valid RiftHello");
             assert_eq!(hello.share_name, "test", "share_name mismatch");
             assert_eq!(hello.protocol_version, 1, "protocol_version mismatch");
-            assert!(hello.capabilities.is_empty(), "capabilities should be empty");
+            assert!(
+                hello.capabilities.is_empty(),
+                "capabilities should be empty"
+            );
         });
 
         // Encode a valid RiftHello and send it

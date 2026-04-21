@@ -117,11 +117,7 @@ impl RemoteShare for MockRemoteShare {
             merkle_root: vec![],
         })
     }
-    async fn merkle_drill(
-        &self,
-        _handle: Uuid,
-        _hash: &[u8],
-    ) -> anyhow::Result<MerkleDrillResult> {
+    async fn merkle_drill(&self, _handle: Uuid, _hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
         Ok(MerkleDrillResult {
             parent_hash: vec![],
             children: vec![],

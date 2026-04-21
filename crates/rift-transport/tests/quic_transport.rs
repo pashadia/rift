@@ -374,4 +374,3 @@ async fn quic_connection_close_detected_on_accept_stream() {
 
     server_task.await.unwrap();
 }
-

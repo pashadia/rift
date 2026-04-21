@@ -51,7 +51,7 @@ pub mod msg {
 
     // Merkle operations
     pub const MERKLE_DRILL: u8 = 0x50;
-    pub const MERKLE_DRILL_RESPONSE: u8 = 0x51;  // was MERKLE_LEVEL_RESPONSE
+    pub const MERKLE_DRILL_RESPONSE: u8 = 0x51; // was MERKLE_LEVEL_RESPONSE
     pub const MERKLE_LEAVES_RESPONSE: u8 = 0x52;
 
     // Notifications (deferred from PoC)
@@ -467,9 +467,15 @@ mod tests {
         let decoded = MerkleDrillResponse::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.parent_hash, vec![0xFF; 32]);
         assert_eq!(decoded.children.len(), 2);
-        assert_eq!(decoded.children[0].child_type, MerkleChildType::MerkleChildSubtree as i32);
+        assert_eq!(
+            decoded.children[0].child_type,
+            MerkleChildType::MerkleChildSubtree as i32
+        );
         assert_eq!(decoded.children[0].hash, vec![0xAA; 32]);
-        assert_eq!(decoded.children[1].child_type, MerkleChildType::MerkleChildLeaf as i32);
+        assert_eq!(
+            decoded.children[1].child_type,
+            MerkleChildType::MerkleChildLeaf as i32
+        );
         assert_eq!(decoded.children[1].length, 131072);
         assert_eq!(decoded.children[1].chunk_index, 7);
     }

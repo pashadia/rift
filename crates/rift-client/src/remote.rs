@@ -31,9 +31,5 @@ pub trait RemoteShare: Send + Sync + 'static {
 
     /// Drills the Merkle tree to get children of a specific node.
     /// `hash`: empty = request root's children, otherwise the hash to query.
-    async fn merkle_drill(
-        &self,
-        handle: Uuid,
-        hash: &[u8],
-    ) -> anyhow::Result<MerkleDrillResult>;
+    async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult>;
 }

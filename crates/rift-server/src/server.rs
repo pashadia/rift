@@ -87,8 +87,7 @@ async fn serve_connection<C>(
     share: PathBuf,
     db: Arc<Option<Database>>,
     handle_db: Arc<HandleDatabase>,
-)
-where
+) where
     C: RiftConnection,
     C::Stream: 'static,
 {
@@ -276,9 +275,11 @@ mod tests {
     /// connector so tests can open connections.
     fn start_in_memory_server(
         share: PathBuf,
-    ) -> (tokio::task::JoinHandle<anyhow::Result<()>>, InMemoryConnector) {
-        let (listener, connector) =
-            InMemoryListener::new("test-server-fp", "test-client-fp");
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        InMemoryConnector,
+    ) {
+        let (listener, connector) = InMemoryListener::new("test-server-fp", "test-client-fp");
         let db: Arc<Option<Database>> = Arc::new(None);
         let handle_db = Arc::new(HandleDatabase::new());
         let handle = tokio::spawn(accept_loop(listener, share, db, handle_db));
@@ -327,12 +328,9 @@ mod tests {
         drop(connector);
 
         // accept_loop must terminate within a reasonable timeout.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server_handle,
-        )
-        .await
-        .expect("accept_loop did not exit within 2 s after listener closed");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
+            .await
+            .expect("accept_loop did not exit within 2 s after listener closed");
 
         // The task itself must return Ok(()).
         assert!(
