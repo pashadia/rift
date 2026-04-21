@@ -2257,6 +2257,7 @@ mod merkle_drill_tests {
             "children should be empty for invalid handle"
         );
     }
+
 }
 
 // ---------------------------------------------------------------------------

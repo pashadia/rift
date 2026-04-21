@@ -687,9 +687,9 @@ pub async fn merkle_drill_response<S: RiftStream>(
         Err(_) => return send_empty(stream).await,
     };
 
-    let canonical = match handle_db.get_path(&handle) {
-        Some(p) => p,
-        None => return send_empty(stream).await,
+    let canonical = match resolve(share, &handle, handle_db).await {
+        Ok(p) => p,
+        Err(_) => return send_empty(stream).await,
     };
 
     // 3. Need a database for hash-based lookup
@@ -781,4 +781,85 @@ pub async fn merkle_drill_response<S: RiftStream>(
     stream.finish_send().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_transport::connection::InMemoryConnection;
+    use rift_transport::RiftConnection;
+    use rift_protocol::messages::msg;
+    use crate::metadata::db::Database;
+    use prost::Message;
+
+    #[tokio::test]
+    async fn drill_rejects_path_traversal() {
+        // SECURITY: MerkleDrill handler must reject handles pointing outside the share.
+        // This tests the resolve() path traversal guard.
+
+        // Setup: share root is a temp dir
+        let share = tempfile::tempdir().unwrap();
+        let share_canonical = std::fs::canonicalize(share.path()).unwrap();
+
+        // File outside the share
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, b"secret data").unwrap();
+
+        // Register a handle for the outside file in the HandleDatabase
+        let handle_db = HandleDatabase::new();
+        let outside_handle = handle_db.get_or_create_handle(&outside_file).await.unwrap();
+
+        // Verify test setup: handle points outside the share
+        let stored = handle_db.get_path(&outside_handle).unwrap();
+        let stored_canonical = std::fs::canonicalize(&stored).unwrap();
+        assert!(
+            !stored_canonical.starts_with(&share_canonical),
+            "test setup: handle must point outside share root"
+        );
+
+        // Create a stream pair: handler writes to server side, we read from client side
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        // Build a MerkleDrill request for the outside handle
+        let drill_req = MerkleDrill {
+            handle: outside_handle.into_bytes().to_vec(),
+            hash: vec![],
+        };
+        let payload = drill_req.encode_to_vec();
+
+        // Handler requires a database
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Call the handler — should reject path traversal and return empty response
+        merkle_drill_response(
+            &mut server_stream,
+            &payload,
+            &share_canonical,
+            Some(&db),
+            &handle_db,
+        )
+        .await
+        .unwrap();
+
+        // Read the response from the client side
+        let (type_id, resp_bytes) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::MERKLE_DRILL_RESPONSE);
+
+        let response = MerkleDrillResponse::decode(&resp_bytes[..]).unwrap();
+
+        // SECURITY: must return empty response, not serve data from outside the share
+        assert!(
+            response.parent_hash.is_empty(),
+            "parent_hash must be empty for path traversal — got {:?}",
+            response.parent_hash
+        );
+        assert!(
+            response.children.is_empty(),
+            "children must be empty for path traversal — got {} children",
+            response.children.len()
+        );
+    }
 }
