@@ -10,6 +10,17 @@ use std::time::UNIX_EPOCH;
 use tokio_rusqlite::rusqlite;
 use tokio_rusqlite::Result as SqliteResult;
 
+/// Check if an error is `QueryReturnedNoRows`.
+///
+/// This helper avoids fragile string matching and uses proper
+/// enum variant matching for the tokio_rusqlite error wrapper.
+fn is_no_rows(e: &tokio_rusqlite::Error) -> bool {
+    matches!(
+        e,
+        tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows)
+    )
+}
+
 /// A cached Merkle tree entry.
 #[derive(Debug, Clone)]
 pub struct MerkleEntry {
@@ -88,7 +99,7 @@ impl Database {
                     Ok(None)
                 }
             }
-            Err(e) if e.to_string().contains("Query returned no rows") => Ok(None),
+            Err(e) if is_no_rows(&e) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -268,8 +279,7 @@ impl Database {
                 Ok(Some(children))
             }
             Err(e) => {
-                // tokio_rusqlite::Error wraps rusqlite::Error
-                if e.to_string().contains("Query returned no rows") {
+                if is_no_rows(&e) {
                     Ok(None)
                 } else {
                     Err(e)
@@ -313,8 +323,7 @@ impl Database {
                 chunk_index: chunk_index as u32,
             })),
             Err(e) => {
-                let s = e.to_string();
-                if s.contains("Query returned no rows") {
+                if is_no_rows(&e) {
                     Ok(None)
                 } else {
                     Err(e)
@@ -370,6 +379,24 @@ mod tests {
         let entry = result.unwrap();
         assert_eq!(entry.root, root);
         assert_eq!(entry.leaf_hashes, leaf_hashes);
+    }
+
+    // Unit tests for is_no_rows helper
+    #[test]
+    fn is_no_rows_detects_query_returned_no_rows() {
+        let err = tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows);
+        assert!(is_no_rows(&err), "Should detect QueryReturnedNoRows");
+    }
+
+    #[test]
+    fn is_no_rows_false_for_other_errors() {
+        // Test various other error variants - using InvalidParameterCount
+        let sql_err = rusqlite::Error::InvalidParameterCount(2, 3);
+        let err = tokio_rusqlite::Error::Error(sql_err);
+        assert!(!is_no_rows(&err), "Should not match InvalidParameterCount");
+
+        let err = tokio_rusqlite::Error::ConnectionClosed;
+        assert!(!is_no_rows(&err), "Should not match ConnectionClosed");
     }
 
     #[tokio::test]
