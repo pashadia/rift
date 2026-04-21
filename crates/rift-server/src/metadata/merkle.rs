@@ -3,7 +3,8 @@
 //! Stores and retrieves Merkle tree data keyed by file path and metadata.
 
 use crate::metadata::db::Database;
-use rift_common::crypto::{Blake3Hash, MerkleTree};
+use rift_common::crypto::{Blake3Hash, LeafInfo, MerkleChild, MerkleTree};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use tokio_rusqlite::rusqlite;
@@ -85,7 +86,7 @@ impl Database {
                     Ok(None)
                 }
             }
-            Err(e) if e.to_string().contains("QueryReturnedNoRows") => Ok(None),
+            Err(e) if e.to_string().contains("Query returned no rows") => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -142,6 +143,185 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Store a complete Merkle tree for a file, including intermediate
+    /// nodes and leaf metadata.
+    ///
+    /// This populates the `merkle_tree_nodes` and `merkle_leaf_info` tables
+    /// and also updates the `merkle_cache` table for backward compatibility.
+    /// The operation is atomic (wrapped in a transaction).
+    pub async fn put_tree(
+        &self,
+        path: &Path,
+        mtime_ns: u64,
+        file_size: u64,
+        root: &Blake3Hash,
+        cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
+        leaf_infos: &[LeafInfo],
+    ) -> SqliteResult<()> {
+        let path_str = path.to_string_lossy().to_string();
+
+        // Serialize all children entries for DB insertion
+        let mut node_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(cache.len());
+        for (hash, children) in cache.iter() {
+            let hash_bytes = hash.as_bytes().to_vec();
+            let children_bytes = postcard::to_allocvec(children)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            node_entries.push((hash_bytes, children_bytes));
+        }
+
+        // Serialize leaf info entries
+        let mut leaf_entries: Vec<(Vec<u8>, i64, i64, i64)> =
+            Vec::with_capacity(leaf_infos.len());
+        for info in leaf_infos {
+            let hash_bytes = info.hash.as_bytes().to_vec();
+            leaf_entries.push((
+                hash_bytes,
+                info.offset as i64,
+                info.length as i64,
+                info.chunk_index as i64,
+            ));
+        }
+
+        let root_bytes = root.as_bytes().to_vec();
+
+        self.call(move |conn: &mut rusqlite::Connection| {
+            let tx = conn.transaction()?;
+
+            // Delete old data for this file
+            tx.execute(
+                "DELETE FROM merkle_tree_nodes WHERE file_path = ?1",
+                [&path_str],
+            )?;
+            tx.execute(
+                "DELETE FROM merkle_leaf_info WHERE file_path = ?1",
+                [&path_str],
+            )?;
+
+            // Insert all node entries
+            for (hash_bytes, children_bytes) in &node_entries {
+                tx.execute(
+                    "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![path_str, hash_bytes, children_bytes],
+                )?;
+            }
+
+            // Insert all leaf info entries
+            for (hash_bytes, offset, length, chunk_index) in &leaf_entries {
+                tx.execute(
+                    "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![path_str, hash_bytes, offset, length, chunk_index],
+                )?;
+            }
+
+            // Also update the legacy merkle_cache table
+            {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+
+                tx.execute(
+                    "INSERT OR REPLACE INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, "".as_bytes(), now],
+                )?;
+            }
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Look up the children of a Merkle tree node by its hash.
+    ///
+    /// Returns `None` if the hash is not found or if deserialization fails.
+    pub async fn get_children(
+        &self,
+        path: &Path,
+        node_hash: &Blake3Hash,
+    ) -> SqliteResult<Option<Vec<MerkleChild>>> {
+        let path_str = path.to_string_lossy().to_string();
+        let hash_bytes = node_hash.as_bytes().to_vec();
+
+        let result = self
+            .call(move |conn: &mut rusqlite::Connection| {
+                conn.query_row(
+                    "SELECT children FROM merkle_tree_nodes WHERE file_path = ?1 AND node_hash = ?2",
+                    rusqlite::params![path_str, hash_bytes],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+            })
+            .await;
+
+        match result {
+            Ok(children_blob) => {
+                let children: Vec<MerkleChild> = match postcard::from_bytes(&children_blob) {
+                    Ok(c) => c,
+                    Err(_) => return Ok(None), // Graceful degradation on corrupt data
+                };
+                Ok(Some(children))
+            }
+            Err(e) => {
+                // tokio_rusqlite::Error wraps rusqlite::Error
+                if e.to_string().contains("Query returned no rows") {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Look up leaf metadata by chunk hash.
+    ///
+    /// Returns `None` if the chunk hash is not found.
+    pub async fn get_leaf_info(
+        &self,
+        path: &Path,
+        chunk_hash: &Blake3Hash,
+    ) -> SqliteResult<Option<LeafInfo>> {
+        let path_str = path.to_string_lossy().to_string();
+        let hash_bytes = chunk_hash.as_bytes().to_vec();
+        let hash_bytes_for_reconstruction = chunk_hash.clone();
+
+        let result = self
+            .call(move |conn: &mut rusqlite::Connection| {
+                conn.query_row(
+                    "SELECT chunk_hash, chunk_offset, chunk_length, chunk_index FROM merkle_leaf_info WHERE file_path = ?1 AND chunk_hash = ?2",
+                    rusqlite::params![path_str, hash_bytes],
+                    |row| {
+                        let offset: i64 = row.get(1)?;
+                        let length: i64 = row.get(2)?;
+                        let chunk_index: i64 = row.get(3)?;
+                        Ok((offset, length, chunk_index))
+                    },
+                )
+            })
+            .await;
+
+        match result {
+            Ok((offset, length, chunk_index)) => {
+                Ok(Some(LeafInfo {
+                    hash: hash_bytes_for_reconstruction,
+                    offset: offset as u64,
+                    length: length as u64,
+                    chunk_index: chunk_index as u32,
+                }))
+            }
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("Query returned no rows") {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
