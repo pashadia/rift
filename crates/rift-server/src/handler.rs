@@ -13,7 +13,7 @@ use futures::FutureExt;
 use prost::Message as _;
 use tracing::instrument;
 
-use rift_common::crypto::Blake3Hash;
+use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
     ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
@@ -651,9 +651,7 @@ pub async fn read_response<S: RiftStream>(
 }
 
 // ---------------------------------------------------------------------------
-// MerkleDrill handler (stub — will be replaced by hash-based lookup in Task 7)
-//
-// TODO(rift-gzg): Replace with hash-based lookup using Database::get_children()
+// MerkleDrill handler — hash-based lookup
 // ---------------------------------------------------------------------------
 
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
@@ -661,45 +659,121 @@ pub async fn merkle_drill_response<S: RiftStream>(
     stream: &mut S,
     payload: &[u8],
     share: &Path,
-    _db: Option<&Database>,
+    db: Option<&Database>,
     handle_db: &HandleDatabase,
 ) -> anyhow::Result<()> {
+    // Helper: send empty response and finish
+    async fn send_empty<S: RiftStream>(stream: &mut S) -> anyhow::Result<()> {
+        let response = MerkleDrillResponse {
+            parent_hash: vec![],
+            children: vec![],
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        Ok(())
+    }
+
+    // 1. Parse request
     let req = match MerkleDrill::decode(payload) {
         Ok(r) => r,
-        Err(_) => {
-            let response = MerkleDrillResponse {
-                parent_hash: vec![],
-                children: vec![],
-            };
-            stream
-                .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
-        }
+        Err(_) => return send_empty(stream).await,
     };
 
-    // Parse handle from bytes to UUID
-    let _handle = match Uuid::from_slice(&req.handle) {
+    // 2. Parse handle → UUID → resolve to canonical path
+    let handle = match Uuid::from_slice(&req.handle) {
         Ok(u) => u,
-        Err(_) => {
-            let response = MerkleDrillResponse {
-                parent_hash: vec![],
-                children: vec![],
-            };
-            stream
-                .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
+        Err(_) => return send_empty(stream).await,
+    };
+
+    let canonical = match handle_db.get_path(&handle) {
+        Some(p) => p,
+        None => return send_empty(stream).await,
+    };
+
+    // 3. Need a database for hash-based lookup
+    let database = match db {
+        Some(d) => d,
+        None => return send_empty(stream).await,
+    };
+
+    // 4. Read file content
+    let content = match tokio::fs::read(&canonical).await {
+        Ok(c) => c,
+        Err(_) => return send_empty(stream).await,
+    };
+
+    // 5. Build Merkle tree with cache
+    use rift_common::crypto::Chunker;
+
+    let chunker = Chunker::default();
+    let chunk_boundaries = chunker.chunk(&content);
+
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
+        .collect();
+
+    let merkle = MerkleTree::default();
+    let (root, cache, leaf_infos) = merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+    // 6. Store tree in DB
+    if let Ok(meta) = tokio::fs::metadata(&canonical).await {
+        let mtime_ns = meta
+            .modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
+            .unwrap_or(0);
+        let file_size = meta.len();
+        let _ = database
+            .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
+            .await;
+    }
+
+    // 7. Determine query hash
+    let query_hash = if req.hash.is_empty() {
+        root
+    } else {
+        match Blake3Hash::from_slice(&req.hash) {
+            Ok(h) => h,
+            Err(_) => return send_empty(stream).await,
         }
     };
 
-    // TODO(rift-gzg): Full hash-based implementation coming in Task 7
-    // For now, return empty response
+    // 8. Look up children
+    let children = match database.get_children(&canonical, &query_hash).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return send_empty(stream).await,
+        Err(_) => return send_empty(stream).await,
+    };
+
+    // 9. Convert to proto
+    let proto_children: Vec<MerkleChildProto> = children
+        .iter()
+        .map(|c| match c {
+            MerkleChild::Subtree(hash) => MerkleChildProto {
+                child_type: MerkleChildType::MerkleChildSubtree as i32,
+                hash: hash.as_bytes().to_vec(),
+                length: 0,
+                chunk_index: 0,
+            },
+            MerkleChild::Leaf {
+                hash,
+                length,
+                chunk_index,
+            } => MerkleChildProto {
+                child_type: MerkleChildType::MerkleChildLeaf as i32,
+                hash: hash.as_bytes().to_vec(),
+                length: *length,
+                chunk_index: *chunk_index,
+            },
+        })
+        .collect();
+
+    // 10. Send response
     let response = MerkleDrillResponse {
-        parent_hash: vec![],
-        children: vec![],
+        parent_hash: query_hash.as_bytes().to_vec(),
+        children: proto_children,
     };
     stream
         .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
