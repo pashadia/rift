@@ -328,7 +328,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_common::crypto::{Blake3Hash, MerkleTree, MerkleChild, LeafInfo};
+    use rift_common::crypto::{Blake3Hash, MerkleTree, LeafInfo};
     use std::collections::HashMap;
     use std::fs;
 
