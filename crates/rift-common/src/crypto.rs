@@ -496,7 +496,7 @@ mod proptests {
 }
 
 // ---------------------------------------------------------------------------
-// Tests for MerkleChild enum (bincode serialization)
+// Tests for MerkleChild enum (postcard serialization)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -507,8 +507,8 @@ mod merkle_child_tests {
     fn merkle_child_subtree_roundtrip() {
         let hash = Blake3Hash::new(b"subtree data");
         let child = MerkleChild::Subtree(hash.clone());
-        let encoded = bincode::serialize(&child).unwrap();
-        let decoded: MerkleChild = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_allocvec(&child).unwrap();
+        let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, child);
     }
 
@@ -520,8 +520,8 @@ mod merkle_child_tests {
             length: 65536,
             chunk_index: 42,
         };
-        let encoded = bincode::serialize(&child).unwrap();
-        let decoded: MerkleChild = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_allocvec(&child).unwrap();
+        let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, child);
     }
 
@@ -530,8 +530,8 @@ mod merkle_child_tests {
         let hash = Blake3Hash::new(b"deterministic");
         let child1 = MerkleChild::Subtree(hash.clone());
         let child2 = MerkleChild::Subtree(hash.clone());
-        let enc1 = bincode::serialize(&child1).unwrap();
-        let enc2 = bincode::serialize(&child2).unwrap();
+        let enc1 = postcard::to_allocvec(&child1).unwrap();
+        let enc2 = postcard::to_allocvec(&child2).unwrap();
         assert_eq!(enc1, enc2);
     }
 
@@ -543,8 +543,8 @@ mod merkle_child_tests {
             length: 131072,
             chunk_index: 7,
         };
-        let encoded = bincode::serialize(&child).unwrap();
-        let decoded: MerkleChild = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_allocvec(&child).unwrap();
+        let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             MerkleChild::Leaf {
                 hash: h,

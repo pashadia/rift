@@ -12,7 +12,7 @@ name = "rift-server"
 path = "src/main.rs"
 
 [dependencies]
-bincode = "1"
+postcard = { version = "1", features = ["alloc"] }
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
