@@ -84,6 +84,16 @@ pub struct MerkleNode {
     pub size: u64,
 }
 
+/// Metadata for a leaf (chunk) in the Merkle tree.
+///
+/// Stored in the `merkle_leaf_info` DB table for O(1) chunk lookup by hash.
+pub struct LeafInfo {
+    pub hash: Blake3Hash,
+    pub offset: u64,
+    pub length: u64,
+    pub chunk_index: u32,
+}
+
 /// A child node in the hash-based Merkle tree.
 ///
 /// Each child is either a subtree reference (intermediate node)
@@ -227,6 +237,46 @@ impl MerkleTree {
 
         let root = current_level.into_iter().next().unwrap();
         (root, cache)
+    }
+
+    /// Build a Merkle tree with chunk offset/length metadata.
+    ///
+    /// Returns (root, cache, leaf_infos) where leaf_infos contains
+    /// per-chunk metadata suitable for DB storage.
+    /// The `chunk_boundaries` slice must be the same length as `leaf_hashes`
+    /// and provide (offset, length) for each chunk.
+    pub fn build_with_cache_and_offsets(
+        &self,
+        leaf_hashes: &[Blake3Hash],
+        chunk_boundaries: &[(usize, usize)],
+    ) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>, Vec<LeafInfo>) {
+        assert_eq!(leaf_hashes.len(), chunk_boundaries.len(), "leaf_hashes and chunk_boundaries must have same length");
+
+        let (root, mut cache) = self.build_with_cache(leaf_hashes);
+
+        let leaf_infos: Vec<LeafInfo> = leaf_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| LeafInfo {
+                hash: hash.clone(),
+                offset: chunk_boundaries[i].0 as u64,
+                length: chunk_boundaries[i].1 as u64,
+                chunk_index: i as u32,
+            })
+            .collect();
+
+        // Fill in length field on leaf MerkleChild entries
+        for children in cache.values_mut() {
+            for child in children.iter_mut() {
+                if let MerkleChild::Leaf { hash, length, .. } = child {
+                    if let Some(info) = leaf_infos.iter().find(|info| info.hash == *hash) {
+                        *length = info.length;
+                    }
+                }
+            }
+        }
+
+        (root, cache, leaf_infos)
     }
 }
 
@@ -1004,5 +1054,49 @@ mod merkle_cache_tests {
         let (root, cache) = tree.build_with_cache(&[]);
         assert_eq!(root, Blake3Hash::new(&[]));
         assert!(cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod merkle_offset_tests {
+    use super::*;
+
+    #[test]
+    fn build_with_offsets_returns_leaf_infos() {
+        let tree = MerkleTree::default();
+        let data: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 100]).collect();
+        let leaf_hashes: Vec<Blake3Hash> = data.iter().map(|d| Blake3Hash::new(d)).collect();
+        let chunk_boundaries: Vec<(usize, usize)> = vec![
+            (0, 100), (100, 100), (200, 100), (300, 100), (400, 100),
+        ];
+
+        let (_, _, leaf_infos) = tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+        assert_eq!(leaf_infos.len(), 5);
+        for (i, info) in leaf_infos.iter().enumerate() {
+            assert_eq!(info.chunk_index, i as u32);
+            assert_eq!(info.offset, i as u64 * 100);
+            assert_eq!(info.length, 100);
+            assert_eq!(info.hash, leaf_hashes[i]);
+        }
+    }
+
+    #[test]
+    fn build_with_offsets_fills_leaf_length_in_cache() {
+        let tree = MerkleTree::default();
+        let leaf_hashes: Vec<Blake3Hash> = (0..5).map(|i| Blake3Hash::new(&[i])).collect();
+        let chunk_boundaries: Vec<(usize, usize)> = vec![
+            (0, 50), (50, 60), (110, 70), (180, 80), (260, 90),
+        ];
+
+        let (_, cache, _) = tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+        // All leaf children in cache should have correct lengths
+        for children in cache.values() {
+            for child in children {
+                if let MerkleChild::Leaf { length, chunk_index, .. } = child {
+                    let expected_lengths = [50u64, 60, 70, 80, 90];
+                    assert_eq!(*length, expected_lengths[*chunk_index as usize]);
+                }
+            }
+        }
     }
 }
