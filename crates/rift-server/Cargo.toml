@@ -12,6 +12,7 @@ name = "rift-server"
 path = "src/main.rs"
 
 [dependencies]
+bincode = "1"
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

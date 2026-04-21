@@ -148,6 +148,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_common::crypto::{Blake3Hash, MerkleTree, MerkleChild, LeafInfo};
+    use std::collections::HashMap;
     use std::fs;
 
     fn file_mtime_ns(path: &Path) -> u64 {
@@ -275,5 +277,70 @@ mod tests {
             let entry = result.unwrap();
             assert_eq!(entry.root, root);
         }
+    }
+
+    #[tokio::test]
+    async fn put_tree_and_get_children_root() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        // Build a small tree: 2 leaves
+        let tree = MerkleTree::default();
+        let leaves = vec![Blake3Hash::new(b"chunk1"), Blake3Hash::new(b"chunk2")];
+        let chunks = vec![(0usize, 5usize), (5usize, 6usize)]; // fake chunk boundaries
+        let (root, cache, leaf_infos) = tree.build_with_cache_and_offsets(&leaves, &chunks);
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime_ns = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+
+        db.put_tree(&file_path, mtime_ns, meta.len(), &root, &cache, &leaf_infos).await.unwrap();
+
+        // Query root's children
+        let children = db.get_children(&file_path, &root).await.unwrap();
+        assert!(children.is_some(), "Root should have children in DB");
+        let children = children.unwrap();
+        assert_eq!(children.len(), 2, "Root should have 2 children (2 leaves)");
+    }
+
+    #[tokio::test]
+    async fn get_children_nonexistent_hash_returns_none() {
+        let db = Database::open_in_memory().await.unwrap();
+        let file_path = std::path::PathBuf::from("/tmp/nonexistent.txt");
+        let fake_hash = Blake3Hash::new(b"does not exist");
+        let result = db.get_children(&file_path, &fake_hash).await.unwrap();
+        assert!(result.is_none(), "Non-existent hash should return None");
+    }
+
+    #[tokio::test]
+    async fn get_leaf_info_by_hash() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let chunk_hash = Blake3Hash::new(b"chunk1");
+        let leaf_infos = vec![LeafInfo {
+            hash: chunk_hash.clone(),
+            offset: 0,
+            length: 100,
+            chunk_index: 0,
+        }];
+        let root = Blake3Hash::new(b"root");
+        let cache = HashMap::new(); // empty cache for this test
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime_ns = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+
+        db.put_tree(&file_path, mtime_ns, meta.len(), &root, &cache, &leaf_infos).await.unwrap();
+
+        let info = db.get_leaf_info(&file_path, &chunk_hash).await.unwrap();
+        assert!(info.is_some(), "Should find leaf info for known chunk hash");
+        let info = info.unwrap();
+        assert_eq!(info.hash, chunk_hash);
+        assert_eq!(info.offset, 0);
+        assert_eq!(info.length, 100);
+        assert_eq!(info.chunk_index, 0);
     }
 }
