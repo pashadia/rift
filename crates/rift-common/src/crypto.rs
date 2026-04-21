@@ -1,10 +1,12 @@
 //! Cryptographic primitives: BLAKE3 hashing, FastCDC chunking, Merkle trees
 
+use std::collections::HashMap;
+
 use blake3::Hasher;
 use fastcdc::v2020::FastCDC;
 
 /// BLAKE3 hash wrapper
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Blake3Hash([u8; 32]);
 
 impl Blake3Hash {
@@ -82,6 +84,33 @@ pub struct MerkleNode {
     pub size: u64,
 }
 
+/// Metadata for a leaf (chunk) in the Merkle tree.
+///
+/// Stored in the `merkle_leaf_info` DB table for O(1) chunk lookup by hash.
+pub struct LeafInfo {
+    pub hash: Blake3Hash,
+    pub offset: u64,
+    pub length: u64,
+    pub chunk_index: u32,
+}
+
+/// A child node in the hash-based Merkle tree.
+///
+/// Each child is either a subtree reference (intermediate node)
+/// or a leaf (actual chunk with metadata).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MerkleChild {
+    /// Intermediate node — hash points to a subtree whose children
+    /// can be queried with another MerkleDrill.
+    Subtree(Blake3Hash),
+    /// Leaf node — actual chunk with metadata.
+    Leaf {
+        hash: Blake3Hash,
+        length: u64,
+        chunk_index: u32,
+    },
+}
+
 /// Simple 64-ary Merkle tree builder
 pub struct MerkleTree {
     fanout: usize,
@@ -154,6 +183,110 @@ impl MerkleTree {
             leaves.push(Blake3Hash::from_slice(chunk).unwrap());
         }
         Ok(leaves)
+    }
+
+    /// Build a Merkle tree and return the root hash plus a cache of parent→children.
+    ///
+    /// The `cache` maps each intermediate node's hash to its children (as `MerkleChild`).
+    /// Leaf nodes appear as `MerkleChild::Leaf` entries in the cache at the level above them.
+    ///
+    /// Uses level-based leaf detection: nodes at the bottom level are always leaves,
+    /// nodes at higher levels are always subtrees. This avoids any ambiguity from
+    /// hash-based lookup (which would theoretically misdetect an intermediate hash
+    /// that collides with a leaf hash, though BLAKE3 makes this astronomically unlikely).
+    pub fn build_with_cache(
+        &self,
+        leaf_hashes: &[Blake3Hash],
+    ) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>) {
+        if leaf_hashes.is_empty() {
+            return (Blake3Hash::new(&[]), HashMap::new());
+        }
+
+        if leaf_hashes.len() == 1 {
+            let root = leaf_hashes[0].clone();
+            let mut cache = HashMap::new();
+            cache.insert(
+                root.clone(),
+                vec![MerkleChild::Leaf {
+                    hash: leaf_hashes[0].clone(),
+                    length: 0,
+                    chunk_index: 0,
+                }],
+            );
+            return (root, cache);
+        }
+
+        let mut cache: HashMap<Blake3Hash, Vec<MerkleChild>> = HashMap::new();
+        let mut current_level: Vec<Blake3Hash> = leaf_hashes.to_vec();
+        let mut is_bottom_level = true;
+
+        while current_level.len() > 1 {
+            let mut next_level = Vec::new();
+            for (chunk_idx, chunk) in current_level.chunks(self.fanout).enumerate() {
+                let mut hasher = Hasher::new();
+                let mut children = Vec::with_capacity(chunk.len());
+                for (i, hash) in chunk.iter().enumerate() {
+                    hasher.update(hash.as_bytes());
+                    if is_bottom_level {
+                        children.push(MerkleChild::Leaf {
+                            hash: hash.clone(),
+                            length: 0,
+                            chunk_index: (chunk_idx * self.fanout + i) as u32,
+                        });
+                    } else {
+                        children.push(MerkleChild::Subtree(hash.clone()));
+                    }
+                }
+                let parent_hash = Blake3Hash(*hasher.finalize().as_bytes());
+                cache.insert(parent_hash.clone(), children);
+                next_level.push(parent_hash);
+            }
+            is_bottom_level = false;
+            current_level = next_level;
+        }
+
+        let root = current_level.into_iter().next().unwrap();
+        (root, cache)
+    }
+
+    /// Build a Merkle tree with chunk offset/length metadata.
+    ///
+    /// Returns (root, cache, leaf_infos) where leaf_infos contains
+    /// per-chunk metadata suitable for DB storage.
+    /// The `chunk_boundaries` slice must be the same length as `leaf_hashes`
+    /// and provide (offset, length) for each chunk.
+    pub fn build_with_cache_and_offsets(
+        &self,
+        leaf_hashes: &[Blake3Hash],
+        chunk_boundaries: &[(usize, usize)],
+    ) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>, Vec<LeafInfo>) {
+        assert_eq!(leaf_hashes.len(), chunk_boundaries.len(), "leaf_hashes and chunk_boundaries must have same length");
+
+        let (root, mut cache) = self.build_with_cache(leaf_hashes);
+
+        let leaf_infos: Vec<LeafInfo> = leaf_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| LeafInfo {
+                hash: hash.clone(),
+                offset: chunk_boundaries[i].0 as u64,
+                length: chunk_boundaries[i].1 as u64,
+                chunk_index: i as u32,
+            })
+            .collect();
+
+        // Fill in length field on leaf MerkleChild entries
+        for children in cache.values_mut() {
+            for child in children.iter_mut() {
+                if let MerkleChild::Leaf { hash, length, .. } = child {
+                    if let Some(info) = leaf_infos.iter().find(|info| info.hash == *hash) {
+                        *length = info.length;
+                    }
+                }
+            }
+        }
+
+        (root, cache, leaf_infos)
     }
 }
 
@@ -368,6 +501,71 @@ mod proptests {
             let tree = MerkleTree::default();
             let root = tree.build(&[]);
             prop_assert_eq!(root.as_bytes().len(), 32);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for MerkleChild enum (postcard serialization)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod merkle_child_tests {
+    use super::*;
+
+    #[test]
+    fn merkle_child_subtree_roundtrip() {
+        let hash = Blake3Hash::new(b"subtree data");
+        let child = MerkleChild::Subtree(hash.clone());
+        let encoded = postcard::to_allocvec(&child).unwrap();
+        let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, child);
+    }
+
+    #[test]
+    fn merkle_child_leaf_roundtrip() {
+        let hash = Blake3Hash::new(b"leaf data");
+        let child = MerkleChild::Leaf {
+            hash: hash.clone(),
+            length: 65536,
+            chunk_index: 42,
+        };
+        let encoded = postcard::to_allocvec(&child).unwrap();
+        let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, child);
+    }
+
+    #[test]
+    fn merkle_child_deterministic_serialization() {
+        let hash = Blake3Hash::new(b"deterministic");
+        let child1 = MerkleChild::Subtree(hash.clone());
+        let child2 = MerkleChild::Subtree(hash.clone());
+        let enc1 = postcard::to_allocvec(&child1).unwrap();
+        let enc2 = postcard::to_allocvec(&child2).unwrap();
+        assert_eq!(enc1, enc2);
+    }
+
+    #[test]
+    fn merkle_child_leaf_preserves_all_fields() {
+        let hash = Blake3Hash::new(b"chunk");
+        let child = MerkleChild::Leaf {
+            hash: hash.clone(),
+            length: 131072,
+            chunk_index: 7,
+        };
+        let encoded = postcard::to_allocvec(&child).unwrap();
+        let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
+        match decoded {
+            MerkleChild::Leaf {
+                hash: h,
+                length,
+                chunk_index,
+            } => {
+                assert_eq!(h, hash);
+                assert_eq!(length, 131072);
+                assert_eq!(chunk_index, 7);
+            }
+            MerkleChild::Subtree(_) => panic!("expected Leaf variant"),
         }
     }
 }
@@ -748,5 +946,170 @@ mod merkle_ext_tests {
         let root_4097 = tree.build(&leaves_4097);
 
         assert_ne!(root_4096, root_4097);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for build_with_cache() method (cache-returning Merkle tree builder)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod merkle_cache_tests {
+    use super::*;
+
+    #[test]
+    fn build_with_cache_single_leaf_is_identity() {
+        let tree = MerkleTree::default();
+        let leaf = Blake3Hash::new(b"single");
+        let (root, cache) = tree.build_with_cache(std::slice::from_ref(&leaf));
+        assert_eq!(root, leaf);
+        assert_eq!(cache.len(), 1, "single leaf should have root → [leaf] in cache");
+        let children = &cache[&root];
+        assert_eq!(children.len(), 1);
+        assert!(matches!(&children[0], MerkleChild::Leaf { hash, .. } if hash == &leaf));
+    }
+
+    #[test]
+    fn build_with_cache_two_to_63_leaves_single_level() {
+        let tree = MerkleTree::default();
+        for n in [2, 5, 32, 63] {
+            let leaves: Vec<_> = (0..n).map(|i| Blake3Hash::new(&[i as u8])).collect();
+            let (root, cache) = tree.build_with_cache(&leaves);
+            assert_eq!(
+                cache.len(),
+                1,
+                "n={n}: should have exactly 1 intermediate node"
+            );
+            let children = &cache[&root];
+            assert_eq!(children.len(), n, "n={n}: root should have {n} children");
+        }
+    }
+
+    #[test]
+    fn build_with_cache_64_leaves() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<_> = (0..64).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let (root, cache) = tree.build_with_cache(&leaves);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[&root].len(), 64);
+    }
+
+    #[test]
+    fn build_with_cache_65_leaves_two_intermediates() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<_> = (0..65).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let (root, cache) = tree.build_with_cache(&leaves);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache[&root].len(), 2);
+    }
+
+    #[test]
+    fn build_with_cache_matches_existing_build_root() {
+        let tree = MerkleTree::default();
+        for n in [1, 2, 10, 63, 64, 65, 128, 200, 500] {
+            let leaves: Vec<_> = (0..n)
+                .map(|i| Blake3Hash::new(&(i as u64).to_le_bytes()))
+                .collect();
+            let root_existing = tree.build(&leaves);
+            let (root_cached, _) = tree.build_with_cache(&leaves);
+            assert_eq!(
+                root_existing, root_cached,
+                "n={n}: root should match existing build()"
+            );
+        }
+    }
+
+    #[test]
+    fn build_with_cache_children_count_invariant() {
+        let tree = MerkleTree::default();
+        for n in [5, 64, 65, 200, 500] {
+            let leaves: Vec<_> = (0..n)
+                .map(|i| Blake3Hash::new(&(i as u64).to_le_bytes()))
+                .collect();
+            let (_, cache) = tree.build_with_cache(&leaves);
+            let total_leaves: usize = cache
+                .values()
+                .map(|children| {
+                    children
+                        .iter()
+                        .filter(|c| matches!(c, MerkleChild::Leaf { .. }))
+                        .count()
+                })
+                .sum();
+            assert_eq!(total_leaves, n, "n={n}: leaf count must match input");
+        }
+    }
+
+    #[test]
+    fn build_with_cache_leaf_children_have_correct_index() {
+        let tree = MerkleTree::default();
+        let leaves: Vec<_> = (0..5).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let (_, cache) = tree.build_with_cache(&leaves);
+        let leaf_children: Vec<_> = cache
+            .values()
+            .flatten()
+            .filter_map(|c| match c {
+                MerkleChild::Leaf {
+                    chunk_index, hash, ..
+                } => Some((*chunk_index, hash.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(leaf_children.len(), 5);
+        for (chunk_index, hash) in &leaf_children {
+            assert_eq!(*hash, leaves[*chunk_index as usize]);
+        }
+    }
+
+    #[test]
+    fn build_with_cache_empty() {
+        let tree = MerkleTree::default();
+        let (root, cache) = tree.build_with_cache(&[]);
+        assert_eq!(root, Blake3Hash::new(&[]));
+        assert!(cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod merkle_offset_tests {
+    use super::*;
+
+    #[test]
+    fn build_with_offsets_returns_leaf_infos() {
+        let tree = MerkleTree::default();
+        let data: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 100]).collect();
+        let leaf_hashes: Vec<Blake3Hash> = data.iter().map(|d| Blake3Hash::new(d)).collect();
+        let chunk_boundaries: Vec<(usize, usize)> = vec![
+            (0, 100), (100, 100), (200, 100), (300, 100), (400, 100),
+        ];
+
+        let (_, _, leaf_infos) = tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+        assert_eq!(leaf_infos.len(), 5);
+        for (i, info) in leaf_infos.iter().enumerate() {
+            assert_eq!(info.chunk_index, i as u32);
+            assert_eq!(info.offset, i as u64 * 100);
+            assert_eq!(info.length, 100);
+            assert_eq!(info.hash, leaf_hashes[i]);
+        }
+    }
+
+    #[test]
+    fn build_with_offsets_fills_leaf_length_in_cache() {
+        let tree = MerkleTree::default();
+        let leaf_hashes: Vec<Blake3Hash> = (0..5).map(|i| Blake3Hash::new(&[i])).collect();
+        let chunk_boundaries: Vec<(usize, usize)> = vec![
+            (0, 50), (50, 60), (110, 70), (180, 80), (260, 90),
+        ];
+
+        let (_, cache, _) = tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+        // All leaf children in cache should have correct lengths
+        for children in cache.values() {
+            for child in children {
+                if let MerkleChild::Leaf { length, chunk_index, .. } = child {
+                    let expected_lengths = [50u64, 60, 70, 80, 90];
+                    assert_eq!(*length, expected_lengths[*chunk_index as usize]);
+                }
+            }
+        }
     }
 }

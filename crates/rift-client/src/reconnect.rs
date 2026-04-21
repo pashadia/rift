@@ -163,17 +163,16 @@ impl RemoteShare for ReconnectingClient {
     async fn merkle_drill(
         &self,
         handle: Uuid,
-        level: u32,
-        subtrees: &[u32],
+        hash: &[u8],
     ) -> anyhow::Result<MerkleDrillResult> {
-        let subtrees = subtrees.to_vec();
+        let hash = hash.to_vec();
         let client = self.client.clone();
         self.with_reconnect(move || {
-            let subtrees = subtrees.clone();
+            let hash = hash.clone();
             let client = client.clone();
             async move {
                 let client = client.lock().await;
-                let resp = client.merkle_drill(handle, level, &subtrees).await?;
+                let resp = client.merkle_drill(handle, &hash).await?;
                 Ok(resp.into())
             }
         })

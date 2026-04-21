@@ -51,7 +51,7 @@ pub mod msg {
 
     // Merkle operations
     pub const MERKLE_DRILL: u8 = 0x50;
-    pub const MERKLE_LEVEL_RESPONSE: u8 = 0x51;
+    pub const MERKLE_DRILL_RESPONSE: u8 = 0x51;  // was MERKLE_LEVEL_RESPONSE
     pub const MERKLE_LEAVES_RESPONSE: u8 = 0x52;
 
     // Notifications (deferred from PoC)
@@ -422,41 +422,56 @@ mod tests {
     // --- Merkle ---
 
     #[test]
-    fn merkle_drill_root_level() {
+    fn merkle_drill_hash_based_roundtrip() {
         let msg = MerkleDrill {
             handle: b"file-handle".to_vec(),
-            level: 0,
-            subtrees: vec![],
+            hash: vec![0xAB; 32],
         };
         let encoded = msg.encode_to_vec();
         let decoded = MerkleDrill::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.level, 0);
-        assert!(decoded.subtrees.is_empty());
+        assert_eq!(decoded.handle, b"file-handle");
+        assert_eq!(decoded.hash, vec![0xAB; 32]);
     }
 
     #[test]
-    fn merkle_drill_specific_subtrees() {
+    fn merkle_drill_empty_hash_requests_root() {
         let msg = MerkleDrill {
-            handle: b"file-handle".to_vec(),
-            level: 1,
-            subtrees: vec![12, 47],
+            handle: b"root-request".to_vec(),
+            hash: vec![],
         };
         let encoded = msg.encode_to_vec();
         let decoded = MerkleDrill::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.subtrees, vec![12, 47]);
+        assert!(decoded.hash.is_empty());
     }
 
     #[test]
-    fn merkle_level_response_round_trip() {
-        let msg = MerkleLevelResponse {
-            level: 1,
-            hashes: vec![vec![0xAA; 32], vec![0xBB; 32]],
-            subtree_bytes: vec![131072, 262144],
+    fn merkle_drill_response_roundtrip() {
+        let msg = MerkleDrillResponse {
+            parent_hash: vec![0xFF; 32],
+            children: vec![
+                MerkleChildProto {
+                    child_type: MerkleChildType::MerkleChildSubtree as i32,
+                    hash: vec![0xAA; 32],
+                    length: 0,
+                    chunk_index: 0,
+                },
+                MerkleChildProto {
+                    child_type: MerkleChildType::MerkleChildLeaf as i32,
+                    hash: vec![0xBB; 32],
+                    length: 131072,
+                    chunk_index: 7,
+                },
+            ],
         };
         let encoded = msg.encode_to_vec();
-        let decoded = MerkleLevelResponse::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.hashes.len(), 2);
-        assert_eq!(decoded.subtree_bytes, vec![131072, 262144]);
+        let decoded = MerkleDrillResponse::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.parent_hash, vec![0xFF; 32]);
+        assert_eq!(decoded.children.len(), 2);
+        assert_eq!(decoded.children[0].child_type, MerkleChildType::MerkleChildSubtree as i32);
+        assert_eq!(decoded.children[0].hash, vec![0xAA; 32]);
+        assert_eq!(decoded.children[1].child_type, MerkleChildType::MerkleChildLeaf as i32);
+        assert_eq!(decoded.children[1].length, 131072);
+        assert_eq!(decoded.children[1].chunk_index, 7);
     }
 
     #[test]
@@ -1039,7 +1054,7 @@ mod tests {
             WRITE_COMMIT,
             WRITE_RESPONSE,
             MERKLE_DRILL,
-            MERKLE_LEVEL_RESPONSE,
+            MERKLE_DRILL_RESPONSE,
             MERKLE_LEAVES_RESPONSE,
             FILE_CHANGED,
             FILE_CREATED,

@@ -36,9 +36,9 @@ use uuid::Uuid;
 use rift_common::FsError;
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ErrorCode,
-    FileAttrs, LookupRequest, LookupResponse, MerkleDrill, MerkleLevelResponse, ReadRequest,
-    ReadResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, ShareInfo, StatRequest,
-    StatResponse, TransferComplete, WhoamiRequest, WhoamiResponse,
+    FileAttrs, LookupRequest, LookupResponse, MerkleChildType, MerkleDrill, MerkleDrillResponse,
+    ReadRequest, ReadResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, ShareInfo,
+    StatRequest, StatResponse, TransferComplete, WhoamiRequest, WhoamiResponse,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, QuicConnection, RiftConnection,
@@ -655,14 +655,18 @@ impl<C: RiftConnection> RiftClient<C> {
         })
     }
 
-    /// Fetch Merkle tree levels from the server.
-    #[instrument(skip(self), fields(level, subtrees_len = subtrees.len()))]
-    pub async fn merkle_drill(
-        &self,
-        handle: Uuid,
-        level: u32,
-        subtrees: &[u32],
-    ) -> Result<MerkleLevelResponse> {
+    // ---------------------------------------------------------------------------
+    // MerkleDrill
+    // ---------------------------------------------------------------------------
+
+    /// Fetch children of a node in the Merkle tree from the server.
+    ///
+    /// - `handle`: The file handle
+    /// - `hash`: Hash of the node to query (empty = request root's children)
+    ///
+    /// Returns `MerkleDrillResponse` with parent_hash and children list.
+    #[instrument(skip(self), fields(hash_len = hash.len()))]
+    pub async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> Result<MerkleDrillResponse> {
         let mut stream = self
             .conn
             .open_stream()
@@ -671,8 +675,7 @@ impl<C: RiftConnection> RiftClient<C> {
 
         let req = MerkleDrill {
             handle: handle.as_bytes().to_vec(),
-            level,
-            subtrees: subtrees.to_vec(),
+            hash: hash.to_vec(),
         };
         stream
             .send_frame(msg::MERKLE_DRILL, &req.encode_to_vec())
@@ -683,7 +686,7 @@ impl<C: RiftConnection> RiftClient<C> {
             anyhow::anyhow!("merkle_drill: server closed stream without response")
         })?;
 
-        let response = MerkleLevelResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
+        let response = MerkleDrillResponse::decode(payload.as_ref()).map_err(|_| FsError::Io)?;
 
         Ok(response)
     }
@@ -808,22 +811,39 @@ impl<C: RiftConnection> RiftClient<rift_transport::RecordingConnection<C>> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // RemoteShare impl (Linux only)
 // ---------------------------------------------------------------------------
 
 /// Wrapper type for MerkleDrill results, simplifying the protocol response.
 pub struct MerkleDrillResult {
-    pub hashes: Vec<Vec<u8>>,
-    pub sizes: Vec<u64>,
+    pub parent_hash: Vec<u8>,
+    pub children: Vec<MerkleChildInfo>,
 }
 
-impl From<MerkleLevelResponse> for MerkleDrillResult {
-    fn from(resp: MerkleLevelResponse) -> Self {
+/// Information about a child node returned from merkle drill.
+pub struct MerkleChildInfo {
+    pub is_subtree: bool,
+    pub hash: Vec<u8>,
+    pub length: u64,
+    pub chunk_index: u32,
+}
+
+impl From<MerkleDrillResponse> for MerkleDrillResult {
+    fn from(resp: MerkleDrillResponse) -> Self {
+        let children: Vec<MerkleChildInfo> = resp
+            .children
+            .iter()
+            .map(|c| MerkleChildInfo {
+                is_subtree: c.child_type == MerkleChildType::MerkleChildSubtree as i32,
+                hash: c.hash.clone(),
+                length: c.length,
+                chunk_index: c.chunk_index,
+            })
+            .collect();
         Self {
-            hashes: resp.hashes,
-            sizes: resp.subtree_bytes,
+            parent_hash: resp.parent_hash,
+            children,
         }
     }
 }
@@ -859,13 +879,8 @@ impl crate::remote::RemoteShare for RiftClient<QuicConnection> {
         self.read_chunks(handle, start_chunk, chunk_count).await
     }
 
-    async fn merkle_drill(
-        &self,
-        handle: Uuid,
-        level: u32,
-        subtrees: &[u32],
-    ) -> anyhow::Result<MerkleDrillResult> {
-        let resp = self.merkle_drill(handle, level, subtrees).await?;
+    async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
+        let resp = self.merkle_drill(handle, hash).await?;
         Ok(resp.into())
     }
 }
@@ -1338,7 +1353,11 @@ mod tests {
         });
 
         client.stat(root).await.unwrap();
-        assert_eq!(client.stream_count(), 1, "stream_count must be exactly 1 after one stat");
+        assert_eq!(
+            client.stream_count(),
+            1,
+            "stream_count must be exactly 1 after one stat"
+        );
     }
 
     #[tokio::test]
@@ -1369,7 +1388,10 @@ mod tests {
         client.stat(root).await.unwrap();
 
         let frames = client.recorded_frames();
-        assert!(!frames.is_empty(), "recorded_frames must not be empty after stat");
+        assert!(
+            !frames.is_empty(),
+            "recorded_frames must not be empty after stat"
+        );
         assert_eq!(
             frames[0].type_id,
             msg::STAT_REQUEST,

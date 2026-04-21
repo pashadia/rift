@@ -13,13 +13,13 @@ use futures::FutureExt;
 use prost::Message as _;
 use tracing::instrument;
 
-use rift_common::crypto::Blake3Hash;
+use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
     ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
-    MerkleDrill, MerkleLevelResponse, ReadRequest, ReadResponse, ReadSuccess, ReaddirEntry,
-    ReaddirRequest, ReaddirResponse, ReaddirSuccess, StatRequest, StatResponse, StatResult,
-    TransferComplete,
+    MerkleChildProto, MerkleChildType, MerkleDrill, MerkleDrillResponse, ReadRequest, ReadResponse,
+    ReadSuccess, ReaddirEntry, ReaddirRequest, ReaddirResponse, ReaddirSuccess, StatRequest,
+    StatResponse, StatResult, TransferComplete,
 };
 use rift_transport::RiftStream;
 
@@ -651,7 +651,7 @@ pub async fn read_response<S: RiftStream>(
 }
 
 // ---------------------------------------------------------------------------
-// MerkleDrill handler
+// MerkleDrill handler — hash-based lookup
 // ---------------------------------------------------------------------------
 
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
@@ -662,147 +662,122 @@ pub async fn merkle_drill_response<S: RiftStream>(
     db: Option<&Database>,
     handle_db: &HandleDatabase,
 ) -> anyhow::Result<()> {
+    // Helper: send empty response and finish
+    async fn send_empty<S: RiftStream>(stream: &mut S) -> anyhow::Result<()> {
+        let response = MerkleDrillResponse {
+            parent_hash: vec![],
+            children: vec![],
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        Ok(())
+    }
+
+    // 1. Parse request
     let req = match MerkleDrill::decode(payload) {
         Ok(r) => r,
-        Err(_) => {
-            let response = MerkleLevelResponse {
-                level: 0,
-                hashes: vec![],
-                subtree_bytes: vec![],
-            };
-            stream
-                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
-        }
+        Err(_) => return send_empty(stream).await,
     };
 
-    // Parse handle from bytes to UUID at the network boundary
+    // 2. Parse handle → UUID → resolve to canonical path
     let handle = match Uuid::from_slice(&req.handle) {
         Ok(u) => u,
-        Err(_) => {
-            let response = MerkleLevelResponse {
-                level: req.level,
-                hashes: vec![],
-                subtree_bytes: vec![],
-            };
-            stream
-                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
-        }
+        Err(_) => return send_empty(stream).await,
     };
 
     let canonical = match resolve(share, &handle, handle_db).await {
         Ok(p) => p,
-        Err(_) => {
-            let response = MerkleLevelResponse {
-                level: req.level,
-                hashes: vec![],
-                subtree_bytes: vec![],
-            };
-            stream
-                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
-        }
+        Err(_) => return send_empty(stream).await,
     };
 
+    // 3. Need a database for hash-based lookup
+    let database = match db {
+        Some(d) => d,
+        None => return send_empty(stream).await,
+    };
+
+    // 4. Read file content
     let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
-        Err(_) => {
-            let response = MerkleLevelResponse {
-                level: req.level,
-                hashes: vec![],
-                subtree_bytes: vec![],
-            };
-            stream
-                .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
-        }
+        Err(_) => return send_empty(stream).await,
     };
 
-    use rift_common::crypto::{Chunker, MerkleTree};
+    // 5. Build Merkle tree with cache
+    use rift_common::crypto::Chunker;
+
     let chunker = Chunker::default();
     let chunk_boundaries = chunker.chunk(&content);
 
     let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
         .iter()
-        .map(|(offset, length)| {
-            let chunk_data = &content[*offset..*offset + length];
-            Blake3Hash::new(chunk_data)
-        })
+        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
         .collect();
 
     let merkle = MerkleTree::default();
-    let root = merkle.build(&leaf_hashes);
+    let (root, cache, leaf_infos) =
+        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
 
-    // Level 0 = root hash only
-    if req.level == 0 {
-        let response = MerkleLevelResponse {
-            level: 0,
-            hashes: vec![root.as_bytes().to_vec()],
-            subtree_bytes: vec![content.len() as u64],
-        };
-        stream
-            .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
+    // 6. Store tree in DB
+    if let Ok(meta) = tokio::fs::metadata(&canonical).await {
+        let mtime_ns = meta
+            .modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
+            .unwrap_or(0);
+        let file_size = meta.len();
+        let _ = database
+            .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
+            .await;
+    }
 
-        if let Some(database) = db {
-            if let Ok(meta) = tokio::fs::metadata(&canonical).await {
-                let mtime_ns = meta
-                    .modified()
-                    .map(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0);
-                let _ = database
-                    .put_merkle(&canonical, mtime_ns, meta.len(), &root, &leaf_hashes)
-                    .await;
-            }
+    // 7. Determine query hash
+    let query_hash = if req.hash.is_empty() {
+        root
+    } else {
+        match Blake3Hash::from_slice(&req.hash) {
+            Ok(h) => h,
+            Err(_) => return send_empty(stream).await,
         }
+    };
 
-        return Ok(());
-    }
+    // 8. Look up children
+    let children = match database.get_children(&canonical, &query_hash).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return send_empty(stream).await,
+        Err(_) => return send_empty(stream).await,
+    };
 
-    // Level 1 = chunk hashes (the leaf level content hashes)
-    if req.level == 1 {
-        let hashes: Vec<Vec<u8>> = leaf_hashes.iter().map(|h| h.as_bytes().to_vec()).collect();
+    // 9. Convert to proto
+    let proto_children: Vec<MerkleChildProto> = children
+        .iter()
+        .map(|c| match c {
+            MerkleChild::Subtree(hash) => MerkleChildProto {
+                child_type: MerkleChildType::MerkleChildSubtree as i32,
+                hash: hash.as_bytes().to_vec(),
+                length: 0,
+                chunk_index: 0,
+            },
+            MerkleChild::Leaf {
+                hash,
+                length,
+                chunk_index,
+            } => MerkleChildProto {
+                child_type: MerkleChildType::MerkleChildLeaf as i32,
+                hash: hash.as_bytes().to_vec(),
+                length: *length,
+                chunk_index: *chunk_index,
+            },
+        })
+        .collect();
 
-        let sizes: Vec<u64> = chunk_boundaries
-            .iter()
-            .map(|(_, length)| *length as u64)
-            .collect();
-
-        let response = MerkleLevelResponse {
-            level: 1,
-            hashes,
-            subtree_bytes: sizes,
-        };
-        stream
-            .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-
-        return Ok(());
-    }
-
-    // For other levels, return empty for now
-    let response = MerkleLevelResponse {
-        level: req.level,
-        hashes: vec![],
-        subtree_bytes: vec![],
+    // 10. Send response
+    let response = MerkleDrillResponse {
+        parent_hash: query_hash.as_bytes().to_vec(),
+        children: proto_children,
     };
     stream
-        .send_frame(msg::MERKLE_LEVEL_RESPONSE, &response.encode_to_vec())
+        .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
         .await?;
     stream.finish_send().await?;
 
@@ -954,7 +929,11 @@ mod tests {
         let resp = stat_response(&garbage, &share, None, &handle_db).await;
 
         // Malformed payload → decoder error → StatResponse { results: vec![] }
-        assert_eq!(resp.results.len(), 0, "malformed payload must yield empty results");
+        assert_eq!(
+            resp.results.len(),
+            0,
+            "malformed payload must yield empty results"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1053,8 +1032,7 @@ mod tests {
 
         match resp.result {
             Some(readdir_response::Result::Entries(success)) => {
-                let names: Vec<&str> =
-                    success.entries.iter().map(|e| e.name.as_str()).collect();
+                let names: Vec<&str> = success.entries.iter().map(|e| e.name.as_str()).collect();
                 assert!(names.contains(&"alpha.txt"), "must list alpha.txt");
                 assert!(names.contains(&"beta.txt"), "must list beta.txt");
                 assert_eq!(names.len(), 2);
@@ -1112,4 +1090,81 @@ mod tests {
     // are defined in rift-protocol but no server-side stubs are implemented.
     // Tests will be added once the stubs land.
     // -----------------------------------------------------------------------
+    use super::*;
+    use crate::metadata::db::Database;
+
+    use rift_protocol::messages::msg;
+    use rift_transport::connection::InMemoryConnection;
+    use rift_transport::RiftConnection;
+
+    #[tokio::test]
+    async fn drill_rejects_path_traversal() {
+        // SECURITY: MerkleDrill handler must reject handles pointing outside the share.
+        // This tests the resolve() path traversal guard.
+
+        // Setup: share root is a temp dir
+        let share = tempfile::tempdir().unwrap();
+        let share_canonical = std::fs::canonicalize(share.path()).unwrap();
+
+        // File outside the share
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, b"secret data").unwrap();
+
+        // Register a handle for the outside file in the HandleDatabase
+        let handle_db = HandleDatabase::new();
+        let outside_handle = handle_db.get_or_create_handle(&outside_file).await.unwrap();
+
+        // Verify test setup: handle points outside the share
+        let stored = handle_db.get_path(&outside_handle).unwrap();
+        let stored_canonical = std::fs::canonicalize(&stored).unwrap();
+        assert!(
+            !stored_canonical.starts_with(&share_canonical),
+            "test setup: handle must point outside share root"
+        );
+
+        // Create a stream pair: handler writes to server side, we read from client side
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        // Build a MerkleDrill request for the outside handle
+        let drill_req = MerkleDrill {
+            handle: outside_handle.into_bytes().to_vec(),
+            hash: vec![],
+        };
+        let payload = drill_req.encode_to_vec();
+
+        // Handler requires a database
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Call the handler — should reject path traversal and return empty response
+        merkle_drill_response(
+            &mut server_stream,
+            &payload,
+            &share_canonical,
+            Some(&db),
+            &handle_db,
+        )
+        .await
+        .unwrap();
+
+        // Read the response from the client side
+        let (type_id, resp_bytes) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::MERKLE_DRILL_RESPONSE);
+
+        let response = MerkleDrillResponse::decode(&resp_bytes[..]).unwrap();
+
+        // SECURITY: must return empty response, not serve data from outside the share
+        assert!(
+            response.parent_hash.is_empty(),
+            "parent_hash must be empty for path traversal — got {:?}",
+            response.parent_hash
+        );
+        assert!(
+            response.children.is_empty(),
+            "children must be empty for path traversal — got {} children",
+            response.children.len()
+        );
+    }
 }

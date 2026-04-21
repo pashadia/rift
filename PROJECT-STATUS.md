@@ -87,30 +87,30 @@ For complete dependency list and rationale, see [`docs/05-implementation/technol
 - [x] WhoamiRequest/Response
 
 **Filesystem operations:**
-- [x] STAT_REQUEST/RESPONSE (implemented; batch stat not tested)
+- [x] STAT_REQUEST/RESPONSE (implemented; batch stat tested)
 - [x] LOOKUP_REQUEST/RESPONSE
 - [x] READDIR_REQUEST/RESPONSE
-- [ ] CREATE_REQUEST/RESPONSE (defined in proto, not in handler)
-- [ ] MKDIR_REQUEST/RESPONSE (defined in proto, not in handler)
-- [ ] UNLINK_REQUEST/RESPONSE (defined in proto, not in handler)
-- [ ] RMDIR_REQUEST/RESPONSE (defined in proto, not in handler)
-- [ ] RENAME_REQUEST/RESPONSE (defined in proto, not in handler)
+- [ ] CREATE_REQUEST/RESPONSE (defined in proto, not implemented)
+- [ ] MKDIR_REQUEST/RESPONSE (defined in proto, not implemented)
+- [ ] UNLINK_REQUEST/RESPONSE (defined in proto, not implemented)
+- [ ] RMDIR_REQUEST/RESPONSE (defined in proto, not implemented)
+- [ ] RENAME_REQUEST/RESPONSE (defined in proto, not implemented)
 - [ ] LINK_REQUEST/RESPONSE (deferred)
 - [ ] OPEN_REQUEST/RESPONSE (not needed - handles used directly)
 - [ ] CLOSE_REQUEST (not needed - stateless operations)
 - [ ] GETXATTR/SETXATTR/LISTXATTR/REMOVEXATTR (if RIFT_XATTRS, deferred)
 
-**Transfer messages:** ⚠️ Partial implementation, tests failing
-- [x] READ_REQUEST/RESPONSE (partial - tests failing)
-- [x] BLOCK_HEADER (partial - tests failing)
-- [x] BLOCK_DATA (partial - tests failing)
+**Transfer messages:** ✅ Working (tested)
+- [x] READ_REQUEST/RESPONSE (tested, works)
+- [x] BLOCK_HEADER (tested, works)
+- [x] BLOCK_DATA (tested, works)
 - [ ] WRITE_REQUEST/RESPONSE (defined in proto, not in handler)
 - [ ] WRITE_COMPLETE (defined in proto, not in handler)
 
-**Merkle tree messages:** ⚠️ Partial implementation, tests failing
+**Merkle tree messages:** ⚠️ Partial implementation
 - [ ] MERKLE_COMPARE (not implemented)
-- [ ] MERKLE_LEVEL (defined, partial server implementation)
-- [x] MERKLE_DRILL (partial - server responds, client tests failing)
+- [x] MERKLE_LEVEL (server implementation complete)
+- [x] MERKLE_DRILL (server responds - tested)
 - [ ] MERKLE_LEAVES (defined, not implemented)
 
 **Notification messages:** ⚠️ Deferred (not PoC)
@@ -233,7 +233,7 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - [x] Implement `rift-common`:
   - [x] Configuration parsing (TOML)
   - [x] Shared types (ShareInfo, Permissions, etc.)
-  - [ ] Permission file parsing
+  - [x] Permission file parsing
   - [x] Test utilities (temp dirs, test cert generation)
   - [x] BLAKE3 hashing wrapper
   - [x] FastCDC chunking wrapper (32/128/512 KB params)
@@ -324,15 +324,15 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 - [x] Accept QUIC connections
 - [x] Handle RiftHello/RiftWelcome handshake
 - [x] Extract client fingerprint from TLS session
-- [ ] Load server config (`/etc/rift/config.toml`)
+- [x] Load server config (tested)
 - [ ] Load permission files (`/etc/rift/permissions/*.allow`)
-- [ ] Authorization logic (check fingerprint against permissions)
-- [ ] Handle DiscoverRequest (list authorized shares)
-- [ ] Handle WhoamiRequest (return identity info)
+- [ ] Authorization logic (not implemented)
+- [ ] Handle DiscoverRequest (not implemented, no handler)
+- [ ] Handle WhoamiRequest (not implemented, no handler)
 - [ ] Connection logging (in-memory + persistent JSONL)
 - [x] Share management (map share names to filesystem paths)
-- [ ] File handle generation (encrypted paths)
-- [ ] File handle tracking (open files table)
+- [x] File handle generation (UUID-based)
+- [x] File handle tracking (HandleDatabase)
 - [x] STAT (return file metadata)
 - [x] LOOKUP (resolve path to inode)
 - [x] READDIR (list directory, optionally with stat info)
@@ -363,12 +363,12 @@ This roadmap prioritizes early wins, dependency ordering, and test-first develop
 **Tasks:**
 - [x] Connect to server (QUIC + TLS)
 - [x] Send RiftHello, receive RiftWelcome
-- [ ] Verify server cert (CA validation or TOFU prompt)
-- [ ] Send DiscoverRequest, parse response
-- [ ] Send WhoamiRequest, parse response
+- [x] Verify server cert (TOFU tested)
+- [ ] Send DiscoverRequest, parse response (not tested)
+- [ ] Send WhoamiRequest, parse response (not tested)
 - [x] High-level API (stat, lookup, readdir, read_chunks, merkle_drill)
-- [ ] Session management (connection pooling)
-- [ ] File handle caching (reuse across operations)
+- [ ] Session management (connection pooling) - not tested
+- [x] File handle caching (client reuses handles)
 - [x] CLI args parsing (clap derive API)
 - [ ] Implement basic client commands (only mount implemented)
 - [ ] Interactive prompts (TOFU confirmation)

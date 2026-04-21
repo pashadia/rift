@@ -1,9 +1,6 @@
 # Dolt database (managed by Dolt, not git)
 dolt/
 
-# Primary issue data (managed by Dolt, branch-agnostic — never commit to git)
-issues.jsonl
-
 # Runtime files
 bd.sock
 bd.sock.startlock
