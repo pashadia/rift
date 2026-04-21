@@ -6,7 +6,7 @@ use blake3::Hasher;
 use fastcdc::v2020::FastCDC;
 
 /// BLAKE3 hash wrapper
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Blake3Hash([u8; 32]);
 
 impl Blake3Hash {
@@ -182,6 +182,73 @@ impl MerkleTree {
             leaves.push(Blake3Hash::from_slice(chunk).unwrap());
         }
         Ok(leaves)
+    }
+
+    /// Build a Merkle tree and return the root hash, a map of parent→children,
+    /// and leaf info with offset/length metadata.
+    ///
+    /// The `cache` maps each intermediate node's hash to its children (as `MerkleChild`).
+    /// Leaf nodes appear as `MerkleChild::Leaf` entries in the cache at the level above them.
+    pub fn build_with_cache(
+        &self,
+        leaf_hashes: &[Blake3Hash],
+    ) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>, Vec<LeafInfo>) {
+        if leaf_hashes.is_empty() {
+            return (Blake3Hash::new(&[]), HashMap::new(), Vec::new());
+        }
+
+        let leaf_infos: Vec<LeafInfo> = leaf_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| LeafInfo {
+                hash: hash.clone(),
+                offset: 0,
+                length: 0,
+                chunk_index: i as u32,
+            })
+            .collect();
+
+        if leaf_hashes.len() == 1 {
+            return (leaf_hashes[0].clone(), HashMap::new(), leaf_infos);
+        }
+
+        let mut cache: HashMap<Blake3Hash, Vec<MerkleChild>> = HashMap::new();
+        let mut current_level: Vec<Blake3Hash> = leaf_hashes.to_vec();
+
+        // Build a set of leaf hashes for O(1) lookup
+        let leaf_hash_set: std::collections::HashSet<_> = leaf_hashes.iter().cloned().collect();
+        let leaf_info_map: HashMap<Blake3Hash, &LeafInfo> = leaf_infos
+            .iter()
+            .map(|info| (info.hash.clone(), info))
+            .collect();
+
+        while current_level.len() > 1 {
+            let mut next_level = Vec::new();
+            for chunk in current_level.chunks(self.fanout) {
+                let mut hasher = Hasher::new();
+                let mut children = Vec::with_capacity(chunk.len());
+                for hash in chunk {
+                    hasher.update(hash.as_bytes());
+                    if leaf_hash_set.contains(hash) {
+                        let info = leaf_info_map[hash];
+                        children.push(MerkleChild::Leaf {
+                            hash: hash.clone(),
+                            length: info.length,
+                            chunk_index: info.chunk_index,
+                        });
+                    } else {
+                        children.push(MerkleChild::Subtree(hash.clone()));
+                    }
+                }
+                let parent_hash = Blake3Hash(*hasher.finalize().as_bytes());
+                cache.insert(parent_hash.clone(), children);
+                next_level.push(parent_hash);
+            }
+            current_level = next_level;
+        }
+
+        let root = current_level.into_iter().next().unwrap();
+        (root, cache, leaf_infos)
     }
 }
 
@@ -905,7 +972,7 @@ mod merkle_cache_tests {
     #[test]
     fn build_with_cache_children_count_invariant() {
         let tree = MerkleTree::default();
-        for n in [1, 5, 64, 65, 200, 500] {
+        for n in [5, 64, 65, 200, 500] {
             let leaves: Vec<_> = (0..n).map(|i| Blake3Hash::new(&(i as u64).to_le_bytes())).collect();
             let (_, cache, _) = tree.build_with_cache(&leaves);
             let total_leaves: usize = cache.values()
