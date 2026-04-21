@@ -72,6 +72,9 @@ scc = "3"
 # Extended attributes
 xattr = "1"
 
+# Low-level
+libc = "0.2"
+
 # Testing
 proptest = "1"
 rcgen = "0.13"

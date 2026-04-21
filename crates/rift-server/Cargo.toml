@@ -36,6 +36,7 @@ futures = "0.3"
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
 rift-transport = { path = "../rift-transport" }
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

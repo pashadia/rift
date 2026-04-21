@@ -35,7 +35,7 @@ rift-transport = { path = "../rift-transport" }
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse3 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-libc = { version = "0.2", optional = true }
+libc = { workspace = true, optional = true }
 
 [features]
 default = ["fuse"]

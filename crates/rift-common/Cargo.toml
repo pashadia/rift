@@ -15,7 +15,7 @@ toml.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 postcard = { version = "1", features = ["alloc"] }
-libc = "0.2"
+libc.workspace = true
 uuid.workspace = true
 scc.workspace = true
 
