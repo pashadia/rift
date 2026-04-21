@@ -32,14 +32,14 @@ impl HandleDatabase {
             return Ok(handle);
         }
 
-        let handle = match xattr::get(path, RIFT_HANDLE_XATTR) {
+        let handle = match xattr::get(&canonical, RIFT_HANDLE_XATTR) {
             Ok(Some(value)) if value.len() == 16 => {
                 Uuid::from_slice(&value).unwrap_or_else(|_| Uuid::now_v7())
             }
             _ => {
                 let handle = Uuid::now_v7();
-                if path.is_file() {
-                    let _ = xattr::set(path, RIFT_HANDLE_XATTR, handle.as_bytes());
+                if canonical.is_file() {
+                    let _ = xattr::set(&canonical, RIFT_HANDLE_XATTR, handle.as_bytes());
                 }
                 handle
             }
@@ -317,5 +317,63 @@ mod tests {
             );
         }
         assert_eq!(db.len(), 1, "only one entry in database");
+    }
+
+    /// Test that xattr operations use the canonical path, not the symlink path.
+    /// This ensures handles persist across restarts even when accessed via symlinks.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_xattr_uses_canonical_path_not_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let real_file = tmp.path().join("real_file.txt");
+        let symlink_path = tmp.path().join("symlink.txt");
+
+        // Create the real file and a symlink pointing to it
+        std::fs::write(&real_file, "test content").unwrap();
+        symlink(&real_file, &symlink_path).unwrap();
+
+        let db = HandleDatabase::new();
+
+        // Call get_or_create_handle via the symlink path
+        let handle = db.get_or_create_handle(&symlink_path).await.unwrap();
+
+        // Verify the xattr was written to the REAL file (canonical), not the symlink
+        let xattr_on_real = xattr::get(&real_file, RIFT_HANDLE_XATTR).unwrap();
+        assert!(
+            xattr_on_real.is_some(),
+            "xattr should be stored on the canonical (real) file"
+        );
+        assert_eq!(
+            xattr_on_real.unwrap(),
+            handle.as_bytes(),
+            "xattr value should match the handle"
+        );
+
+        // Verify the symlink should NOT have xattr (symlinks typically don't support xattrs
+        // or the xattr should be on the target, not the symlink itself)
+        let xattr_on_symlink = xattr::get(&symlink_path, RIFT_HANDLE_XATTR).unwrap();
+        assert!(
+            xattr_on_symlink.is_none() || xattr_on_symlink.as_ref().unwrap() != handle.as_bytes(),
+            "xattr should not be on symlink (or should be the same as target if symlink xattrs are supported)"
+        );
+
+        // Now create a new database instance and verify the handle is recovered
+        // from the real file's xattr when accessed via symlink
+        let db2 = HandleDatabase::new();
+        let handle_via_symlink = db2.get_or_create_handle(&symlink_path).await.unwrap();
+        assert_eq!(
+            handle, handle_via_symlink,
+            "handle should be consistent when accessed via symlink"
+        );
+
+        // Also verify accessing via canonical path returns same handle
+        let canonical = real_file.canonicalize().unwrap();
+        let handle_via_canonical = db2.get_or_create_handle(&canonical).await.unwrap();
+        assert_eq!(
+            handle, handle_via_canonical,
+            "handle should be consistent when accessed via canonical path"
+        );
     }
 }
