@@ -2069,16 +2069,23 @@ mod merkle_drill_tests {
 
     #[tokio::test]
     async fn drill_subtree_returns_grandchildren() {
-        // Create a file large enough to have subtree nodes (512KB of random data)
+        // Create a file large enough to have subtree nodes (>64 chunks).
+        // Use random-ish data to ensure the CDC chunker produces many small chunks.
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("large_file.bin");
-        // Create varied content to ensure good chunking behavior
-        let mut content = Vec::with_capacity(512 * 1024);
-        for i in 0u32..(512 * 1024 / 256) as u32 {
-            content.extend_from_slice(&i.to_le_bytes());
-            content.extend_from_slice(&[0x00; 248]);
+        // Generate 10MB of pseudo-random data to ensure many chunks (>64) for subtree nodes
+        // The default FastCDC chunker produces ~128KB avg chunks, so we need ~10MB
+        // to reliably get >64 chunks and thus create Subtree intermediate nodes.
+        let mut rng_state: u64 = 0x123456789ABCDEF0u64;
+        let mut content: Vec<u8> = Vec::with_capacity(10 * 1024 * 1024);
+        while content.len() < 10 * 1024 * 1024 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            content.extend_from_slice(&rng_state.to_le_bytes());
         }
+        content.truncate(10 * 1024 * 1024);
         std::fs::write(&file_path, &content).unwrap();
 
         // Start server with DB
@@ -2125,7 +2132,7 @@ mod merkle_drill_tests {
             .children
             .iter()
             .find(|c| c.child_type == MerkleChildType::MerkleChildSubtree as i32)
-            .expect("should have at least one subtree child in a 512KB file");
+            .expect("should have at least one subtree child");
 
         // Second drill: get grandchildren via the subtree child hash
         let mut stream = conn.open_stream().await.unwrap();

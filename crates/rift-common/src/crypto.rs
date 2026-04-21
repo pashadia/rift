@@ -203,7 +203,17 @@ impl MerkleTree {
         }
 
         if leaf_hashes.len() == 1 {
-            return (leaf_hashes[0].clone(), HashMap::new());
+            let root = leaf_hashes[0].clone();
+            let mut cache = HashMap::new();
+            cache.insert(
+                root.clone(),
+                vec![MerkleChild::Leaf {
+                    hash: leaf_hashes[0].clone(),
+                    length: 0,
+                    chunk_index: 0,
+                }],
+            );
+            return (root, cache);
         }
 
         let mut cache: HashMap<Blake3Hash, Vec<MerkleChild>> = HashMap::new();
@@ -953,7 +963,10 @@ mod merkle_cache_tests {
         let leaf = Blake3Hash::new(b"single");
         let (root, cache) = tree.build_with_cache(std::slice::from_ref(&leaf));
         assert_eq!(root, leaf);
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 1, "single leaf should have root → [leaf] in cache");
+        let children = &cache[&root];
+        assert_eq!(children.len(), 1);
+        assert!(matches!(&children[0], MerkleChild::Leaf { hash, .. } if hash == &leaf));
     }
 
     #[test]
