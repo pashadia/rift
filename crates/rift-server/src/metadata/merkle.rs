@@ -31,12 +31,10 @@ impl Database {
             return Ok(None);
         };
 
-        let Ok(mtime_ns) = meta
+        let mtime_ns = meta
             .modified()
-            .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64)
-        else {
-            return Ok(None);
-        };
+            .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0))
+            .unwrap_or(0);
 
         let file_size = meta.len();
         let path_str = path.to_string_lossy().to_string();
@@ -275,5 +273,31 @@ mod tests {
             let entry = result.unwrap();
             assert_eq!(entry.root, root);
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn get_merkle_handles_pre_epoch_mtime() {
+        // Pre-epoch mtime caused panic on unwrap()
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("pre_epoch.txt");
+        fs::write(&file_path, b"test content").unwrap();
+
+        // Set mtime before Unix epoch (1969-12-31)
+        let path_c = CString::new(file_path.as_os_str().as_bytes()).unwrap();
+        let times = libc::timespec {
+            tv_sec: -86400, // one day before epoch
+            tv_nsec: 0,
+        };
+        let times_arr = [times, times]; // atime, mtime
+        let ret = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times_arr.as_ptr(), 0) };
+        assert_eq!(ret, 0, "utimensat failed");
+
+        // Should not panic - function must complete without panic
+        let db = Database::open_in_memory().await.unwrap();
+        let _result = db.get_merkle(&file_path).await; // If panic occurs, test fails here
     }
 }
