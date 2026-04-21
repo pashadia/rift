@@ -99,4 +99,69 @@ mod tests {
 
         assert_eq!(result, 0);
     }
+
+    #[tokio::test]
+    async fn merkle_tree_nodes_table_creates() {
+        let db = Database::open_in_memory().await.unwrap();
+        let result = db.call(|conn| {
+            conn.execute(
+                "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                ("test.txt", vec![0u8; 32], vec![1u8; 64]),
+            )
+        }).await;
+        assert!(result.is_ok(), "Should be able to insert into merkle_tree_nodes");
+    }
+
+    #[tokio::test]
+    async fn merkle_tree_nodes_insert_and_query() {
+        let db = Database::open_in_memory().await.unwrap();
+        let path = "/tmp/test.txt";
+        let node_hash = vec![0xAB; 32];
+        let children_blob = vec![1, 2, 3, 4];
+
+        let path2 = path.to_string();
+        let node_hash2 = node_hash.clone();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                (path2, node_hash2, children_blob),
+            )
+        }).await.unwrap();
+
+        let retrieved: (Vec<u8>, Vec<u8>) = db.call(move |conn| {
+            conn.query_row(
+                "SELECT node_hash, children FROM merkle_tree_nodes WHERE file_path = ?1 AND node_hash = ?2",
+                (path, node_hash),
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+        }).await.unwrap();
+
+        assert_eq!(retrieved.0, vec![0xAB; 32]);
+        assert_eq!(retrieved.1, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn merkle_tree_nodes_primary_key_uniqueness() {
+        let db = Database::open_in_memory().await.unwrap();
+        let path = "/tmp/test.txt";
+        let node_hash = vec![0xAB; 32];
+
+        let path2 = path.to_string();
+        let node_hash2 = node_hash.clone();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                (path2, node_hash2, vec![1u8]),
+            )
+        }).await.unwrap();
+
+        let result = db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                (path, node_hash, vec![2u8]),
+            )
+        }).await;
+
+        assert!(result.is_err(), "Duplicate (file_path, node_hash) should fail");
+    }
 }
