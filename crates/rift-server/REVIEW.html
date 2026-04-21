@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rift Server Code Review</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2333;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --critical: #f85149;
+    --critical-bg: #2d1215;
+    --critical-border: #f8514940;
+    --high: #d29922;
+    --high-bg: #2d2510;
+    --high-border: #d2992240;
+    --medium: #58a6ff;
+    --medium-bg: #0d2140;
+    --medium-border: #58a6ff40;
+    --low: #3fb950;
+    --low-bg: #0d2818;
+    --low-border: #3fb95040;
+    --info: #8b949e;
+    --info-bg: #161b22;
+    --info-border: #30363d;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 0;
+  }
+
+  .hero {
+    background: linear-gradient(135deg, #1a1040 0%, #0d1117 50%, #0d2137 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 3rem 2rem;
+    text-align: center;
+  }
+  .hero h1 { font-size: 2.2rem; margin-bottom: 0.5rem; font-weight: 700; }
+  .hero p { color: var(--text2); font-size: 1.1rem; }
+  .hero .meta {
+    display: flex; gap: 1.5rem; justify-content: center; margin-top: 1rem; flex-wrap: wrap;
+  }
+  .hero .meta span {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.8rem;
+    font-size: 0.85rem;
+    color: var(--text2);
+  }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+
+  /* Summary Stats */
+  .stats-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2.5rem;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1rem;
+    text-align: center;
+  }
+  .stat-card .num { font-size: 2rem; font-weight: 700; }
+  .stat-card .label { font-size: 0.8rem; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 0.2rem; }
+
+  /* Section headers */
+  .section { margin-bottom: 3rem; }
+  .section-header {
+    display: flex; align-items: center; gap: 0.75rem;
+    margin-bottom: 1.25rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-header h2 { font-size: 1.4rem; }
+  .section-icon { font-size: 1.5rem; }
+
+  /* Findings */
+  .finding {
+    background: var(--surface);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    overflow: hidden;
+    border-left: 4px solid var(--border);
+  }
+  .finding.critical { border-left-color: var(--critical); }
+  .finding.high { border-left-color: var(--high); }
+  .finding.medium { border-left-color: var(--medium); }
+  .finding.low { border-left-color: var(--low); }
+  .finding.info { border-left-color: var(--info); }
+
+  .finding-header {
+    display: flex; align-items: center; gap: 0.75rem;
+    padding: 1rem 1.25rem;
+    cursor: pointer;
+    user-select: none;
+  }
+  .finding-header:hover { background: var(--surface2); }
+
+  .severity-badge {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .severity-badge.critical { background: var(--critical-bg); color: var(--critical); border: 1px solid var(--critical-border); }
+  .severity-badge.high { background: var(--high-bg); color: var(--high); border: 1px solid var(--high-border); }
+  .severity-badge.medium { background: var(--medium-bg); color: var(--medium); border: 1px solid var(--medium-border); }
+  .severity-badge.low { background: var(--low-bg); color: var(--low); border: 1px solid var(--low-border); }
+  .severity-badge.info { background: var(--info-bg); color: var(--info); border: 1px solid var(--info-border); }
+
+  .finding-title { flex: 1; font-weight: 600; font-size: 0.95rem; }
+  .finding-location { color: var(--text2); font-size: 0.8rem; font-family: 'SF Mono', Consolas, monospace; white-space: nowrap; }
+
+  .finding-body {
+    padding: 0 1.25rem 1.25rem;
+    display: none;
+  }
+  .finding.open .finding-body { display: block; }
+  .finding.open .chevron { transform: rotate(90deg); }
+  .chevron { transition: transform 0.15s; color: var(--text2); }
+
+  .finding-body p { margin-bottom: 0.75rem; font-size: 0.9rem; color: var(--text2); line-height: 1.65; }
+  .finding-body p strong { color: var(--text); }
+
+  .code-block {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin: 0.75rem 0;
+    overflow-x: auto;
+    font-family: 'SF Mono', Consolas, 'Liberation Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: #c9d1d9;
+  }
+  .code-block .hl-bad { color: var(--critical); }
+  .code-block .hl-warn { color: var(--high); }
+  .code-block .hl-good { color: var(--low); }
+  .code-block .hl-kw { color: #ff7b72; }
+  .code-block .hl-fn { color: #d2a8ff; }
+  .code-block .hl-str { color: #a5d6ff; }
+  .code-block .hl-cmt { color: #8b949e; font-style: italic; }
+  .code-block .hl-line { color: #484f58; user-select: none; }
+
+  .recommendation {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin: 0.5rem 0;
+  }
+  .recommendation::before { content: '💡 '; }
+  .recommendation p { margin: 0; color: var(--text); font-size: 0.88rem; }
+
+  /* Architecture diagram */
+  .arch-diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+    overflow-x: auto;
+  }
+  .arch-diagram pre {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 0.82rem;
+    color: var(--text2);
+    line-height: 1.5;
+  }
+
+  /* Filter bar */
+  .filter-bar {
+    display: flex; gap: 0.5rem; margin-bottom: 1.5rem; flex-wrap: wrap;
+  }
+  .filter-btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text2);
+    border-radius: 6px;
+    padding: 0.35rem 0.75rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .filter-btn:hover { border-color: var(--text2); color: var(--text); }
+  .filter-btn.active { border-color: var(--medium); color: var(--medium); background: var(--medium-bg); }
+  .filter-btn .count { margin-left: 0.3rem; opacity: 0.7; }
+
+  /* File map */
+  .file-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 2rem;
+  }
+  .file-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .file-name {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+  .file-meta { font-size: 0.78rem; color: var(--text2); }
+  .file-dots { display: flex; gap: 3px; margin-top: 0.5rem; flex-wrap: wrap; }
+  .file-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+  }
+  .file-dot.critical { background: var(--critical); }
+  .file-dot.high { background: var(--high); }
+  .file-dot.medium { background: var(--medium); }
+  .file-dot.low { background: var(--low); }
+  .file-dot.info { background: var(--info); }
+
+  @media (max-width: 768px) {
+    .hero h1 { font-size: 1.5rem; }
+    .container { padding: 1rem; }
+    .stats-bar { grid-template-columns: repeat(3, 1fr); }
+    .finding-header { flex-wrap: wrap; }
+    .finding-location { width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>🔍 Rift Server — Code Quality Review</h1>
+  <p>Security, architecture, maintainability, and correctness assessment</p>
+  <div class="meta">
+    <span>📦 crate: rift-server</span>
+    <span>📝 5,536 lines total</span>
+    <span>🗂 11 source files</span>
+    <span>📅 Reviewed 2025</span>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- ===== SUMMARY STATS ===== -->
+<div class="stats-bar">
+  <div class="stat-card"><div class="num" style="color:var(--critical)">3</div><div class="label">Critical</div></div>
+  <div class="stat-card"><div class="num" style="color:var(--high)">7</div><div class="label">High</div></div>
+  <div class="stat-card"><div class="num" style="color:var(--medium)">8</div><div class="label">Medium</div></div>
+  <div class="stat-card"><div class="num" style="color:var(--low)">5</div><div class="label">Low</div></div>
+  <div class="stat-card"><div class="num" style="color:var(--info)">4</div><div class="label">Info</div></div>
+  <div class="stat-card"><div class="num" style="color:var(--text)">27</div><div class="label">Total</div></div>
+</div>
+
+<!-- ===== FILE MAP ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">📂</span>
+    <h2>Files &amp; Hotspots</h2>
+  </div>
+  <div class="file-grid">
+    <div class="file-card">
+      <div class="file-name">src/main.rs</div>
+      <div class="file-meta">115 lines · Binary entry point</div>
+      <div class="file-dots">
+        <span class="file-dot critical"></span>
+        <span class="file-dot high"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/server.rs</div>
+      <div class="file-meta">341 lines · Connection dispatch</div>
+      <div class="file-dots">
+        <span class="file-dot critical"></span>
+        <span class="file-dot high"></span>
+        <span class="file-dot medium"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/handler.rs</div>
+      <div class="file-meta">1,169 lines · Request handlers</div>
+      <div class="file-dots">
+        <span class="file-dot critical"></span>
+        <span class="file-dot high"></span>
+        <span class="file-dot high"></span>
+        <span class="file-dot medium"></span>
+        <span class="file-dot medium"></span>
+        <span class="file-dot medium"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/handle.rs</div>
+      <div class="file-meta">321 lines · Handle database</div>
+      <div class="file-dots">
+        <span class="file-dot high"></span>
+        <span class="file-dot medium"></span>
+        <span class="file-dot low"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/cert.rs</div>
+      <div class="file-meta">176 lines · Certificate mgmt</div>
+      <div class="file-dots">
+        <span class="file-dot medium"></span>
+        <span class="file-dot low"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/config.rs</div>
+      <div class="file-meta">77 lines · Config loading</div>
+      <div class="file-dots">
+        <span class="file-dot low"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/metadata/db.rs</div>
+      <div class="file-meta">326 lines · SQLite schema</div>
+      <div class="file-dots">
+        <span class="file-dot medium"></span>
+        <span class="file-dot low"></span>
+        <span class="file-dot info"></span>
+        <span class="file-dot info"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">src/metadata/merkle.rs</div>
+      <div class="file-meta">566 lines · Merkle cache</div>
+      <div class="file-dots">
+        <span class="file-dot high"></span>
+        <span class="file-dot low"></span>
+        <span class="file-dot info"></span>
+      </div>
+    </div>
+    <div class="file-card">
+      <div class="file-name">tests/server.rs</div>
+      <div class="file-meta">2,430 lines · Integration tests</div>
+      <div class="file-dots">
+        <span class="file-dot info"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== ARCHITECTURE OVERVIEW ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">🏗</span>
+    <h2>Architecture Overview</h2>
+  </div>
+  <div class="arch-diagram">
+<pre>
+┌──────────────────────────────────────────────────────────────┐
+│  main.rs                                                     │
+│  ├─ CLI parsing (clap)                                       │
+│  ├─ Config loading (TOML or --share flag)                    │
+│  ├─ TLS cert get/generate                                    │
+│  └─ accept_loop spawn + ctrl-c signal                        │
+└──────────┬───────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│  server.rs — accept_loop                                      │
+│  ├─ Accept QUIC connections → spawn per-connection task       │
+│  ├─ serve_connection: accept streams → spawn per-stream task  │
+│  └─ handle_stream: read first frame, dispatch by type_id      │
+│      ├─ RIFT_HELLO    → handshake + send_welcome              │
+│      ├─ STAT_REQUEST  → handler::stat_response               │
+│      ├─ LOOKUP_REQUEST → handler::lookup_response             │
+│      ├─ READDIR_REQUEST→ handler::readdir_response            │
+│      ├─ READ_REQUEST   → handler::read_response (streaming)  │
+│      └─ MERKLE_DRILL   → handler::merkle_drill_response      │
+└──────────┬───────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│  handler.rs — Pure request handlers                           │
+│  ├─ resolve()  — handle UUID → canonical path + escape check │
+│  ├─ stat_response, lookup_response, readdir_response         │
+│  ├─ read_response (multi-frame streaming)                    │
+│  └─ merkle_drill_response (hash-based tree traversal)        │
+└──────────┬───────────────────────────────────────────────────┘
+           │
+     ┌─────┴─────┐
+     ▼           ▼
+┌──────────┐  ┌──────────────────┐
+│handle.rs │  │ metadata/         │
+│HandleDB  │  │ ├─ db.rs         │
+│(in-mem   │  │ │  SQLite schema │
+│ UUID↔Path│  │ └─ merkle.rs     │
+│ map +    │  │    cache R/W     │
+│ xattr)   │  └──────────────────┘
+└──────────┘
+</pre>
+  </div>
+</div>
+
+<!-- ===== FILTER BAR ===== -->
+<div class="filter-bar">
+  <button class="filter-btn active" onclick="filterFindings('all')">All<span class="count">27</span></button>
+  <button class="filter-btn" style="border-color:var(--critical-border);color:var(--critical)" onclick="filterFindings('critical')">Critical<span class="count">3</span></button>
+  <button class="filter-btn" style="border-color:var(--high-border);color:var(--high)" onclick="filterFindings('high')">High<span class="count">7</span></button>
+  <button class="filter-btn" style="border-color:var(--medium-border);color:var(--medium)" onclick="filterFindings('medium')">Medium<span class="count">8</span></button>
+  <button class="filter-btn" style="border-color:var(--low-border);color:var(--low)" onclick="filterFindings('low')">Low<span class="count">5</span></button>
+  <button class="filter-btn" style="border-color:var(--info-border);color:var(--info)" onclick="filterFindings('info')">Info<span class="count">4</span></button>
+</div>
+
+<!-- ===== SECURITY ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">🔒</span>
+    <h2>Security</h2>
+  </div>
+
+  <!-- S1 -->
+  <div class="finding critical" data-sev="critical">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge critical">Critical</span>
+      <span class="finding-title">No authentication or authorization enforced on connections</span>
+      <span class="finding-location">server.rs:serve_connection</span>
+    </div>
+    <div class="finding-body">
+      <p>The per-connection handler has a <strong>TODO comment</strong> acknowledging that peer fingerprint authorization is not implemented. Any client with a valid TLS certificate can connect and access <strong>any share</strong> with full read access. The README describes a permission system (<code>.allow</code> files per share with fingerprint + access level), but <strong>none of it is enforced at runtime</strong>.</p>
+      <div class="code-block"><span class="hl-cmt">// TODO(v1): authorise peer fingerprint against per-share permission files</span>
+<span class="hl-cmt">// before accepting any streams.</span></div>
+      <p>Additionally, the <code>RiftWelcome</code> hardcodes <code>read_only: true</code> regardless of config, so the protocol itself can't communicate the correct access level even if auth was added.</p>
+      <div class="recommendation"><p>Implement peer fingerprint validation in <code>serve_connection</code> before accepting any streams. Load per-share permission files on startup. Reject connections that don't match any allow rule. Derive <code>read_only</code> from the permission file for the matched fingerprint.</p></div>
+    </div>
+  </div>
+
+  <!-- S2 -->
+  <div class="finding critical" data-sev="critical">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge critical">Critical</span>
+      <span class="finding-title">Memory exhaustion via unbounded file reads</span>
+      <span class="finding-location">handler.rs:read_response</span>
+    </div>
+    <div class="finding-body">
+      <p><code>read_response</code> calls <code>tokio::fs::read(&amp;canonical)</code> which <strong>reads the entire file into memory</strong> before slicing it into chunks. A malicious or misbehaving client can request a read on a multi-gigabyte file, causing the server process to allocate that much RAM, potentially triggering OOM. There is <strong>no file size limit, no streaming, and no backpressure</strong>.</p>
+      <div class="code-block"><span class="hl-kw">let</span> content = <span class="hl-kw">match</span> tokio::fs::<span class="hl-fn">read</span>(&amp;canonical).<span class="hl-kw">await</span> {
+    <span class="hl-str">Ok(c)</span> =&gt; c,  <span class="hl-cmt">// Entire file loaded into heap</span>
+    …
+};</div>
+      <div class="recommendation"><p>Stream file data using <code>tokio::fs::File</code> + <code>tokio::io::BufReader</code>. Read chunks on demand based on byte offsets rather than loading the whole file. Add a configurable max file size limit (e.g., 4 GiB). This also eliminates the duplicate Merkle tree computation in <code>read_response</code> vs. <code>get_or_compute_merkle_root</code>.</p></div>
+    </div>
+  </div>
+
+  <!-- S3 -->
+  <div class="finding critical" data-sev="critical">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge critical">Critical</span>
+      <span class="finding-title">TOCTOU race in path canonicalization — symlink insertion attack</span>
+      <span class="finding-location">handler.rs:resolve, lookup_response</span>
+    </div>
+    <div class="finding-body">
+      <p>The <code>resolve()</code> function looks up a path from the <code>HandleDatabase</code>, then <strong>canonicalizes it to check it stays within the share root</strong>. This is correct at the moment of the check, but creates a <strong>Time-of-Check-to-Time-of-Use (TOCTOU) race</strong>: between canonicalization and the actual file operation (stat, read, etc.), an attacker with local filesystem access could replace a legitimate file or directory with a symlink pointing outside the share.</p>
+      <div class="code-block"><span class="hl-cmt">// Step 1: Canonicalize resolves symlinks, verifies inside share</span>
+<span class="hl-kw">let</span> canonical = tokio::fs::<span class="hl-fn">canonicalize</span>(&amp;stored_path).<span class="hl-kw">await</span>?;
+<span class="hl-cmt">// --- RACE WINDOW: attacker replaces file with symlink here ---</span>
+<span class="hl-cmt">// Step 2: Open the file using the now-stale canonical path</span>
+<span class="hl-kw">let</span> meta = tokio::fs::<span class="hl-fn">metadata</span>(&amp;canonical).<span class="hl-kw">await</span>?;  <span class="hl-cmt">// may follow new symlink</span></div>
+      <div class="recommendation"><p>Open the file first via <code>File::open</code>, then call <code>file.metadata()</code> on the <strong>file handle</strong> (not the path) to get metadata for the opened file. Use <code>std::fs::File</code> and then <code>file.metadata()</code> / <code>file.canonicalize()</code> on Linux via <code>/proc/self/fd/...</code>. Alternatively, use <code>O_NOFOLLOW</code> on open to refuse symlinks at the leaf.</p></div>
+    </div>
+  </div>
+
+  <!-- S4 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title">No rate limiting or concurrency limits — DoS vector</span>
+      <span class="finding-location">server.rs:accept_loop, serve_connection</span>
+    </div>
+    <div class="finding-body">
+      <p>Both <code>accept_loop</code> and <code>serve_connection</code> spawn a new <code>tokio::spawn</code> task for every incoming connection and every stream <strong>without any bounds</strong>. A malicious client can open thousands of connections or streams, each of which triggers filesystem I/O and Merkle tree computation. This can exhaust server resources (memory, CPU, file descriptors) very quickly.</p>
+      <div class="recommendation"><p>Add a <code>Semaphore</code> or <code>tokio::sync::Semaphore</code> around task spawning with a configurable max concurrency (e.g., 256 connections, 1024 streams total). Consider per-client-fingerprint rate limiting. Back-pressure the <code>accept</code> loop when limits are reached.</p></div>
+    </div>
+  </div>
+
+  <!-- S5 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title">xattr handle forgery — unauthenticated persistent handles</span>
+      <span class="finding-location">handle.rs:get_or_create_handle</span>
+    </div>
+    <div class="finding-body">
+      <p>The <code>HandleDatabase</code> persists UUID handles as extended attributes (<code>user.rift.handle</code>) on files. Any process with write access to the filesystem can set this xattr to a chosen UUID, effectively <strong>injecting arbitrary handle mappings</strong> that the server will trust on next lookup. The server reads the xattr and trusts it without verification.</p>
+      <div class="code-block"><span class="hl-kw">let</span> handle = <span class="hl-kw">match</span> xattr::<span class="hl-fn">get</span>(path, RIFT_HANDLE_XATTR) {
+    <span class="hl-str">Ok(Some(value))</span> <span class="hl-kw">if</span> value.len() == 16 =&gt; {
+        Uuid::<span class="hl-fn">from_slice</span>(&amp;value).<span class="hl-fn">unwrap_or_else</span>(|_| Uuid::<span class="hl-fn">now_v7</span>())
+    }
+    …
+};</div>
+      <p>If a user sets <code>user.rift.handle</code> to collide with the UUID of a different file's handle, the second file's <code>get_or_create_handle</code> will find a pre-existing entry in the map and return the <em>wrong</em> file's UUID. The <code>insert-then-re-lookup on Exists</code> pattern does prevent one collision path, but only for concurrent inserts — not for xattr-forged collisions.</p>
+      <div class="recommendation"><p>Sign or HMAC the xattr value with a server key before writing, and verify the signature on read. Alternatively, don't read xattrs at all and generate handles purely in-memory, rebuilding from disk only via <code>populate_from_share</code> at startup.</p></div>
+    </div>
+  </div>
+
+  <!-- S6 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title">Self-signed cert auto-generation with hardcoded CN and no key rotation</span>
+      <span class="finding-location">cert.rs:generate_and_save_cert</span>
+    </div>
+    <div class="finding-body">
+      <p>The cert auto-generation uses <code>rcgen::generate_simple_self_signed(vec!["rift-server"])</code> which produces a cert with a <strong>hardcoded CN of "rift-server"</strong>, no Subject Alternative Names, and a default validity period. There is <strong>no mechanism to rotate keys</strong> — once generated, the same cert/key is reused forever. A leaked private key compromises all past and future connections with no remediation path.</p>
+      <div class="recommendation"><p>Add SANs for the server's hostname/IP. Make the CN configurable. Add a <code>--rotate-cert</code> flag or automatic rotation based on expiry. Consider adding a key rotation protocol where the server can publish a new cert fingerprint to authorized clients.</p></div>
+    </div>
+  </div>
+
+  <!-- S7 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">No input validation on start_chunk / chunk_count in READ_REQUEST</span>
+      <span class="finding-location">handler.rs:read_response</span>
+    </div>
+    <div class="finding-body">
+      <p>The <code>read_response</code> handler accepts <code>start_chunk</code> and <code>chunk_count</code> from the client without validation. A client can send <code>start_chunk = u32::MAX</code> or <code>chunk_count = u32::MAX</code>, which will cause <code>.skip()</code> and <code>.take()</code> on the chunk list. While this doesn't panic, a very large <code>chunk_count</code> combined with a file that has many chunks could cause a long iteration and many frame sends.</p>
+      <div class="recommendation"><p>Add an upper bound on <code>chunk_count</code> (e.g., 256). Clamp or reject out-of-range <code>start_chunk</code> values early before any file I/O.</p></div>
+    </div>
+  </div>
+
+  <!-- S8 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">Silent error swallowing hides security events</span>
+      <span class="finding-location">handler.rs (multiple), merkle.rs (multiple)</span>
+    </div>
+    <div class="finding-body">
+      <p>Multiple locations silently discard errors with <code>let _ = ...</code>. Most notably:</p>
+      <ul style="margin:0.5rem 0 0.75rem 1.5rem; font-size:0.88rem; color:var(--text2)">
+        <li><code>let _ = database.put_merkle(...).await;</code> — DB write failures are silently ignored</li>
+        <li><code>let _ = xattr::set(path, RIFT_HANDLE_XATTR, handle.as_bytes());</code> — xattr write failures ignored</li>
+        <li><code>let _ = database.put_tree(...).await;</code> — tree persistence failures ignored</li>
+      </ul>
+      <p>While this prevents crashes, it means that cache corruption, disk-full errors, or permission problems are invisible to operators. This is especially concerning for security-sensitive operations where cache integrity matters (Merkle tree tampering detection).</p>
+      <div class="recommendation"><p>Log at <code>warn!</code> level when cache writes fail. Consider surfacing persistent write failures as metrics. For xattr writes on directories, the silent skip is arguably fine, but on files it should at least be logged.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== DESIGN & ARCHITECTURE ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">🏗</span>
+    <h2>Design &amp; Architecture</h2>
+  </div>
+
+  <!-- D1 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title">Only the first share is exported — multi-share config is misleading</span>
+      <span class="finding-location">main.rs:63</span>
+    </div>
+    <div class="finding-body">
+      <p>The config and CLI support defining multiple shares, but <code>main.rs</code> only passes <code>server_config.shares[0].path</code> to the server. The remaining shares are silently ignored, and there's no warning that they're dropped. The handshake also only sends one <code>ShareInfo</code>.</p>
+      <div class="code-block"><span class="hl-kw">let</span> share_path = server_config.shares[<span class="hl-bad">0</span>].path.<span class="hl-fn">clone</span>();  <span class="hl-cmt">// Only first share!</span></div>
+      <div class="recommendation"><p>Either implement multi-share support (pass all shares to <code>accept_loop</code>, dispatch by share name in the handshake), or <strong>validate and reject</strong> configs with more than one share with a clear error message. The current silent truncation is the worst of both worlds.</p></div>
+    </div>
+  </div>
+
+  <!-- D2 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title"><code>Arc&lt;Option&lt;Database&gt;&gt;</code> — awkward type erasure</span>
+      <span class="finding-location">main.rs, server.rs, handler.rs</span>
+    </div>
+    <div class="finding-body">
+      <p>The database is threaded through as <code>Arc&lt;Option&lt;Database&gt;&gt;</code>, requiring unwrapping at every call site with <code>db.as_ref().as_ref()</code>. This conflates two concerns: shared ownership (<code>Arc</code>) and optionality (<code>Option</code>). The current pattern forces every handler to handle the "no database" case, creating code duplication.</p>
+      <div class="code-block"><span class="hl-kw">let</span> db_ref = db.<span class="hl-fn">as_ref</span>().<span class="hl-fn">as_ref</span>();  <span class="hl-cmt">// Double unwrap — appears in every handler</span></div>
+      <div class="recommendation"><p>Replace with a trait object or <code>Arc&lt;dyn MerkleCache&gt;</code> where <code>MerkleCache</code> is implemented by both <code>Database</code> and a <code>NoopCache</code> / <code>NullCache</code> type. This eliminates <code>Option</code> from the type entirely and removes the double-unwrap from every handler call site.</p></div>
+    </div>
+  </div>
+
+  <!-- D3 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">No filesystem abstraction — direct <code>tokio::fs</code> calls in handlers</span>
+      <span class="finding-location">handler.rs (throughout)</span>
+    </div>
+    <div class="finding-body">
+      <p>All handlers call <code>tokio::fs::*</code> directly. This couples business logic to the physical filesystem and makes it <strong>impossible to test with virtual/mock filesystems</strong>. The current tests rely on <code>tempfile::TempDir</code>, which means they touch the real disk and are slow/non-deterministic. Any future support for S3-backed shares, FUSE mounts, or encrypted-at-rest storage would require major refactoring.</p>
+      <div class="recommendation"><p>Introduce a <code>Vfs</code> trait with methods like <code>stat</code>, <code>read_dir</code>, <code>open</code>, <code>read</code>, etc. Implement it for the real filesystem. Inject the trait into handlers. This also makes it possible to add per-share VFS implementations (e.g., read-only enforcement at the VFS layer).</p></div>
+    </div>
+  </div>
+
+  <!-- D4 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">Inconsistent handler error handling — some return types, some stream directly</span>
+      <span class="finding-location">handler.rs:stat_response vs read_response</span>
+    </div>
+    <div class="finding-body">
+      <p>Handlers have two different error handling patterns:</p>
+      <ul style="margin:0.5rem 0 0.75rem 1.5rem; font-size:0.88rem; color:var(--text2)">
+        <li><strong>Return type pattern</strong>: <code>stat_response</code>, <code>lookup_response</code>, <code>readdir_response</code> — return a proto struct with an error variant. Clean and testable.</li>
+        <li><strong>Stream pattern</strong>: <code>read_response</code>, <code>merkle_drill_response</code> — take <code>&amp;mut S: RiftStream</code> and write error frames directly. Harder to test, harder to reason about.</li>
+      </ul>
+      <div class="recommendation"><p>Unify on one pattern. The return-type pattern is better for testability and composability. For streaming handlers, separate the "resolve and prepare" phase (returns a result) from the "send frames" phase (takes a stream). This makes the streaming handlers testable without a stream.</p></div>
+    </div>
+  </div>
+
+  <!-- D5 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">No connection state — handshake results are not tracked</span>
+      <span class="finding-location">server.rs:serve_connection</span>
+    </div>
+    <div class="finding-body">
+      <p>The handshake produces a <code>RiftWelcome</code> with important state (protocol version, share info, root handle), but <strong>this state is not stored anywhere</strong>. Subsequent streams on the same connection don't know which share was selected, what protocol version was negotiated, or what capabilities were agreed upon. This makes it impossible to enforce per-connection constraints (e.g., a v1 client shouldn't send v2 messages).</p>
+      <div class="recommendation"><p>Create a <code>ConnectionState</code> struct that captures the handshake result. Store it wrapped in <code>Arc</code> and pass it to stream handlers. This also enables future per-connection features like negotiated capabilities, session timeouts, and authorization scope.</p></div>
+    </div>
+  </div>
+
+  <!-- D6 -->
+  <div class="finding low" data-sev="low">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge low">Low</span>
+      <span class="finding-title">No graceful shutdown / drain logic</span>
+      <span class="finding-location">main.rs:tokio::select!</span>
+    </div>
+    <div class="finding-body">
+      <p>When ctrl-c is pressed, the server immediately drops the listener and all in-flight tasks. There's no drain logic to wait for active streams to complete, which means in-flight READ operations are silently aborted mid-transfer.</p>
+      <div class="recommendation"><p>Use a <code>CancellationToken</code>. On ctrl-c, stop accepting new connections/streams but wait for existing streams to complete with a timeout (e.g., 30 seconds). Log in-flight stream count during shutdown.</p></div>
+    </div>
+  </div>
+
+  <!-- D7 -->
+  <div class="finding low" data-sev="low">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge low">Low</span>
+      <span class="finding-title">Unknown message types silently close stream with no error to client</span>
+      <span class="finding-location">server.rs:handle_stream</span>
+    </div>
+    <div class="finding-body">
+      <div class="code-block">other =&gt; {
+    <span class="hl-cmt">// TODO(v1): send ERROR_RESPONSE so clients surface a real error.</span>
+    <span class="hl-fn">debug!</span>(<span class="hl-str">"unknown message type 0x{:02X} — closing stream"</span>, other);
+}</div>
+      <p>Clients that send an unsupported message type get the stream silently closed with no error frame. This makes debugging client-side issues very hard. The TODO has been present since the initial implementation.</p>
+      <div class="recommendation"><p>Define a generic <code>ERROR_RESPONSE</code> message in the protocol. Send it before closing the stream for unknown types. This is a 5-line fix.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== CODE QUALITY & MAINTAINABILITY ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">🧹</span>
+    <h2>Code Quality &amp; Maintainability</h2>
+  </div>
+
+  <!-- Q1 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title">handler.rs is a 1,169-line monolith with 5 distinct handlers + helpers</span>
+      <span class="finding-location">handler.rs</span>
+    </div>
+    <div class="finding-body">
+      <p><code>handler.rs</code> contains: <code>resolve()</code>, <code>metadata_to_attrs()</code>, <code>build_attrs()</code>, <code>stat_response()</code>, <code>lookup_response()</code>, <code>readdir_response()</code>, <code>read_response()</code>, <code>merkle_drill_response()</code>, <code>get_or_compute_merkle_root()</code>, and numerous helper functions. At 1,169 lines it's well beyond the typical ~300-line guideline for a single Rust file. Each handler has its own error helpers and they share no common structure.</p>
+      <div class="recommendation"><p>Split into: <code>handler/mod.rs</code> (dispatch + resolve), <code>handler/stat.rs</code>, <code>handler/lookup.rs</code>, <code>handler/readdir.rs</code>, <code>handler/read.rs</code>, <code>handler/merkle.rs</code>. Move <code>metadata_to_attrs</code> and <code>build_attrs</code> into an <code>attrs.rs</code>. Add a shared <code>error.rs</code> for common error helpers.</p></div>
+    </div>
+  </div>
+
+  <!-- Q2 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title">Duplicate Merkle tree computation in read_response vs stat</span>
+      <span class="finding-location">handler.rs:read_response, get_or_compute_merkle_root</span>
+    </div>
+    <div class="finding-body">
+      <p><code>read_response</code> computes the full Merkle tree to determine chunk boundaries and hashes, then computes it <strong>again</strong> at the end to store in the cache. <code>get_or_compute_merkle_root</code> does the same work independently. If a client first does STAT then READ on the same file, the Merkle tree is computed <strong>twice</strong> for the same content.</p>
+      <div class="recommendation"><p>Extract a <code>compute_merkle_tree()</code> function that returns both the root hash and the full tree structure. Use it in both STAT and READ paths. Consider caching the result in a small LRU cache keyed by (path, mtime) since the same file may be accessed multiple times in quick succession.</p></div>
+    </div>
+  </div>
+
+  <!-- Q3 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">Schema SQL duplicated between <code>open()</code> and <code>open_in_memory()</code></span>
+      <span class="finding-location">metadata/db.rs</span>
+    </div>
+    <div class="finding-body">
+      <p>The three CREATE TABLE statements are copy-pasted between <code>Database::open()</code> and <code>Database::open_in_memory()</code>. If either is updated without the other, the schemas will silently drift. This is a DRY violation and a maintenance hazard.</p>
+      <div class="code-block"><span class="hl-cmt">// In open():</span>
+conn.<span class="hl-fn">execute_batch</span>(<span class="hl-str">"CREATE TABLE IF NOT EXISTS merkle_cache (...); CREATE TABLE ..."</span>);
+<span class="hl-cmt">// In open_in_memory():  ← exact same string, copy-pasted</span>
+conn.<span class="hl-fn">execute_batch</span>(<span class="hl-str">"CREATE TABLE IF NOT EXISTS merkle_cache (...); CREATE TABLE ..."</span>);</div>
+      <div class="recommendation"><p>Extract the schema DDL into a <code>const SCHEMA: &amp;str</code> or a <code>fn init_schema(conn)</code> helper that both constructors call.</p></div>
+    </div>
+  </div>
+
+  <!-- Q4 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">Inconsistent error codes for similar failure modes</span>
+      <span class="finding-location">handler.rs</span>
+    </div>
+    <div class="finding-body">
+      <p>Handlers use different error codes for logically similar conditions:</p>
+      <ul style="margin:0.5rem 0 0.75rem 1.5rem; font-size:0.88rem; color:var(--text2)">
+        <li>Malformed payload: <code>stat_response</code> returns empty results, <code>lookup</code> returns <code>ErrorUnsupported</code>, <code>readdir</code> returns <code>ErrorUnsupported</code></li>
+        <li>Invalid UUID handle: <code>stat</code> returns <code>ErrorNotFound</code>, <code>lookup</code> returns <code>ErrorNotFound</code>, <code>read</code> returns <code>ErrorNotFound</code> — this is consistent ✓</li>
+        <li>Path escapes share: <code>resolve</code> bails with a string error, which maps to <code>ErrorNotFound</code> sometimes and <code>ErrorPermissionDenied</code> never — despite being a security violation</li>
+      </ul>
+      <div class="recommendation"><p>Add a <code>ErrorCode::ErrorPermissionDenied</code> for path traversal attempts (which is a security event, not "not found"). Use consistent error codes for malformed payloads (e.g., <code>ErrorCode::ErrorMalformed</code> across all handlers). Log path traversal attempts at <code>warn!</code> level.</p></div>
+    </div>
+  </div>
+
+  <!-- Q5 -->
+  <div class="finding low" data-sev="low">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge low">Low</span>
+      <span class="finding-title">Magic number: <code>max_concurrent_streams: 128</code></span>
+      <span class="finding-location">server.rs:handle_stream (RIFT_HELLO handler)</span>
+    </div>
+    <div class="finding-body">
+      <p>The <code>RiftWelcome</code> message hardcodes <code>max_concurrent_streams: 128</code> with no way to configure it and no enforcement of the limit on either side.</p>
+      <div class="recommendation"><p>Make this configurable via <code>ServerConfig</code>. Enforce the limit in <code>serve_connection</code> by tracking active streams with a <code>Semaphore</code>.</p></div>
+    </div>
+  </div>
+
+  <!-- Q6 -->
+  <div class="finding low" data-sev="low">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge low">Low</span>
+      <span class="finding-title">Outdated <code>walkdir = "1"</code> dependency</span>
+      <span class="finding-location">Cargo.toml</span>
+    </div>
+    <div class="finding-body">
+      <p>The crate depends on <code>walkdir = "1"</code> which was released in 2015. The current version is 2.x with API improvements and bug fixes. Version 1 is effectively unmaintained.</p>
+      <div class="recommendation"><p>Upgrade to <code>walkdir = "2"</code>. The API surface is similar but has minor breaking changes (e.g., <code>WalkDir::new</code> returns a different iterator type). This is a low-effort change.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== CORRECTNESS ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">🐛</span>
+    <h2>Correctness</h2>
+  </div>
+
+  <!-- C1 -->
+  <div class="finding high" data-sev="high">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge high">High</span>
+      <span class="finding-title"><code>put_tree</code> writes empty <code>leaf_hashes</code> to legacy cache — data inconsistency</span>
+      <span class="finding-location">metadata/merkle.rs:put_tree</span>
+    </div>
+    <div class="finding-body">
+      <p>When <code>put_tree</code> updates the legacy <code>merkle_cache</code> table for backward compatibility, it writes <strong>empty bytes</strong> (<code>"".as_bytes()</code>) for the <code>leaf_hashes</code> column. If <code>get_merkle</code> later hits this entry (which it will, since the mtime/size match), it will try to deserialize empty bytes as leaf hashes, <strong>silently fail, and return <code>None</code></strong>. This means the cache entry is created but can never be read back successfully — it's a write-only cache entry that wastes space and forces re-computation.</p>
+      <div class="code-block"><span class="hl-cmt">// In put_tree():</span>
+tx.<span class="hl-fn">execute</span>(
+    <span class="hl-str">"INSERT OR REPLACE INTO merkle_cache ... VALUES (?1, ?2, ?3, ?4, ?5, ?6)"</span>,
+    rusqlite::params![path_str, mtime, file_size, root_bytes, <span class="hl-bad">"".as_bytes()</span>, now],
+);</div>
+      <div class="recommendation"><p>Either serialize the real leaf_hashes into the legacy cache entry, or skip the legacy cache insert entirely in <code>put_tree</code> (the tree nodes table is authoritative). If keeping it for backward compat, at least set a flag so <code>get_merkle</code> knows to check the tree nodes table.</p></div>
+    </div>
+  </div>
+
+  <!-- C2 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title"><code>lookup_response</code> re-canonicalizes the share root on every call</span>
+      <span class="finding-location">handler.rs:lookup_response</span>
+    </div>
+    <div class="finding-body">
+      <p><code>lookup_response</code> calls <code>tokio::fs::canonicalize(share)</code> and <code>tokio::fs::canonicalize(&amp;child_path)</code> on every request. The share root canonicalization is redundant — it's the same value every time and adds an unnecessary syscall. More importantly, if the share root becomes unreachable (e.g., NFS down), <em>every</em> lookup fails even for files within an already-canonicalized subtree.</p>
+      <div class="recommendation"><p>Canonicalize the share root once at startup and store it in the <code>ConnectionState</code> struct. Pass it into handlers instead of the raw share path.</p></div>
+    </div>
+  </div>
+
+  <!-- C3 -->
+  <div class="finding medium" data-sev="medium">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge medium">Medium</span>
+      <span class="finding-title">Merkle cache keyed by file path string — rename breaks cache</span>
+      <span class="finding-location">metadata/db.rs, merkle.rs</span>
+    </div>
+    <div class="finding-body">
+      <p>The SQLite schema uses <code>file_path TEXT PRIMARY KEY</code> across all three tables. If a file is renamed, the old cache entry becomes orphaned (never matched) and a new one is created on next access. The old entry is never cleaned up. Over time, this leads to unbounded cache growth. Additionally, if a <em>different</em> file is later created at the same path with the same mtime/size, it could receive the <em>wrong</em> cached Merkle tree.</p>
+      <div class="recommendation"><p>Consider adding an inode/device-number key to the cache to make entries truly identity-based. Add a periodic cleanup job or LRU eviction to bound cache size. The mtime/size staleness check mitigates the "wrong cache" risk but doesn't eliminate it for adversarial scenarios.</p></div>
+    </div>
+  </div>
+
+  <!-- C4 -->
+  <div class="finding low" data-sev="low">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge low">Low</span>
+      <span class="finding-title">HandleDatabase xattr read uses non-canonical path</span>
+      <span class="finding-location">handle.rs:get_or_create_handle</span>
+    </div>
+    <div class="finding-body">
+      <p><code>get_or_create_handle</code> first canonicalizes the path and stores the canonical path in the map. But then it reads/writes xattrs using <strong>the original <code>path</code> argument</strong>, not the canonical one. If the input <code>path</code> and the canonical path differ (e.g., due to symlinks in intermediate components), the xattr is read from the symlink path but the in-memory map uses the resolved path. This inconsistency could cause handles to be lost or re-created unnecessarily on server restart.</p>
+      <div class="code-block"><span class="hl-kw">let</span> canonical = tokio::fs::<span class="hl-fn">canonicalize</span>(path).<span class="hl-kw">await</span>?;
+<span class="hl-cmt">// … map uses `canonical` …</span>
+<span class="hl-kw">let</span> handle = <span class="hl-kw">match</span> xattr::<span class="hl-fn">get</span>(<span class="hl-bad">path</span>, RIFT_HANDLE_XATTR) {  <span class="hl-cmt">// ← non-canonical!</span>
+    …
+};
+<span class="hl-cmt">// and:</span>
+<span class="hl-kw">if</span> path.<span class="hl-fn">is_file</span>() {
+    <span class="hl-kw">let</span> _ = xattr::<span class="hl-fn">set</span>(<span class="hl-bad">path</span>, RIFT_HANDLE_XATTR, handle.<span class="hl-fn">as_bytes</span>());  <span class="hl-cmt">// ← non-canonical!</span>
+}</div>
+      <div class="recommendation"><p>Use <code>canonical</code> for both xattr reads and writes. Add a <code>canonical.as_os_str()</code> call instead of the raw <code>path</code> argument.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== INFO / OBSERVATIONS ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">ℹ️</span>
+    <h2>Observations</h2>
+  </div>
+
+  <!-- I1 -->
+  <div class="finding info" data-sev="info">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge info">Info</span>
+      <span class="finding-title">No database schema versioning or migration system</span>
+      <span class="finding-location">metadata/db.rs</span>
+    </div>
+    <div class="finding-body">
+      <p>The schema is created with <code>CREATE TABLE IF NOT EXISTS</code> and has no version tracking. Adding columns or tables in future versions would silently create them alongside the old schema, but <strong>there's no way to migrate existing data or detect schema version mismatches</strong>. If a column is renamed or a constraint changes, the old table persists unchanged.</p>
+      <div class="recommendation"><p>Add a <code>schema_version INTEGER</code> table (or pragma) and check it on open. Implement a simple migration runner. This is low priority now but will become critical as the schema evolves.</p></div>
+    </div>
+  </div>
+
+  <!-- I2 -->
+  <div class="finding info" data-sev="info">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge info">Info</span>
+      <span class="finding-title">Extensive but partially duplicated test suite (2,430 lines)</span>
+      <span class="finding-location">tests/server.rs</span>
+    </div>
+    <div class="finding-body">
+      <p>The integration test file is very thorough (2430 lines!) with good coverage of security cases (path traversal, malformed payloads, symlink escapes). However, there's significant overlap with the unit tests in <code>handler.rs</code> tests module. Many test cases test the exact same scenarios at different levels, which increases maintenance burden without proportional value.</p>
+      <div class="recommendation"><p>Consolidate: keep unit tests for edge cases and error paths in <code>handler.rs</code>. Keep integration tests only for protocol-level concerns (framing, handshake, multi-stream). Add a brief comment at the top of each test module explaining what level it tests and why.</p></div>
+    </div>
+  </div>
+
+  <!-- I3 -->
+  <div class="finding info" data-sev="info">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge info">Info</span>
+      <span class="finding-title">Pre-epoch mtime handling was fixed, but other edge cases remain</span>
+      <span class="finding-location">metadata/merkle.rs:get_merkle</span>
+    </div>
+    <div class="finding-body">
+      <p>The codebase correctly handles pre-epoch mtime (the test at <code>metadata/merkle.rs:get_merkle_handles_pre_epoch_mtime</code> proves this was a past bug). Good. However, there are other edge cases untested: files with mtime at exactly <code>UNIX_EPOCH</code> (0), files where <code>meta.modified()</code> returns <code>Err</code> (e.g., some filesystems don't support mtime), and files where <code>as_nanos() as u64</code> overflows for very large mtime values.</p>
+      <div class="recommendation"><p>Consider adding a <code>mtime_ns == 0</code> guard to always re-compute (since 0 could mean "unsupported" or "actual epoch"). This avoids caching entries that might be wrong.</p></div>
+    </div>
+  </div>
+
+  <!-- I4 -->
+  <div class="finding info" data-sev="info">
+    <div class="finding-header" onclick="toggleFinding(this)">
+      <span class="chevron">▶</span>
+      <span class="severity-badge info">Info</span>
+      <span class="finding-title">Merkle drill rebuilds the full tree on every request (no lazy loading)</span>
+      <span class="finding-location">handler.rs:merkle_drill_response</span>
+    </div>
+    <div class="finding-body">
+      <p><code>merkle_drill_response</code> reads the entire file, builds the full Merkle tree with cache, and stores it to the database — <strong>on every drill request</strong>. This is correct for the first drill on a file, but wasteful for subsequent drills where the tree is already in the DB. The code does check the DB for children, but only after rebuilding the tree.</p>
+      <div class="recommendation"><p>Check the cache first: if <code>get_merkle</code> returns a hit, the tree should already be in the DB from a previous <code>put_tree</code> call. Skip the tree rebuild in that case and go straight to <code>get_children</code>.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== POSITIVE NOTES ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">✅</span>
+    <h2>What's Done Well</h2>
+  </div>
+  <div style="background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:1.25rem;">
+    <ul style="margin-left:1.5rem; font-size:0.9rem; color:var(--text2); line-height:1.8;">
+      <li><strong style="color:var(--low)">Path traversal protection</strong> via canonicalization + share-prefix check in <code>resolve()</code> is correct at the logical level and handles both direct and symlink escapes.</li>
+      <li><strong style="color:var(--low)">Handle eviction</strong> on stale/escaped paths — <code>resolve()</code> removes invalid handles from the <code>HandleDatabase</code>, preventing stale entries from accumulating.</li>
+      <li><strong style="color:var(--low)">Robust malformed payload handling</strong> — every handler catches <code>decode()</code> errors and returns an error response, never panicking on bad input.</li>
+      <li><strong style="color:var(--low)">Concurrent insert safety</strong> — the <code>get_or_create_handle</code> insert-then-re-lookup pattern correctly handles races, verified by the 100-concurrent-call test.</li>
+      <li><strong style="color:var(--low)">Good test coverage for security cases</strong> — symlink escapes, path traversal, malformed payloads, and pre-epoch mtime are all tested.</li>
+      <li><strong style="color:var(--low)">SQLite WAL mode</strong> — correct choice for concurrent read-heavy workload.</li>
+      <li><strong style="color:var(--low)">Clean separation</strong> between transport (<code>server.rs</code>) and business logic (<code>handler.rs</code>), even if handler.rs is large.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===== PRIORITY FIX LIST ===== -->
+<div class="section">
+  <div class="section-header">
+    <span class="section-icon">📋</span>
+    <h2>Recommended Fix Priority</h2>
+  </div>
+  <div style="background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:1.25rem; overflow-x:auto;">
+    <table style="width:100%; border-collapse:collapse; font-size:0.85rem;">
+      <thead>
+        <tr style="border-bottom:1px solid var(--border); color:var(--text2);">
+          <th style="text-align:left; padding:0.5rem;">#</th>
+          <th style="text-align:left; padding:0.5rem;">Severity</th>
+          <th style="text-align:left; padding:0.5rem;">Finding</th>
+          <th style="text-align:left; padding:0.5rem;">Effort</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">1</td><td style="padding:0.5rem; color:var(--critical)">Critical</td><td style="padding:0.5rem;">No auth/authorization enforced</td><td style="padding:0.5rem; color:var(--text2)">M</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">2</td><td style="padding:0.5rem; color:var(--critical)">Critical</td><td style="padding:0.5rem;">Memory exhaustion via unbounded file reads</td><td style="padding:0.5rem; color:var(--text2)">L</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">3</td><td style="padding:0.5rem; color:var(--critical)">Critical</td><td style="padding:0.5rem;">TOCTOU symlink race in resolve</td><td style="padding:0.5rem; color:var(--text2)">M</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">4</td><td style="padding:0.5rem; color:var(--high)">High</td><td style="padding:0.5rem;">No rate limiting / concurrency limits</td><td style="padding:0.5rem; color:var(--text2)">M</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">5</td><td style="padding:0.5rem; color:var(--high)">High</td><td style="padding:0.5rem;">Only first share exported</td><td style="padding:0.5rem; color:var(--text2)">S</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">6</td><td style="padding:0.5rem; color:var(--high)">High</td><td style="padding:0.5rem;">put_tree writes empty leaf_hashes</td><td style="padding:0.5rem; color:var(--text2)">S</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">7</td><td style="padding:0.5rem; color:var(--high)">High</td><td style="padding:0.5rem;">xattr handle forgery possible</td><td style="padding:0.5rem; color:var(--text2)">M</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">8</td><td style="padding:0.5rem; color:var(--high)">High</td><td style="padding:0.5rem;">handler.rs monolith (1169 lines)</td><td style="padding:0.5rem; color:var(--text2)">M</td></tr>
+        <tr style="border-bottom:1px solid var(--border);"><td style="padding:0.5rem; color:var(--text2)">9</td><td style="padding:0.5rem; color:var(--high)">High</td><td style="padding:0.5rem;">Duplicate Merkle computation</td><td style="padding:0.5rem; color:var(--text2)">M</td></tr>
+        <tr><td style="padding:0.5rem; color:var(--text2)">10+</td><td style="padding:0.5rem; color:var(--medium)">Med/Low</td><td style="padding:0.5rem;">See remaining findings above</td><td style="padding:0.5rem; color:var(--text2)">S–M</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:1rem; font-size:0.8rem; color:var(--text2);">Effort: S = Small (&lt;1 hour), M = Medium (1–4 hours), L = Large (1–2 days)</p>
+  </div>
+</div>
+
+</div>
+
+<script>
+function toggleFinding(el) {
+  el.parentElement.classList.toggle('open');
+}
+
+function filterFindings(sev) {
+  document.querySelectorAll('.finding').forEach(f => {
+    if (sev === 'all' || f.dataset.sev === sev) {
+      f.style.display = '';
+    } else {
+      f.style.display = 'none';
+    }
+  });
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  event.target.closest('.filter-btn')?.classList.add('active');
+}
+
+// Open all critical findings by default
+document.querySelectorAll('.finding.critical').forEach(f => f.classList.add('open'));
+</script>
+
+</body>
+</html>

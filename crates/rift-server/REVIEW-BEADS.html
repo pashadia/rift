@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rift Server Review × Beads Cross-Reference</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2333;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --critical: #f85149;
+    --critical-bg: #2d1215;
+    --critical-border: #f8514940;
+    --high: #d29922;
+    --high-bg: #2d2510;
+    --high-border: #d2992240;
+    --medium: #58a6ff;
+    --medium-bg: #0d2140;
+    --medium-border: #58a6ff40;
+    --low: #3fb950;
+    --low-bg: #0d2818;
+    --low-border: #3fb95040;
+    --info: #8b949e;
+    --info-bg: #161b22;
+    --info-border: #30363d;
+    --cat1: #f778ba;
+    --cat1-bg: #2d1525;
+    --cat2: #d2a8ff;
+    --cat2-bg: #1f1530;
+    --cat3: #79c0ff;
+    --cat3-bg: #0d1f30;
+    --cat4: #56d364;
+    --cat4-bg: #0d2818;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+  }
+  .hero {
+    background: linear-gradient(135deg, #2d1a3e 0%, #0d1117 50%, #0d2137 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 2.5rem 2rem; text-align: center;
+  }
+  .hero h1 { font-size: 2rem; margin-bottom: 0.4rem; }
+  .hero p { color: var(--text2); font-size: 1rem; }
+  .container { max-width: 1080px; margin: 0 auto; padding: 2rem; }
+
+  /* Category sections */
+  .cat-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 2rem;
+    overflow: hidden;
+  }
+  .cat-header {
+    display: flex; align-items: center; gap: 0.75rem;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .cat-header h2 { font-size: 1.15rem; font-weight: 700; }
+  .cat-header .cat-badge {
+    font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.5px; padding: 0.2rem 0.6rem; border-radius: 4px;
+  }
+  .cat-header .count {
+    margin-left: auto; font-size: 0.8rem; color: var(--text2);
+    background: var(--bg); padding: 0.15rem 0.55rem; border-radius: 4px;
+  }
+
+  /* Category 1: New */
+  .cat1-header { border-left: 4px solid var(--cat1); }
+  .cat1-header .cat-badge { background: var(--cat1-bg); color: var(--cat1); border: 1px solid var(--cat1); }
+  /* Category 2: Related */
+  .cat2-header { border-left: 4px solid var(--cat2); }
+  .cat2-header .cat-badge { background: var(--cat2-bg); color: var(--cat2); border: 1px solid var(--cat2); }
+  /* Category 3: Thin bead */
+  .cat3-header { border-left: 4px solid var(--cat3); }
+  .cat3-header .cat-badge { background: var(--cat3-bg); color: var(--cat3); border: 1px solid var(--cat3); }
+  /* Category 4: Fully covered */
+  .cat4-header { border-left: 4px solid var(--cat4); }
+  .cat4-header .cat-badge { background: var(--cat4-bg); color: var(--cat4); border: 1px solid var(--cat4); }
+
+  /* Finding rows */
+  .finding-row {
+    padding: 0.85rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .finding-row:last-child { border-bottom: none; }
+  .finding-row:hover { background: var(--surface2); }
+
+  .finding-top {
+    display: flex; align-items: center; gap: 0.6rem;
+    margin-bottom: 0.35rem;
+  }
+  .severity-dot {
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  }
+  .severity-dot.critical { background: var(--critical); }
+  .severity-dot.high { background: var(--high); }
+  .severity-dot.medium { background: var(--medium); }
+  .severity-dot.low { background: var(--low); }
+  .severity-dot.info { background: var(--info); }
+
+  .finding-id {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 0.75rem; font-weight: 600;
+    background: var(--bg); padding: 0.1rem 0.45rem; border-radius: 3px;
+    color: var(--text2);
+  }
+  .finding-title { font-weight: 600; font-size: 0.9rem; }
+  .finding-location {
+    margin-left: auto;
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 0.78rem; color: var(--text2); white-space: nowrap;
+  }
+
+  .finding-detail { margin-left: 1.4rem; font-size: 0.85rem; color: var(--text2); line-height: 1.6; }
+
+  .bead-ref {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 0.78rem; font-weight: 600;
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 0.15rem 0.5rem; border-radius: 4px;
+    color: var(--medium); text-decoration: none;
+  }
+  .bead-ref .dot { font-size: 0.55rem; }
+  .bead-ref.p1 { color: var(--critical); border-color: var(--critical-border); }
+  .bead-ref.p2 { color: var(--high); border-color: var(--high-border); }
+  .bead-ref.p3 { color: var(--text2); border-color: var(--info-border); }
+
+  .new-badge {
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    background: var(--cat1-bg); color: var(--cat1);
+    border: 1px solid var(--cat1); padding: 0.1rem 0.4rem; border-radius: 3px;
+    letter-spacing: 0.5px;
+  }
+
+  .gap-label {
+    font-size: 0.78rem; font-weight: 600; color: var(--d29922);
+    display: inline; margin-right: 0.3rem;
+  }
+  .gap-label::before { content: '⚠ Gap: '; }
+
+  .addition-label {
+    font-size: 0.78rem; font-weight: 600; color: var(--low);
+    display: inline; margin-right: 0.3rem;
+  }
+  .addition-label::before { content: '➕ Adds: '; }
+
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }
+  .summary-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.1rem;
+    text-align: center;
+  }
+  .summary-card .num { font-size: 2.2rem; font-weight: 700; }
+  .summary-card .label { font-size: 0.75rem; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 0.2rem; }
+
+  ul.bead-misses {
+    margin: 0.4rem 0 0 1rem;
+    font-size: 0.82rem;
+    color: var(--text2);
+    line-height: 1.7;
+  }
+  ul.bead-misses li { margin-bottom: 0.1rem; }
+
+  @media (max-width: 768px) {
+    .summary-grid { grid-template-columns: repeat(2, 1fr); }
+    .finding-location { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>🔎 Review × Beads Cross-Reference</h1>
+  <p>Every finding from the code review, categorized by relationship to existing beads</p>
+</div>
+
+<div class="container">
+
+<!-- Summary cards -->
+<div class="summary-grid">
+  <div class="summary-card">
+    <div class="num" style="color:var(--cat1)">17</div>
+    <div class="label">Not in beads</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:var(--cat2)">5</div>
+    <div class="label">Related to bead</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:var(--cat3)">2</div>
+    <div class="label">Thin bead — report adds context</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:var(--cat4)">2</div>
+    <div class="label">Fully in beads</div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- CATEGORY 1: Not previously reported                                  -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="cat-section">
+  <div class="cat-header cat1-header">
+    <span class="cat-badge" style="background:var(--cat1-bg);color:var(--cat1);border:1px solid var(--cat1)">Category 1</span>
+    <h2>Not Previously Reported</h2>
+    <span class="new-badge">NEW</span>
+    <span class="count">17 findings</span>
+  </div>
+
+  <!-- 1 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot critical"></span>
+      <span class="finding-id">S3</span>
+      <span class="finding-title">TOCTOU race in path canonicalization — symlink insertion attack</span>
+      <span class="finding-location">handler.rs:resolve</span>
+    </div>
+    <div class="finding-detail">
+      Between <code>canonicalize()</code> and the subsequent file operation, an attacker with local filesystem access could replace a file with a symlink pointing outside the share. The canonical path is validated but then used on an already-resolved path that may have changed. <strong>No bead exists for this.</strong> This is different from the resolved <code>rift-9l0</code> (drill bypassing resolve entirely) — this is a race <em>within</em> resolve itself.
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">S4</span>
+      <span class="finding-title">No rate limiting or concurrency limits — unbounded task spawning</span>
+      <span class="finding-location">server.rs:accept_loop, serve_connection</span>
+    </div>
+    <div class="finding-detail">
+      Both connection and stream handlers use bare <code>tokio::spawn</code> with no <code>Semaphore</code> or bound. A malicious client can exhaust memory, FDs, and CPU. No bead covers DoS protection or concurrency limits for the accept/stream loops.
+    </div>
+  </div>
+
+  <!-- 3 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">S5</span>
+      <span class="finding-title">xattr handle forgery — unauthenticated persistent handles</span>
+      <span class="finding-location">handle.rs:get_or_create_handle</span>
+    </div>
+    <div class="finding-detail">
+      Any process with filesystem write access can set <code>user.rift.handle</code> to a chosen UUID, injecting handle mappings the server will trust. <code>rift-3ak</code> covers <em>silent xattr write failures</em> — this is a different (and more severe) issue: <strong>unauthenticated xattr reads</strong> that enable handle injection and potential UUID collision attacks.
+    </div>
+  </div>
+
+  <!-- 4 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">S7</span>
+      <span class="finding-title">No input validation on start_chunk / chunk_count in READ_REQUEST</span>
+      <span class="finding-location">handler.rs:read_response</span>
+    </div>
+    <div class="finding-detail">
+      <code>start_chunk</code> and <code>chunk_count</code> are taken from the client without bounds checking. A client can request <code>chunk_count = u32::MAX</code>, triggering an extremely long iteration and many frame sends. No bead covers input validation on read request parameters.
+    </div>
+  </div>
+
+  <!-- 5 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">D2</span>
+      <span class="finding-title"><code>Arc&lt;Option&lt;Database&gt;&gt;</code> — awkward double-unwrap type erasure</span>
+      <span class="finding-location">main.rs, server.rs, handler.rs</span>
+    </div>
+    <div class="finding-detail">
+      <code>db.as_ref().as_ref()</code> appears in every handler. The <code>Option</code> conflate shared ownership with optionality. Should be replaced with a trait object (<code>Arc&lt;dyn MerkleCache&gt;</code>) implemented by both <code>Database</code> and a <code>NoopCache</code>. No bead exists for this refactoring.
+    </div>
+  </div>
+
+  <!-- 6 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">D4</span>
+      <span class="finding-title">Inconsistent handler error patterns — return types vs. stream writes</span>
+      <span class="finding-location">handler.rs</span>
+    </div>
+    <div class="finding-detail">
+      <code>stat/lookup/readdir</code> return proto structs (testable, clean). <code>read/merkle_drill</code> take <code>&amp;mut S: RiftStream</code> and write frames directly (hard to test, mixes concerns). No bead for unifying handler error patterns.
+    </div>
+  </div>
+
+  <!-- 7 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">D5</span>
+      <span class="finding-title">No connection state — handshake results not tracked</span>
+      <span class="finding-location">server.rs:serve_connection</span>
+    </div>
+    <div class="finding-detail">
+      The handshake produces a <code>RiftWelcome</code> with protocol version, share info, root handle — but none of this is stored. Subsequent streams don't know which share was selected or what version was negotiated. No bead for per-connection state tracking.
+    </div>
+  </div>
+
+  <!-- 8 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot low"></span>
+      <span class="finding-id">D6</span>
+      <span class="finding-title">No graceful shutdown / drain logic</span>
+      <span class="finding-location">main.rs:tokio::select!</span>
+    </div>
+    <div class="finding-detail">
+      Ctrl-C drops the listener and all in-flight tasks immediately. No <code>CancellationToken</code>, no drain timeout, no in-flight stream tracking. No bead for graceful shutdown.
+    </div>
+  </div>
+
+  <!-- 9 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot low"></span>
+      <span class="finding-id">D7</span>
+      <span class="finding-title">Unknown message types close stream with no error to client</span>
+      <span class="finding-location">server.rs:handle_stream</span>
+    </div>
+    <div class="finding-detail">
+      The code has a <code>TODO(v1): send ERROR_RESPONSE</code> comment but no bead was filed for implementing it. Clients get a silent stream close on unknown message types, making debugging very hard.
+    </div>
+  </div>
+
+  <!-- 10 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">Q1</span>
+      <span class="finding-title">handler.rs is a 1,169-line monolith with 5 handlers + helpers</span>
+      <span class="finding-location">handler.rs</span>
+    </div>
+    <div class="finding-detail">
+      <code>rift-772.6</code> covers moving inline <em>tests</em> to <code>tests/server.rs</code>, but no bead exists for the <strong>module splitting</strong> effort itself (stat.rs, lookup.rs, readdir.rs, read.rs, merkle.rs, attrs.rs, error.rs).
+    </div>
+  </div>
+
+  <!-- 11 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">Q3</span>
+      <span class="finding-title">Schema SQL duplicated between <code>open()</code> and <code>open_in_memory()</code></span>
+      <span class="finding-location">metadata/db.rs</span>
+    </div>
+    <div class="finding-detail">
+      Three CREATE TABLE statements are copy-pasted between the two constructors. Schema drift risk. No bead for deduplicating DB schema DDL.
+    </div>
+  </div>
+
+  <!-- 12 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">Q4</span>
+      <span class="finding-title">Inconsistent error codes for similar failure modes</span>
+      <span class="finding-location">handler.rs</span>
+    </div>
+    <div class="finding-detail">
+      Malformed payloads: <code>stat</code> → empty results, <code>lookup</code> → <code>ErrorUnsupported</code>, <code>readdir</code> → <code>ErrorUnsupported</code>. Path traversal: always <code>ErrorNotFound</code> (should be <code>ErrorPermissionDenied</code>). No bead for error code consistency.
+    </div>
+  </div>
+
+  <!-- 13 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot low"></span>
+      <span class="finding-id">Q5</span>
+      <span class="finding-title">Magic number: <code>max_concurrent_streams: 128</code></span>
+      <span class="finding-location">server.rs:handle_stream</span>
+    </div>
+    <div class="finding-detail">
+      Hardcoded in <code>RiftWelcome</code>, not configurable, not enforced. No bead for making this configurable or enforcing the limit.
+    </div>
+  </div>
+
+  <!-- 14 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot low"></span>
+      <span class="finding-id">Q6</span>
+      <span class="finding-title">Outdated <code>walkdir = "1"</code> dependency</span>
+      <span class="finding-location">Cargo.toml</span>
+    </div>
+    <div class="finding-detail">
+      <code>walkdir v1</code> is from 2015 and unmaintained. Current is v2. No bead for dependency upgrades.
+    </div>
+  </div>
+
+  <!-- 15 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">C1</span>
+      <span class="finding-title"><code>put_tree</code> writes empty <code>leaf_hashes</code> to legacy cache — data inconsistency</span>
+      <span class="finding-location">metadata/merkle.rs:put_tree</span>
+    </div>
+    <div class="finding-detail">
+      <code>put_tree</code> inserts <code>"".as_bytes()</code> for leaf_hashes into the legacy merkle_cache table. When <code>get_merkle</code> later hits this entry, deserialization silently fails and returns <code>None</code> — the cache entry can never be read back. <code>rift-ms7</code> is about <code>build_with_cache()</code> producing <code>length: 0</code> in <em>rift-common</em>; this is a <em>different</em> bug in <em>rift-server</em>'s <code>put_tree</code> writing garbage to the legacy column.
+    </div>
+  </div>
+
+  <!-- 16 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">C2</span>
+      <span class="finding-title"><code>lookup_response</code> re-canonicalizes share root on every call</span>
+      <span class="finding-location">handler.rs:lookup_response</span>
+    </div>
+    <div class="finding-detail">
+      Unnecessary <code>tokio::fs::canonicalize(share)</code> syscall on every lookup. Should be computed once at startup. No bead for this redundant I/O.
+    </div>
+  </div>
+
+  <!-- 17 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot low"></span>
+      <span class="finding-id">C4</span>
+      <span class="finding-title">HandleDatabase xattr read uses non-canonical path</span>
+      <span class="finding-location">handle.rs:get_or_create_handle</span>
+    </div>
+    <div class="finding-detail">
+      The map stores canonical paths, but xattr reads/writes use the original <code>path</code> argument. If input and canonical paths differ (symlinks), handles may be lost on restart. <code>rift-3ak</code> is about <em>silent xattr failures</em> — this is a separate issue (wrong <em>path</em> used for xattr ops).
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- CATEGORY 2: Related to an existing bead                              -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="cat-section">
+  <div class="cat-header cat2-header">
+    <span class="cat-badge" style="background:var(--cat2-bg);color:var(--cat2);border:1px solid var(--cat2)">Category 2</span>
+    <h2>Related to an Existing Bead — Report Adds New Dimensions</h2>
+    <span class="count">5 findings</span>
+  </div>
+
+  <!-- 1 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot critical"></span>
+      <span class="finding-id">S1</span>
+      <span class="finding-title">No authentication or authorization enforced on connections</span>
+      <span class="finding-location">server.rs:serve_connection</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Related beads:</strong>&nbsp;
+      <span class="bead-ref p1">rift-3lh</span>
+      <span class="bead-ref p1">rift-5dt</span>
+      <span class="bead-ref p1">rift-9k6</span>
+      <br><br>
+      The beads describe the feature work to implement auth (fingerprint validation, per-share permissions, TLS client certs). What the beads <strong>don't convey</strong> is the security <em>criticality</em>: right now <strong>any</strong> client with any TLS cert gets full read access to all shares. The TODO comment in <code>serve_connection</code> and the hardcoded <code>read_only: true</code> in <code>RiftWelcome</code> are specific code-level gaps not mentioned in any bead. Additionally, the auth beads are P1 but unblocked by unresolved predecessor chains — the urgency of the current state is not captured.
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">S6</span>
+      <span class="finding-title">Self-signed cert with hardcoded CN, no SAN, no key rotation</span>
+      <span class="finding-location">cert.rs:generate_and_save_cert</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Related beads:</strong>&nbsp;
+      <span class="bead-ref p2">rift-5j9</span> (PEM support)
+      <span class="bead-ref p2">rift-7rk</span> (auto-renewal)
+      <br><br>
+      <span class="gap-label">Neither bead covers the security implications of the current implementation.</span>
+      <code>rift-5j9</code> is about format support (PEM vs DER). <code>rift-7rk</code> is about renewal before expiry. Neither addresses: (1) hardcoded CN <code>"rift-server"</code> with no SAN, (2) no key rotation mechanism — a leaked private key compromises all connections with no remediation, (3) no way to configure the cert's subject identity. These are distinct security gaps beyond format and renewal.
+    </div>
+  </div>
+
+  <!-- 3 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">S8</span>
+      <span class="finding-title">Silent error swallowing hides security events</span>
+      <span class="finding-location">handler.rs, merkle.rs (multiple)</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Related bead:</strong>&nbsp;
+      <span class="bead-ref p3">rift-3ak</span> (xattr write failures)
+      <br><br>
+      <span class="addition-label">Report broadens scope beyond xattrs.</span>
+      <code>rift-3ak</code> covers silent xattr <em>write</em> failures only. My report identifies 3 additional categories of silently swallowed errors: (1) <code>let _ = database.put_merkle(...).await</code> — cache write failures in <code>handler.rs</code>, (2) <code>let _ = database.put_tree(...).await</code> — tree persistence failures in <code>handler.rs</code>, (3) all DB write failures in <code>merkle.rs</code>. Cache integrity failures are especially concerning for Merkle tree tampering detection.
+    </div>
+  </div>
+
+  <!-- 4 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">Q2</span>
+      <span class="finding-title">Duplicate Merkle tree computation in stat vs. read paths</span>
+      <span class="finding-location">handler.rs:read_response, get_or_compute_merkle_root</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Related bead:</strong>&nbsp;
+      <span class="bead-ref p1">rift-qn6</span> (full file read + tree rebuild on every MerkleDrill)
+      <br><br>
+      <span class="addition-label">Report identifies additional duplication paths.</span>
+      <code>rift-qn6</code> focuses on the <code>merkle_drill_response</code> path. My report identifies a <em>second</em> duplication: <code>stat_response</code> → <code>get_or_compute_merkle_root</code> computes the tree, then <code>read_response</code> on the same file computes it again independently. A typical client workflow (stat then read) doubles the work. Additionally, <code>read_response</code> computes the tree <em>twice within the same function</em> (once for chunk boundaries, once for cache storage at the end).
+    </div>
+  </div>
+
+  <!-- 5 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">D3</span>
+      <span class="finding-title">No filesystem abstraction — direct <code>tokio::fs</code> calls</span>
+      <span class="finding-location">handler.rs</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Related bead:</strong>&nbsp;
+      <span class="bead-ref p3">rift-4i2</span> (pluggable storage backends)
+      <br><br>
+      <span class="gap-label">Bead is P4 and much broader — misses the immediate testability/coupling concern.</span>
+      <code>rift-4i2</code> is about abstracting storage behind a trait for S3/object-store backends (P4, far-future). My report frames the issue at a <em>different level</em>: immediate concerns about testability (can't use mock filesystems), per-share VFS enforcement (read-only at VFS layer), and the coupling that makes any future storage change a major refactor. A lightweight <code>Vfs</code> trait is a nearer-term need than the full pluggable backend system.
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- CATEGORY 3: Bead exists but lacks context — report fills the gap     -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="cat-section">
+  <div class="cat-header cat3-header">
+    <span class="cat-badge" style="background:var(--cat3-bg);color:var(--cat3);border:1px solid var(--cat3)">Category 3</span>
+    <h2>Reported in Beads but Lacking Context — Report Fills the Gap</h2>
+    <span class="count">2 findings</span>
+  </div>
+
+  <!-- 1 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot high"></span>
+      <span class="finding-id">D1</span>
+      <span class="finding-title">Only the first share is exported — multi-share config is misleading</span>
+      <span class="finding-location">main.rs:63</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Bead:</strong>&nbsp;
+      <span class="bead-ref p3">rift-uvi</span>
+      — <em>"Server currently only serves first share from config. Need to wire all shares."</em>
+      <br><br>
+      <strong>What the bead misses:</strong> The bead is P3 and describes it as a missing feature. My report identifies that this is actually a <strong>high-severity issue</strong> because:
+      <ul class="bead-misses">
+        <li>The config parser <em>accepts</em> multiple shares silently — no warning, no error</li>
+        <li>Users who configure 3 shares will only get 1, with no indication the others were dropped</li>
+        <li>The handshake sends only one <code>ShareInfo</code>, so clients can't even discover other shares</li>
+        <li><code>shares[0]</code> indexing will panic if config has zero shares (though main.rs has a guard for empty shares before this line)</li>
+      </ul>
+      The bead should be upgraded to P2 at minimum, or at least reject multi-share configs with a clear error message until multi-share support is implemented.
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot info"></span>
+      <span class="finding-id">C3 / I1</span>
+      <span class="finding-title">Merkle cache keyed by file path string; no schema versioning</span>
+      <span class="finding-location">metadata/db.rs, merkle.rs</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Related bead:</strong>&nbsp;
+      <span class="bead-ref p2">rift-xay</span>
+      (configurable cache size limits with LRU eviction)
+      <br><br>
+      <strong>What the bead misses:</strong> <code>rift-xay</code> focuses on <em>eviction policy</em> (LRU, size limits). My report identifies a separate correctness issue with the <em>cache key design</em>:
+      <ul class="bead-misses">
+        <li><code>file_path TEXT PRIMARY KEY</code> — renamed files orphan their cache entries; a new file at the same path with matching mtime/size could get the wrong Merkle tree</li>
+        <li>No <code>schema_version</code> table — no way to migrate existing data or detect version mismatches on open</li>
+        <li>Orphaned entries are never cleaned up → unbounded growth even without LRU</li>
+      </ul>
+      These are data integrity concerns, not just sizing — LRU eviction alone won't prevent the wrong-cache-hit scenario.
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- CATEGORY 4: Fully reported in beads                                  -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="cat-section">
+  <div class="cat-header cat4-header">
+    <span class="cat-badge" style="background:var(--cat4-bg);color:var(--cat4);border:1px solid var(--cat4)">Category 4</span>
+    <h2>Fully Reported in Beads</h2>
+    <span class="count">2 findings</span>
+  </div>
+
+  <!-- 1 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot critical"></span>
+      <span class="finding-id">S2</span>
+      <span class="finding-title">Memory exhaustion via unbounded file reads</span>
+      <span class="finding-location">handler.rs:read_response</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Exact match:</strong>&nbsp;
+      <span class="bead-ref p2">rift-50p</span>
+      — <em>"Stream file reads on the server instead of loading entire file into memory"</em>
+      <br><br>
+      The bead is thorough: identifies all three handlers (<code>get_or_compute_merkle_root</code>, <code>read_response</code>, <code>merkle_drill_response</code>), discusses streaming approaches (mmap, streaming CDC, seek-based), and notes the <code>Chunker::chunk(&amp;[u8])</code> constraint. My report adds the DoS/security framing and the observation that <code>read_response</code> computes the tree twice internally, but the core issue is fully captured by the bead.
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot info"></span>
+      <span class="finding-id">I2 / I4</span>
+      <span class="finding-title">Merkle drill rebuilds full tree on every request; test duplication</span>
+      <span class="finding-location">handler.rs, tests/server.rs</span>
+    </div>
+    <div class="finding-detail">
+      <strong>Exact matches:</strong>&nbsp;
+      <span class="bead-ref p1">rift-qn6</span>
+      (full file read + tree rebuild on every drill)
+      <span class="bead-ref p3">rift-772.6</span>
+      (move handler.rs inline tests to tests/server.rs)
+      <br><br>
+      Both beads cover their respective issues thoroughly. <code>rift-qn6</code> even mentions testing concurrent drill requests for race conditions on DB writes, which my review didn't cover. No new information added.
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- Notable beads that the review did NOT surface                        -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="cat-section">
+  <div class="cat-header" style="border-left: 4px solid var(--text2);">
+    <span class="cat-badge" style="background:var(--bg);color:var(--text2);border:1px solid var(--border)">Supplementary</span>
+    <h2 style="color:var(--text2)">Relevant Beads Not Surfaced by This Review</h2>
+    <span class="count">3 beads in rift-server scope</span>
+  </div>
+
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">—</span>
+      <span class="finding-title" style="font-weight:400"><span class="bead-ref p2">rift-0ao</span> — Fragile string matching for QueryReturnedNoRows</span>
+    </div>
+    <div class="finding-detail">
+      Multiple methods in <code>merkle.rs</code> check for "Query returned no rows" by string-matching the error message. My review noticed the silent error handling but didn't call out this specific <em>fragile pattern-matching</em> issue. The bead is correct — <code>e.to_string().contains("Query returned no rows")</code> will break if <code>tokio_rusqlite</code> changes its error message format. Worth creating a bead-level fix.
+    </div>
+  </div>
+
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">—</span>
+      <span class="finding-title" style="font-weight:400"><span class="bead-ref p3">rift-wqx</span> — Streaming directory pagination for readdir</span>
+    </div>
+    <div class="finding-detail">
+      My review noted that <code>readdir_response</code> collects all entries into a <code>Vec</code> before returning, but didn't flag this as a separate memory concern for directories with 100k+ entries. The bead correctly identifies this as a streaming/pagination issue. My review's focus was on the handler-level design; the pagination concern is additive.
+    </div>
+  </div>
+
+  <div class="finding-row">
+    <div class="finding-top">
+      <span class="severity-dot medium"></span>
+      <span class="finding-id">—</span>
+      <span class="finding-title" style="font-weight:400"><span class="bead-ref p2">rift-ms7</span> — Single-leaf build_with_cache() produces length: 0</span>
+    </div>
+    <div class="finding-detail">
+      This bug is in <code>rift-common</code>'s <code>MerkleTree::build_with_cache()</code>, not <code>rift-server</code> directly. My review scope was <code>rift-server</code> only, so it wasn't surfaced. However, it's related to my finding C1 (put_tree empty leaf_hashes) in that both produce incorrect length metadata in the cache layer. They're distinct bugs but in the same subsystem.
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- Summary / action items                                               -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div style="background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.5rem; margin-top:2rem;">
+  <h3 style="margin-bottom:1rem; font-size:1.1rem;">📌 Recommended Bead Actions</h3>
+  <div style="font-size:0.88rem; color:var(--text2); line-height:1.8;">
+
+    <p><strong style="color:var(--critical)">Create new P1 beads:</strong></p>
+    <ul style="margin:0 0 1rem 1.5rem;">
+      <li><strong>S3</strong> — TOCTOU symlink race in <code>resolve()</code>. Different from resolved <code>rift-9l0</code>; that was drill bypassing resolve entirely. This is a race <em>within</em> resolve after canonicalization.</li>
+      <li><strong>S4</strong> — No rate limiting or concurrency limits on accept/stream loops. DoS vector.</li>
+      <li><strong>S5</strong> — xattr handle forgery. Unauthenticated reads of <code>user.rift.handle</code> enable injection attacks. (Don't merge with <code>rift-3ak</code> — that's about <em>write failures</em>; this is about <em>read trust</em>.)</li>
+    </ul>
+
+    <p><strong style="color:var(--high)">Create new P2 beads:</strong></p>
+    <ul style="margin:0 0 1rem 1.5rem;">
+      <li><strong>D2</strong> — Refactor <code>Arc&lt;Option&lt;Database&gt;&gt;</code> to trait object pattern</li>
+      <li><strong>C1</strong> — <code>put_tree</code> writes empty <code>leaf_hashes</code> to legacy cache — unusable entries</li>
+      <li><strong>D4</strong> — Unify handler error patterns (return-type vs stream-write)</li>
+      <li><strong>Q1</strong> — Split <code>handler.rs</code> monolith into per-operation modules</li>
+      <li><strong>S6 sub-issues</strong> — Hardcoded CN / no SAN / key rotation (extend <code>rift-7rk</code> or create sub-bugs)</li>
+    </ul>
+
+    <p><strong style="color:var(--medium)">Upgrade existing beads:</strong></p>
+    <ul style="margin:0 0 1rem 1.5rem;">
+      <li><strong>rift-uvi</strong> (P3 → P2): Multi-share silence is misleading, not just "missing feature"</li>
+      <li><strong>rift-3ak</strong>: Extend scope from xattr write failures to include all silent DB/xattr write failures</li>
+      <li><strong>rift-qn6</strong>: Add the stat→read double-computation path as additional scope</li>
+    </ul>
+
+    <p><strong style="color:var(--low)">Create P3 beads:</strong></p>
+    <ul style="margin:0 0 0 1.5rem;">
+      <li><strong>Q3</strong> — Deduplicate schema SQL in <code>db.rs</code></li>
+      <li><strong>Q4</strong> — Error code consistency across handlers</li>
+      <li><strong>C2</strong> — Share-root canonicalize-once at startup</li>
+      <li><strong>C4</strong> — Use canonical path for xattr ops in <code>handle.rs</code></li>
+      <li><strong>S7</strong> — Input validation on read request chunk params</li>
+    </ul>
+
+  </div>
+</div>
+
+</div>
+
+</body>
+</html>
