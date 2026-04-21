@@ -1987,6 +1987,272 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
 }
 
 // ---------------------------------------------------------------------------
+// MerkleDrill integration tests
+// ---------------------------------------------------------------------------
+
+mod merkle_drill_tests {
+    use super::*;
+    use rift_protocol::messages::{
+        msg, MerkleChildType, MerkleDrill, MerkleDrillResponse,
+    };
+    use rift_server::metadata::db::Database;
+
+    #[tokio::test]
+    async fn drill_root_returns_children() {
+        // Create a file > 64 bytes (so it has at least 1 chunk)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test_file.txt");
+        let content = vec![0xABu8; 128]; // 128 bytes to ensure at least one chunk
+        std::fs::write(&file_path, &content).unwrap();
+
+        // Start server with DB
+        let db = Database::open_in_memory().await.unwrap();
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+        // Lookup file to get handle
+        let mut stream = conn.open_stream().await.unwrap();
+        let lookup_req = LookupRequest {
+            parent_handle: root_handle,
+            name: "test_file.txt".to_string(),
+        };
+        stream
+            .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+        let file_handle = match lookup_resp.result {
+            Some(lookup_response::Result::Entry(entry)) => entry.handle,
+            _ => panic!("lookup failed"),
+        };
+
+        // Send MerkleDrill request with empty hash (request root's children)
+        let mut stream = conn.open_stream().await.unwrap();
+        let drill_req = MerkleDrill {
+            handle: file_handle,
+            hash: vec![], // empty = request root's children
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &drill_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::MERKLE_DRILL_RESPONSE);
+
+        let response = MerkleDrillResponse::decode(&payload[..]).unwrap();
+
+        // Verify response
+        assert_eq!(
+            response.parent_hash.len(),
+            32,
+            "parent_hash should be 32 bytes (root hash)"
+        );
+        assert!(
+            !response.children.is_empty(),
+            "should have at least 1 child"
+        );
+        for (i, child) in response.children.iter().enumerate() {
+            assert_eq!(
+                child.hash.len(),
+                32,
+                "child {} hash should be 32 bytes",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drill_subtree_returns_grandchildren() {
+        // Create a file large enough to have subtree nodes (512KB of random data)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("large_file.bin");
+        // Create varied content to ensure good chunking behavior
+        let mut content = Vec::with_capacity(512 * 1024);
+        for i in 0u32..(512 * 1024 / 256) as u32 {
+            content.extend_from_slice(&i.to_le_bytes());
+            content.extend_from_slice(&[0x00; 248]);
+        }
+        std::fs::write(&file_path, &content).unwrap();
+
+        // Start server with DB
+        let db = Database::open_in_memory().await.unwrap();
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+        // Lookup file to get handle
+        let mut stream = conn.open_stream().await.unwrap();
+        let lookup_req = LookupRequest {
+            parent_handle: root_handle,
+            name: "large_file.bin".to_string(),
+        };
+        stream
+            .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+        let file_handle = match lookup_resp.result {
+            Some(lookup_response::Result::Entry(entry)) => entry.handle,
+            _ => panic!("lookup failed"),
+        };
+
+        // First drill: get root's children
+        let mut stream = conn.open_stream().await.unwrap();
+        let drill_req = MerkleDrill {
+            handle: file_handle.clone(),
+            hash: vec![], // empty = request root's children
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &drill_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let first_response = MerkleDrillResponse::decode(&payload[..]).unwrap();
+
+        // Find a subtree child
+        let subtree_child = first_response
+            .children
+            .iter()
+            .find(|c| c.child_type == MerkleChildType::MerkleChildSubtree as i32)
+            .expect("should have at least one subtree child in a 512KB file");
+
+        // Second drill: get grandchildren via the subtree child hash
+        let mut stream = conn.open_stream().await.unwrap();
+        let drill_req = MerkleDrill {
+            handle: file_handle,
+            hash: subtree_child.hash.clone(),
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &drill_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let second_response = MerkleDrillResponse::decode(&payload[..]).unwrap();
+
+        // Verify the second response has children (grandchildren of root)
+        assert_eq!(
+            second_response.parent_hash,
+            subtree_child.hash,
+            "parent_hash should match the queried subtree hash"
+        );
+        assert!(
+            !second_response.children.is_empty(),
+            "should have children (grandchildren of root)"
+        );
+    }
+
+    #[tokio::test]
+    async fn drill_unknown_hash_returns_empty_children() {
+        // Create a file with some content
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test_file.txt");
+        std::fs::write(&file_path, vec![0xABu8; 128]).unwrap();
+
+        // Start server with DB
+        let db = Database::open_in_memory().await.unwrap();
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+        // Lookup file to get handle
+        let mut stream = conn.open_stream().await.unwrap();
+        let lookup_req = LookupRequest {
+            parent_handle: root_handle,
+            name: "test_file.txt".to_string(),
+        };
+        stream
+            .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+        let file_handle = match lookup_resp.result {
+            Some(lookup_response::Result::Entry(entry)) => entry.handle,
+            _ => panic!("lookup failed"),
+        };
+
+        // Send MerkleDrill request with a random 32-byte hash that doesn't exist
+        let mut stream = conn.open_stream().await.unwrap();
+        let drill_req = MerkleDrill {
+            handle: file_handle,
+            hash: vec![0xFF; 32], // random hash that doesn't exist
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &drill_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let response = MerkleDrillResponse::decode(&payload[..]).unwrap();
+
+        // Verify graceful degradation: empty response
+        assert!(
+            response.parent_hash.is_empty(),
+            "parent_hash should be empty for unknown hash"
+        );
+        assert!(
+            response.children.is_empty(),
+            "children should be empty for unknown hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn drill_invalid_handle_returns_empty() {
+        // Create a file (needed for the server to have a share)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        std::fs::write(root.join("dummy.txt"), b"dummy").unwrap();
+
+        // Start server with DB
+        let db = Database::open_in_memory().await.unwrap();
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+
+        // Send MerkleDrill request with garbage handle (not a valid UUID)
+        let mut stream = conn.open_stream().await.unwrap();
+        let drill_req = MerkleDrill {
+            handle: b"garbage_not_uuid".to_vec(), // not a valid UUID
+            hash: vec![],                         // empty hash
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &drill_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let response = MerkleDrillResponse::decode(&payload[..]).unwrap();
+
+        // Verify graceful degradation: empty response
+        assert!(
+            response.parent_hash.is_empty(),
+            "parent_hash should be empty for invalid handle"
+        );
+        assert!(
+            response.children.is_empty(),
+            "children should be empty for invalid handle"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Certificate management tests
 // ---------------------------------------------------------------------------
 
