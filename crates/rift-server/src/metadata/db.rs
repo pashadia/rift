@@ -41,6 +41,20 @@ impl Database {
                     root_hash  BLOB NOT NULL,
                     leaf_hashes BLOB NOT NULL,
                     computed_at INTEGER NOT NULL
+                );
+                 CREATE TABLE IF NOT EXISTS merkle_tree_nodes (
+                    file_path TEXT NOT NULL,
+                    node_hash BLOB NOT NULL,
+                    children BLOB NOT NULL,
+                    PRIMARY KEY (file_path, node_hash)
+                );
+                 CREATE TABLE IF NOT EXISTS merkle_leaf_info (
+                    file_path TEXT NOT NULL,
+                    chunk_hash BLOB NOT NULL,
+                    chunk_offset INTEGER NOT NULL,
+                    chunk_length INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    PRIMARY KEY (file_path, chunk_hash)
                 );",
             )
         })
@@ -61,6 +75,20 @@ impl Database {
                     root_hash  BLOB NOT NULL,
                     leaf_hashes BLOB NOT NULL,
                     computed_at INTEGER NOT NULL
+                );
+                 CREATE TABLE IF NOT EXISTS merkle_tree_nodes (
+                    file_path TEXT NOT NULL,
+                    node_hash BLOB NOT NULL,
+                    children BLOB NOT NULL,
+                    PRIMARY KEY (file_path, node_hash)
+                );
+                 CREATE TABLE IF NOT EXISTS merkle_leaf_info (
+                    file_path TEXT NOT NULL,
+                    chunk_hash BLOB NOT NULL,
+                    chunk_offset INTEGER NOT NULL,
+                    chunk_length INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    PRIMARY KEY (file_path, chunk_hash)
                 );",
             )
         })
@@ -163,5 +191,67 @@ mod tests {
         }).await;
 
         assert!(result.is_err(), "Duplicate (file_path, node_hash) should fail");
+    }
+
+    #[tokio::test]
+    async fn merkle_leaf_info_table_creates() {
+        let db = Database::open_in_memory().await.unwrap();
+        let result = db.call(|conn| {
+            conn.execute(
+                "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("test.txt", vec![0u8; 32], 0i64, 131072i64, 0i64),
+            )
+        }).await;
+        assert!(result.is_ok(), "Should be able to insert into merkle_leaf_info");
+    }
+
+    #[tokio::test]
+    async fn merkle_leaf_info_insert_and_query() {
+        let db = Database::open_in_memory().await.unwrap();
+        let path = "/tmp/test.txt";
+        let chunk_hash = vec![0xCD; 32];
+
+        let path2 = path.to_string();
+        let chunk_hash2 = chunk_hash.clone();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (path2, chunk_hash2, 0i64, 131072i64, 0i64),
+            )
+        }).await.unwrap();
+
+        let result: (Vec<u8>, i64, i64, i64) = db.call(move |conn| {
+            conn.query_row(
+                "SELECT chunk_hash, chunk_offset, chunk_length, chunk_index FROM merkle_leaf_info WHERE file_path = ?1 AND chunk_hash = ?2",
+                (path, chunk_hash),
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+            )
+        }).await.unwrap();
+
+        assert_eq!(result.0, vec![0xCD; 32]);
+        assert_eq!(result.1, 0);
+        assert_eq!(result.2, 131072);
+        assert_eq!(result.3, 0);
+    }
+
+    #[tokio::test]
+    async fn merkle_leaf_info_primary_key_uniqueness() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        db.call(|conn| {
+            conn.execute(
+                "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("test.txt", vec![0u8; 32], 0i64, 100i64, 0i64),
+            )
+        }).await.unwrap();
+
+        let result = db.call(|conn| {
+            conn.execute(
+                "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("test.txt", vec![0u8; 32], 100i64, 200i64, 1i64),
+            )
+        }).await;
+
+        assert!(result.is_err(), "Duplicate (file_path, chunk_hash) should fail");
     }
 }
