@@ -1034,7 +1034,6 @@ mod tests {
 
         let chunk0_hash = [0x10u8; 32];
         let chunk1_hash = [0x11u8; 32];
-        let chunk2_hash = [0x12u8; 32];
         let root_hash = [0xABu8; 32];
 
         // sizes: chunk0=100, chunk1=200, chunk2=150  →  total=450
