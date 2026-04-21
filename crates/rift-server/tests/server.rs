@@ -2394,36 +2394,58 @@ mod cert_tests {
     }
 
     #[test]
-    fn cert_manager_provides_helpful_error_for_pem() {
+    fn cert_manager_accepts_pem_format() {
+        // Now that PEM is supported, this test verifies PEM certs are accepted
         let tmp_dir = tempfile::tempdir().unwrap();
         let (cert_path, key_path) = default_cert_paths(tmp_dir.path());
 
-        // Write a PEM certificate (invalid for our format)
-        let pem_cert = r#"-----BEGIN CERTIFICATE-----
-MIIBhTCCASugAwIBAgIBITAKBggqhkjOPQQDAjAhMQswCQYDVQQGEwJVUzEL
-MAkGA1UECAwCQ0EwHhcNMjMwMDEwMDAwMDAwWhcNMjQwMTIzMTIzNTk1WjAh
-MQswCQYDVQQGEwJVUzELMAkGA1UECAwCQ0EwCgYIKoZIzj0EAwIDSQAwRgIh
-APz2u0I0x5lE7V5aE9qG3g0C1A2p2q0N1q1q1q1q1q1q1q1q1q1q1q1q1q1q
+        // Generate valid PEM certificate using rcgen
+        let cert = rcgen::generate_simple_self_signed(vec!["test-server".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+
+        std::fs::write(&cert_path, cert_pem).unwrap();
+        std::fs::write(&key_path, key_pem).unwrap();
+
+        // Should now succeed and return DER bytes
+        let result =
+            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()));
+
+        assert!(result.is_ok(), "PEM certificates should now be supported");
+        let (cert_der, key_der) = result.unwrap();
+
+        // Verify we got valid DER data
+        assert!(!cert_der.is_empty());
+        assert!(!key_der.is_empty());
+        assert_eq!(cert_der[0], 0x30, "cert should be DER format");
+        assert_eq!(key_der[0], 0x30, "key should be DER format");
+    }
+
+    #[test]
+    fn cert_manager_rejects_malformed_pem() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = default_cert_paths(tmp_dir.path());
+
+        // Write malformed PEM certificate (invalid base64)
+        let malformed_cert = r#"-----BEGIN CERTIFICATE-----
+!!!invalid!!!base64!!!
 -----END CERTIFICATE-----"#;
 
-        let pem_key = r#"-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg5cDZj5x5x5x5x5
-x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5
-x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x
-x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x5x
+        let malformed_key = r#"-----BEGIN PRIVATE KEY-----
+!!!invalid!!!base64!!!
 -----END PRIVATE KEY-----"#;
 
-        std::fs::write(&cert_path, pem_cert).unwrap();
-        std::fs::write(&key_path, pem_key).unwrap();
+        std::fs::write(&cert_path, malformed_cert).unwrap();
+        std::fs::write(&key_path, malformed_key).unwrap();
 
         let result =
             rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()));
 
-        assert!(result.is_err(), "should fail with PEM cert");
+        assert!(result.is_err(), "should fail with malformed PEM");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("PEM") || err.contains("format") || err.contains("invalid"),
-            "error should mention format issue: {}",
+            err.contains("PEM") || err.contains("parse") || err.contains("base64"),
+            "error should mention PEM parsing issue: {}",
             err
         );
     }
