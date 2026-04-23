@@ -1,15 +1,19 @@
 use std::path::Path;
 
 use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
+use rift_protocol::messages::FileType;
 use tracing::instrument;
 
 use super::merkle_cache_trait::MerkleCache;
 
-pub(crate) fn root_hash_for_type(is_dir: bool) -> Blake3Hash {
-    if is_dir {
-        Blake3Hash::new(b"<directory>")
-    } else {
-        Blake3Hash::new(b"<symlink>")
+pub(crate) fn sentinel_hash_for_non_file(file_type: FileType) -> Blake3Hash {
+    match file_type {
+        FileType::Directory => Blake3Hash::new(b"<directory>"),
+        FileType::Symlink => Blake3Hash::new(b"<symlink>"),
+        FileType::Regular => unreachable!(
+            "regular files require content-based Merkle root; use get_or_compute_merkle_root()"
+        ),
+        _ => unreachable!("unexpected file type: {:?}", file_type),
     }
 }
 
@@ -26,7 +30,14 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
     chunker: Chunker,
 ) -> Blake3Hash {
     if !meta.is_file() {
-        return root_hash_for_type(true);
+        let file_type = if meta.is_dir() {
+            FileType::Directory
+        } else if meta.is_symlink() {
+            FileType::Symlink
+        } else {
+            unreachable!("unexpected file type: expected directory or symlink")
+        };
+        return sentinel_hash_for_non_file(file_type);
     }
 
     match cache.get_merkle(path).await {
@@ -37,7 +48,16 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
 
     let content = match tokio::fs::read(path).await {
         Ok(c) => c,
-        Err(_) => return root_hash_for_type(true),
+        Err(_) => {
+            let file_type = if meta.is_dir() {
+                FileType::Directory
+            } else if meta.is_symlink() {
+                FileType::Symlink
+            } else {
+                unreachable!("unexpected file type: expected directory or symlink")
+            };
+            return sentinel_hash_for_non_file(file_type);
+        }
     };
 
     let chunk_boundaries = chunker.chunk(&content);

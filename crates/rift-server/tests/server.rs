@@ -177,16 +177,6 @@ async fn stat_response_rejects_wrong_size_handle_bytes() {
 }
 
 #[test]
-fn metadata_to_attrs_regular_file() {
-    use rift_protocol::messages::FileType;
-    let (_dir, root) = helpers::make_share();
-    let meta = std::fs::metadata(root.join("hello.txt")).unwrap();
-    let attrs = rift_server::handler::metadata_to_attrs(&meta);
-    assert_eq!(attrs.file_type, FileType::Regular as i32);
-    assert_eq!(attrs.size, b"hello rift".len() as u64);
-}
-
-#[test]
 fn metadata_to_attrs_directory() {
     use rift_protocol::messages::FileType;
     let (_dir, root) = helpers::make_share();

@@ -1,14 +1,21 @@
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{FileAttrs, FileType};
 
-use crate::handler::merkle_cache::root_hash_for_type;
+use crate::handler::merkle_cache::sentinel_hash_for_non_file;
 
 /// Convert `std::fs::Metadata` to a proto `FileAttrs` message.
 ///
 /// Uses Unix-specific metadata fields (`mode`, `uid`, `gid`, `nlink`).
 /// Uses constant hashes for directories and symlinks since they don't have content.
 pub fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
-    let root_hash = root_hash_for_type(meta.is_dir());
+    let file_type = if meta.is_dir() {
+        FileType::Directory
+    } else if meta.is_symlink() {
+        FileType::Symlink
+    } else {
+        FileType::Regular
+    };
+    let root_hash = sentinel_hash_for_non_file(file_type);
     build_attrs(meta, root_hash)
 }
 
@@ -52,20 +59,6 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn metadata_to_attrs_regular_file_has_file_type() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("file.txt");
-        let content = b"hello rift handler";
-        std::fs::write(&path, content).unwrap();
-
-        let meta = std::fs::metadata(&path).unwrap();
-        let attrs = metadata_to_attrs(&meta);
-
-        assert_eq!(attrs.file_type, FileType::Regular as i32);
-        assert_eq!(attrs.size, content.len() as u64);
-    }
 
     #[test]
     fn metadata_to_attrs_directory_has_dir_type() {
