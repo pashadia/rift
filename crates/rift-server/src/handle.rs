@@ -6,6 +6,33 @@ use walkdir::WalkDir;
 
 const RIFT_HANDLE_XATTR: &str = "user.rift.handle";
 
+/// Returns true if the xattr failure is "expected" — i.e. the filesystem
+/// doesn't support extended attributes (ENOTSUP/EOPNOTSUPP).
+/// Unexpected failures (permissions, I/O errors, etc.) should be logged.
+#[cfg(unix)]
+fn is_expected_xattr_failure(e: &std::io::Error) -> bool {
+    match e.raw_os_error() {
+        Some(errno) => errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP,
+        None => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_expected_xattr_failure(_e: &std::io::Error) -> bool {
+    true // Non-Unix: treat all xattr failures as expected
+}
+
+/// Write handle xattr to canonical path, logging a warning on unexpected failures.
+fn write_handle_xattr(canonical: &Path, handle: Uuid) {
+    if canonical.is_file() {
+        if let Err(e) = xattr::set(canonical, RIFT_HANDLE_XATTR, handle.as_bytes()) {
+            if !is_expected_xattr_failure(&e) {
+                tracing::warn!(path = %canonical.display(), error = %e, "failed to write handle xattr");
+            }
+        }
+    }
+}
+
 pub struct HandleDatabase {
     map: Arc<BidirectionalMap<PathBuf>>,
 }
@@ -33,14 +60,28 @@ impl HandleDatabase {
         }
 
         let handle = match xattr::get(&canonical, RIFT_HANDLE_XATTR) {
-            Ok(Some(value)) if value.len() == 16 => {
-                Uuid::from_slice(&value).unwrap_or_else(|_| Uuid::now_v7())
-            }
-            _ => {
+            Ok(Some(value)) if value.len() == 16 => Uuid::from_slice(&value).unwrap_or_else(|_| {
+                let h = Uuid::now_v7();
+                write_handle_xattr(&canonical, h);
+                h
+            }),
+            Ok(Some(_)) => {
+                // Malformed xattr value (not 16 bytes) — generate new handle
                 let handle = Uuid::now_v7();
-                if canonical.is_file() {
-                    let _ = xattr::set(&canonical, RIFT_HANDLE_XATTR, handle.as_bytes());
+                write_handle_xattr(&canonical, handle);
+                handle
+            }
+            Ok(None) => {
+                let handle = Uuid::now_v7();
+                write_handle_xattr(&canonical, handle);
+                handle
+            }
+            Err(e) => {
+                if !is_expected_xattr_failure(&e) {
+                    tracing::warn!(path = %canonical.display(), error = %e, "failed to read handle xattr");
                 }
+                let handle = Uuid::now_v7();
+                write_handle_xattr(&canonical, handle);
                 handle
             }
         };
@@ -113,6 +154,43 @@ impl Default for HandleDatabase {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(unix)]
+    fn expected_xattr_failure_recognizes_enotsup() {
+        let e = std::io::Error::from_raw_os_error(libc::ENOTSUP);
+        assert!(is_expected_xattr_failure(&e), "ENOTSUP should be expected");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn expected_xattr_failure_recognizes_eopnotsupp() {
+        let e = std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert!(
+            is_expected_xattr_failure(&e),
+            "EOPNOTSUPP should be expected"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unexpected_xattr_failure_permission_denied() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        assert!(
+            !is_expected_xattr_failure(&e),
+            "PermissionDenied should NOT be expected"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unexpected_xattr_failure_io_error() {
+        let e = std::io::Error::other("some I/O error");
+        assert!(
+            !is_expected_xattr_failure(&e),
+            "generic I/O errors should NOT be expected"
+        );
+    }
 
     #[tokio::test]
     async fn test_get_or_create_handle_uses_canonical_path_as_key() {
