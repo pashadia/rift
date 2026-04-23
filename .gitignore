@@ -20,3 +20,6 @@ Thumbs.db
 
 .worktrees/
 
+# Mutants
+mutants.out*
+
