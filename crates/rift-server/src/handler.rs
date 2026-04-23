@@ -464,9 +464,12 @@ async fn get_or_compute_merkle_root(
                 Err(_) => 0,
             };
             let file_size = file_meta.len();
-            let _ = database
+            if let Err(e) = database
                 .put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
+            }
         }
     }
 
@@ -674,9 +677,12 @@ pub async fn read_response<S: RiftStream>(
                 Err(_) => 0,
             };
             let file_size = file_meta.len();
-            let _ = database
+            if let Err(e) = database
                 .put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle root");
+            }
         }
     }
 
@@ -765,9 +771,12 @@ pub async fn merkle_drill_response<S: RiftStream>(
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
             .unwrap_or(0);
         let file_size = meta.len();
-        let _ = database
+        if let Err(e) = database
             .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
-            .await;
+            .await
+        {
+            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
+        }
     }
 
     // 7. Determine query hash
