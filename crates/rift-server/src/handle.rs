@@ -253,6 +253,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_malformed_xattr_generates_new_handle() {
+        let tmp = TempDir::new().unwrap();
+        let db = HandleDatabase::new();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        // Write a malformed xattr (too short — 4 bytes instead of 16)
+        xattr::set(&path, RIFT_HANDLE_XATTR, b"abcd").unwrap();
+
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
+
+        // Should generate a new valid UUID, not use the malformed value
+        assert_eq!(handle.as_bytes().len(), 16);
+
+        // The new handle should have been written back to the xattr
+        let stored = xattr::get(&path, RIFT_HANDLE_XATTR).unwrap();
+        assert_eq!(stored.unwrap().as_slice(), handle.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_malformed_xattr_too_long_generates_new_handle() {
+        let tmp = TempDir::new().unwrap();
+        let db = HandleDatabase::new();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        // Write a malformed xattr (too long — 32 bytes instead of 16)
+        let long_value = [0xAB_u8; 32];
+        xattr::set(&path, RIFT_HANDLE_XATTR, &long_value).unwrap();
+
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
+        assert_eq!(handle.as_bytes().len(), 16);
+
+        let stored = xattr::get(&path, RIFT_HANDLE_XATTR).unwrap();
+        assert_eq!(stored.unwrap().as_slice(), handle.as_bytes());
+    }
+
+    #[tokio::test]
     async fn test_populate_from_share() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "").unwrap();

@@ -3079,6 +3079,81 @@ mod merkle_drill_tests {
             "children should be empty for invalid handle"
         );
     }
+
+    /// Merkle drill must return correct data even when put_tree fails.
+    /// This simulates a DB write failure by dropping the merkle_tree_nodes
+    /// table before the drill, forcing put_tree to error. The response
+    /// should still contain valid children computed from the file content.
+    #[tokio::test]
+    async fn drill_returns_correct_data_despite_db_write_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test_file.txt");
+        let content = vec![0xCDu8; 128];
+        std::fs::write(&file_path, &content).unwrap();
+
+        // Create DB & immediately sabotage it by dropping required tables
+        let db = Database::open_in_memory().await.unwrap();
+        db.call(|conn| {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS merkle_tree_nodes; DROP TABLE IF EXISTS merkle_leaf_info;",
+            )
+        })
+        .await
+        .unwrap();
+
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+        // Lookup file
+        let mut stream = conn.open_stream().await.unwrap();
+        let lookup_req = LookupRequest {
+            parent_handle: root_handle.clone(),
+            name: "test_file.txt".to_string(),
+        };
+        stream
+            .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+        let file_handle = match lookup_resp.result {
+            Some(lookup_response::Result::Entry(entry)) => entry.handle,
+            _ => panic!("lookup failed"),
+        };
+
+        // Drill — should succeed despite DB write failure
+        let mut stream = conn.open_stream().await.unwrap();
+        let drill_req = MerkleDrill {
+            handle: file_handle,
+            hash: vec![],
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL, &drill_req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::MERKLE_DRILL_RESPONSE);
+
+        let response = MerkleDrillResponse::decode(&payload[..]).unwrap();
+        // Response must still contain valid children computed from file content
+        assert_eq!(
+            response.parent_hash.len(),
+            32,
+            "parent_hash should be 32 bytes"
+        );
+        assert!(
+            !response.children.is_empty(),
+            "should have at least 1 child"
+        );
+        for child in &response.children {
+            assert_eq!(child.hash.len(), 32, "each child hash should be 32 bytes");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

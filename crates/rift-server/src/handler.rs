@@ -801,11 +801,14 @@ pub async fn merkle_drill_response<S: RiftStream>(
         }
     };
 
-    // 8. Look up children
-    let children = match database.get_children(&canonical, &query_hash).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return send_empty(stream).await,
-        Err(_) => return send_empty(stream).await,
+    // 8. Look up children — check in-memory cache first, then DB
+    let children = match cache.get(&query_hash) {
+        Some(c) => c.clone(),
+        None => match database.get_children(&canonical, &query_hash).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return send_empty(stream).await,
+            Err(_) => return send_empty(stream).await,
+        },
     };
 
     // 9. Convert to proto
