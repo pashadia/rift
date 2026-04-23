@@ -6,3 +6,5 @@ pub mod handle;
 pub mod handler;
 pub mod metadata;
 pub mod server;
+
+pub use handler::MAX_CHUNK_COUNT;

@@ -482,6 +482,10 @@ fn io_err_kind_to_code(kind: std::io::ErrorKind) -> ErrorCode {
 // Read handler
 // ---------------------------------------------------------------------------
 
+/// Maximum number of chunks a client can request in a single ReadRequest.
+/// This prevents DoS attacks where a client requests u32::MAX chunks.
+pub const MAX_CHUNK_COUNT: u32 = 256;
+
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
 pub async fn read_response<S: RiftStream>(
     stream: &mut S,
@@ -566,6 +570,38 @@ pub async fn read_response<S: RiftStream>(
     use rift_common::crypto::{Chunker, MerkleTree};
     let chunker = Chunker::default();
     let chunk_boundaries = chunker.chunk(&content);
+
+    // Validate chunk_count is within acceptable limits
+    if req.chunk_count > MAX_CHUNK_COUNT {
+        let response = ReadResponse {
+            result: Some(read_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorUnsupported as i32,
+                message: format!("chunk_count exceeds maximum of {}", MAX_CHUNK_COUNT),
+                metadata: None,
+            })),
+        };
+        stream
+            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        return Ok(());
+    }
+
+    // Validate start_chunk is within bounds (start_chunk == chunk count means nothing to read)
+    if req.start_chunk as usize >= chunk_boundaries.len() {
+        let response = ReadResponse {
+            result: Some(read_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorNotFound as i32,
+                message: "start_chunk exceeds file chunk count".to_string(),
+                metadata: None,
+            })),
+        };
+        stream
+            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        return Ok(());
+    }
 
     let start = req.start_chunk as usize;
     let count = if req.chunk_count == 0 {

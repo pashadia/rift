@@ -1883,7 +1883,7 @@ async fn server_read_partial_chunks_returns_requested_only() {
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
-        start_chunk: 1,
+        start_chunk: 0,
         chunk_count: 1,
     };
     stream
@@ -1907,7 +1907,7 @@ async fn server_read_partial_chunks_returns_requested_only() {
         let block_header =
             rift_protocol::messages::BlockHeader::decode(&header_payload[..]).unwrap();
         let chunk_info = block_header.chunk.expect("chunk missing");
-        assert_eq!(chunk_info.index, 1);
+        assert_eq!(chunk_info.index, 0);
     }
 }
 
@@ -2053,6 +2053,421 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
         let expected_data = &content[*expected_offset..*expected_offset + expected_len];
         assert_eq!(actual_data, expected_data, "chunk {} data mismatch", i);
     }
+}
+
+#[tokio::test]
+async fn server_rejects_excessive_chunk_count() {
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // First lookup hello.txt to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Send ReadRequest with chunk_count = u32::MAX - should be rejected
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 0,
+        chunk_count: u32::MAX,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorUnsupported as i32
+            );
+        }
+        _ => panic!("expected error for excessive chunk_count, got success"),
+    }
+}
+
+#[tokio::test]
+async fn server_rejects_start_chunk_past_end() {
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // First lookup hello.txt to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Send ReadRequest with start_chunk past the end of the file
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 1000, // Way past end of a small file
+        chunk_count: 1,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
+            );
+        }
+        _ => panic!("expected error for start_chunk past end, got success"),
+    }
+}
+
+#[tokio::test]
+async fn server_allows_chunk_count_at_max() {
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup hello.txt to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Read with chunk_count == MAX_CHUNK_COUNT — should succeed
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 0,
+        chunk_count: rift_server::MAX_CHUNK_COUNT,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Ok(_)) => {}
+        other => panic!("expected success at MAX_CHUNK_COUNT, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn server_rejects_chunk_count_one_over_max() {
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup hello.txt to get its handle
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Read with chunk_count == MAX_CHUNK_COUNT + 1 — should fail
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 0,
+        chunk_count: rift_server::MAX_CHUNK_COUNT + 1,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorUnsupported as i32
+            );
+        }
+        _ => panic!("expected ErrorUnsupported for chunk_count over max, got success"),
+    }
+}
+
+#[tokio::test]
+async fn server_allows_read_at_last_valid_chunk() {
+    // For a small file ("hello rift" = 10 bytes, 1 chunk), start_chunk == 0
+    // should succeed and start_chunk == chunk_count (1) should fail.
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup hello.txt
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // start_chunk == 0 (last/only valid chunk) should succeed
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 0,
+        chunk_count: 1,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Ok(_)) => {}
+        other => panic!("expected success at last valid chunk, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn server_rejects_read_at_exact_boundary() {
+    // start_chunk == chunk_count (1 for "hello rift") should return ErrorNotFound
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup hello.txt
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // start_chunk == 1 (== number of chunks) should be rejected
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 1,
+        chunk_count: 1,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
+            );
+        }
+        _ => panic!("expected ErrorNotFound at exact boundary, got success"),
+    }
+}
+
+#[tokio::test]
+async fn server_allows_read_with_chunk_count_zero() {
+    // chunk_count == 0 means "read all remaining chunks" — must not be rejected
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup hello.txt
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "hello.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 0,
+        chunk_count: 0,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Ok(_)) => {}
+        other => panic!("expected success with chunk_count=0, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn server_rejects_read_on_empty_file() {
+    // An empty file has 0 chunks, so start_chunk=0 is already out of bounds.
+    // This should return ErrorNotFound, not panic or return empty success.
+    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    // Create empty file
+    std::fs::write(root.join("empty.txt"), b"").unwrap();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Lookup empty.txt
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "empty.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
+    let file_handle = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(entry)) => entry.handle,
+        _ => panic!("lookup failed"),
+    };
+
+    // Read with start_chunk=0 on empty file — should return ErrorNotFound
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: file_handle,
+        start_chunk: 0,
+        chunk_count: 1,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorNotFound as i32,
+                "expected ErrorNotFound for empty file, got code {}",
+                e.code
+            );
+        }
+        other => panic!("expected ErrorNotFound for empty file read, got: {:?}", other),
+    }
+}
+
+#[test]
+fn max_chunk_count_value_is_256() {
+    assert_eq!(rift_server::MAX_CHUNK_COUNT, 256);
 }
 
 // ---------------------------------------------------------------------------
