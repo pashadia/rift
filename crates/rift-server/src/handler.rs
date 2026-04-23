@@ -4,7 +4,11 @@
 //! performs the filesystem work using async I/O, and returns a proto
 //! response.  The async dispatch layer in `server.rs` handles the
 //! transport and calls these functions.
+//!
+//! All handlers validate raw handle bytes as UUIDs at the network boundary
+//! before any filesystem access, rejecting malformed handles immediately.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -27,10 +31,6 @@ use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
 use crate::metadata::db::Database;
-
-// ---------------------------------------------------------------------------
-// Path resolution (security-critical)
-// ---------------------------------------------------------------------------
 
 /// Resolve an opaque `handle` (UUID from the client) to a
 /// canonical filesystem path within `share` using the HandleDatabase.
@@ -83,10 +83,6 @@ pub async fn resolve(
 
     Ok(canonical)
 }
-
-// ---------------------------------------------------------------------------
-// Attribute conversion
-// ---------------------------------------------------------------------------
 
 fn root_hash_for_type(is_dir: bool) -> Blake3Hash {
     if is_dir {
@@ -141,14 +137,13 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
     }
 }
 
-// ---------------------------------------------------------------------------
-// Request handlers (pure: decode → filesystem → encode)
-// ---------------------------------------------------------------------------
-
 /// Handle a `StatRequest`: stat each requested handle and return one
 /// `StatResult` per handle (success or error).
 ///
 /// Malformed payloads return an empty result list rather than panicking.
+/// Each handle in the request produces exactly one result in the response,
+/// preserving a 1:1 invariant. Invalid handles (wrong byte count, etc.)
+/// produce an `ErrorNotFound` result rather than being silently dropped.
 #[instrument(skip(share, db, handle_db), fields(share = %share.display()), level = "debug")]
 pub async fn stat_response(
     payload: &[u8],
@@ -162,10 +157,6 @@ pub async fn stat_response(
         Err(_) => return StatResponse { results: vec![] },
     };
 
-    // Build results. Each handle in the request must produce exactly one result
-    // in the response, preserving the 1:1 invariant. Invalid handles (wrong
-    // byte count, etc.) produce an ErrorNotFound result rather than being
-    // silently dropped.
     let futures: Vec<_> = req
         .handles
         .into_iter()
@@ -197,12 +188,10 @@ pub async fn lookup_response(
         Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
     };
 
-    // Validate the name: must be a single component (no slashes, no NUL).
     if req.name.is_empty() || req.name.contains('/') || req.name.contains('\0') {
         return lookup_error(ErrorCode::ErrorUnsupported);
     }
 
-    // Parse the parent handle from bytes to UUID at the network boundary
     let parent_uuid = match Uuid::from_slice(&req.parent_handle) {
         Ok(u) => u,
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
@@ -266,7 +255,6 @@ pub async fn readdir_response(
         Err(_) => return readdir_error(ErrorCode::ErrorUnsupported),
     };
 
-    // Parse directory handle from bytes to UUID at the network boundary
     let dir_uuid = match Uuid::from_slice(&req.directory_handle) {
         Ok(u) => u,
         Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
@@ -284,13 +272,11 @@ pub async fn readdir_response(
         }
     };
 
-    // Collect entries using async functional approach with tokio
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
 
     let entries: Vec<ReaddirEntry> = match tokio::fs::read_dir(&dir_canonical).await {
         Ok(read_dir) => {
-            // First collect all entries with their info using then, then filter out None values
             let stream = ReadDirStream::new(read_dir);
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
                 .then(|entry_result| async move {
@@ -326,21 +312,17 @@ pub async fn readdir_response(
                 })
                 .collect()
                 .await;
-            // Filter out None values functionally
             entries_with_none.into_iter().flatten().collect()
         }
         Err(e) => return readdir_error(io_err_kind_to_code(e.kind())),
     };
 
-    // Sort entries by name using functional approach
     let mut entries = entries;
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Apply offset.
     let offset = req.offset as usize;
     let entries: Vec<ReaddirEntry> = entries.into_iter().skip(offset).collect();
 
-    // Apply limit (0 = return all).
     let (entries, has_more) = if req.limit > 0 && entries.len() > req.limit as usize {
         let limited: Vec<_> = entries.into_iter().take(req.limit as usize).collect();
         (limited, true)
@@ -355,10 +337,6 @@ pub async fn readdir_response(
         })),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Error helpers
-// ---------------------------------------------------------------------------
 
 fn error_detail(code: ErrorCode) -> ErrorDetail {
     ErrorDetail {
@@ -496,14 +474,13 @@ fn io_err_kind_to_code(kind: std::io::ErrorKind) -> ErrorCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Read handler
-// ---------------------------------------------------------------------------
-
 /// Maximum number of chunks a client can request in a single ReadRequest.
 /// This prevents DoS attacks where a client requests u32::MAX chunks.
 pub const MAX_CHUNK_COUNT: u32 = 256;
 
+/// `start_chunk >= chunk_boundaries.len()` is always a protocol error (`ErrorNotFound`),
+/// even for empty files. The client should know the chunk count from stat; requesting
+/// a nonexistent chunk index indicates a bug or desync.
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
 pub async fn read_response<S: RiftStream>(
     stream: &mut S,
@@ -531,7 +508,6 @@ pub async fn read_response<S: RiftStream>(
         }
     };
 
-    // Parse handle from bytes to UUID at the network boundary
     let handle = match Uuid::from_slice(&req.handle) {
         Ok(u) => u,
         Err(_) => {
@@ -589,7 +565,6 @@ pub async fn read_response<S: RiftStream>(
     use rift_common::crypto::MerkleTree;
     let chunk_boundaries = chunker.chunk(&content);
 
-    // Validate chunk_count is within acceptable limits
     if req.chunk_count > MAX_CHUNK_COUNT {
         let response = ReadResponse {
             result: Some(read_response::Result::Error(ErrorDetail {
@@ -605,9 +580,6 @@ pub async fn read_response<S: RiftStream>(
         return Ok(());
     }
 
-    // start_chunk past the end is a protocol error regardless of file size.
-    // The client should know the chunk count from stat; requesting a nonexistent
-    // chunk index indicates a bug or desync.
     if req.start_chunk as usize >= chunk_boundaries.len() {
         let response = ReadResponse {
             result: Some(read_response::Result::Error(ErrorDetail {
@@ -709,110 +681,9 @@ pub async fn read_response<S: RiftStream>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// MerkleDrill handler — hash-based lookup
-// ---------------------------------------------------------------------------
-
-#[instrument(skip_all, fields(share = %share.display()), level = "debug")]
-pub async fn merkle_drill_response<S: RiftStream>(
-    stream: &mut S,
-    payload: &[u8],
-    share: &Path,
-    db: Option<&Database>,
-    handle_db: &HandleDatabase,
-    chunker: Chunker,
-) -> anyhow::Result<()> {
-    // Helper: send empty response and finish
-    async fn send_empty<S: RiftStream>(stream: &mut S) -> anyhow::Result<()> {
-        let response = MerkleDrillResponse {
-            parent_hash: vec![],
-            children: vec![],
-        };
-        stream
-            .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-        Ok(())
-    }
-
-    // 1. Parse request
-    let req = match MerkleDrill::decode(payload) {
-        Ok(r) => r,
-        Err(_) => return send_empty(stream).await,
-    };
-
-    // 2. Parse handle → UUID → resolve to canonical path
-    let handle = match Uuid::from_slice(&req.handle) {
-        Ok(u) => u,
-        Err(_) => return send_empty(stream).await,
-    };
-
-    let canonical = match resolve(share, &handle, handle_db).await {
-        Ok(p) => p,
-        Err(_) => return send_empty(stream).await,
-    };
-
-    // 3. Need a database for hash-based lookup
-    let database = match db {
-        Some(d) => d,
-        None => return send_empty(stream).await,
-    };
-
-    // 4. Read file content
-    let content = match tokio::fs::read(&canonical).await {
-        Ok(c) => c,
-        Err(_) => return send_empty(stream).await,
-    };
-
-    // 5. Build Merkle tree with cache
-    let chunk_boundaries = chunker.chunk(&content);
-
-    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
-        .iter()
-        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
-        .collect();
-
-    let merkle = MerkleTree::default();
-    let (root, cache, leaf_infos) =
-        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
-
-    // 6. Store tree in DB
-    if let Ok(meta) = tokio::fs::metadata(&canonical).await {
-        let mtime_ns = meta
-            .modified()
-            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
-            .unwrap_or(0);
-        let file_size = meta.len();
-        if let Err(e) = database
-            .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
-            .await
-        {
-            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
-        }
-    }
-
-    // 7. Determine query hash
-    let query_hash = if req.hash.is_empty() {
-        root
-    } else {
-        match Blake3Hash::from_slice(&req.hash) {
-            Ok(h) => h,
-            Err(_) => return send_empty(stream).await,
-        }
-    };
-
-    // 8. Look up children — check in-memory cache first, then DB
-    let children = match cache.get(&query_hash) {
-        Some(c) => c.clone(),
-        None => match database.get_children(&canonical, &query_hash).await {
-            Ok(Some(c)) => c,
-            Ok(None) => return send_empty(stream).await,
-            Err(_) => return send_empty(stream).await,
-        },
-    };
-
-    // 9. Convert to proto
-    let proto_children: Vec<MerkleChildProto> = children
+/// Convert internal `MerkleChild` enum values to proto `MerkleChildProto` messages.
+fn children_to_proto(children: &[MerkleChild]) -> Vec<MerkleChildProto> {
+    children
         .iter()
         .map(|c| match c {
             MerkleChild::Subtree(hash) => MerkleChildProto {
@@ -832,9 +703,126 @@ pub async fn merkle_drill_response<S: RiftStream>(
                 chunk_index: *chunk_index,
             },
         })
+        .collect()
+}
+
+/// Look up Merkle tree children, checking the in-memory cache first and
+/// falling back to the database. Returns `None` if not found in either.
+async fn resolve_children(
+    cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
+    canonical: &Path,
+    query_hash: &Blake3Hash,
+    database: &Database,
+) -> Option<Vec<MerkleChild>> {
+    match cache.get(query_hash) {
+        Some(c) => Some(c.clone()),
+        None => match database.get_children(canonical, query_hash).await {
+            Ok(Some(c)) => Some(c),
+            Ok(None) => None,
+            Err(_) => None,
+        },
+    }
+}
+
+/// Send an empty `MerkleDrillResponse` (zero parent hash, zero children) and finish the stream.
+async fn send_empty_drill_response<S: RiftStream>(stream: &mut S) -> anyhow::Result<()> {
+    let response = MerkleDrillResponse {
+        parent_hash: vec![],
+        children: vec![],
+    };
+    stream
+        .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
+    Ok(())
+}
+
+/// Handle a `MerkleDrill` request: look up children at a given hash in the file's
+/// Merkle tree.
+///
+/// Algorithm:
+/// 1. Parse request and validate handle
+/// 2. Resolve handle to canonical path
+/// 3. Read file content and build Merkle tree with cache
+/// 4. Cache tree in database (best-effort)
+/// 5. Determine query hash (root if empty, otherwise from request)
+/// 6. Look up children (cache-first, then database)
+/// 7. Convert to proto and send response
+#[instrument(skip_all, fields(share = %share.display()), level = "debug")]
+pub async fn merkle_drill_response<S: RiftStream>(
+    stream: &mut S,
+    payload: &[u8],
+    share: &Path,
+    db: Option<&Database>,
+    handle_db: &HandleDatabase,
+    chunker: Chunker,
+) -> anyhow::Result<()> {
+    let req = match MerkleDrill::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return send_empty_drill_response(stream).await,
+    };
+
+    let handle = match Uuid::from_slice(&req.handle) {
+        Ok(u) => u,
+        Err(_) => return send_empty_drill_response(stream).await,
+    };
+
+    let canonical = match resolve(share, &handle, handle_db).await {
+        Ok(p) => p,
+        Err(_) => return send_empty_drill_response(stream).await,
+    };
+
+    let database = match db {
+        Some(d) => d,
+        None => return send_empty_drill_response(stream).await,
+    };
+
+    let content = match tokio::fs::read(&canonical).await {
+        Ok(c) => c,
+        Err(_) => return send_empty_drill_response(stream).await,
+    };
+
+    let chunk_boundaries = chunker.chunk(&content);
+
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
         .collect();
 
-    // 10. Send response
+    let merkle = MerkleTree::default();
+    let (root, cache, leaf_infos) =
+        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+    if let Ok(meta) = tokio::fs::metadata(&canonical).await {
+        let mtime_ns = meta
+            .modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
+            .unwrap_or(0);
+        let file_size = meta.len();
+        if let Err(e) = database
+            .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
+            .await
+        {
+            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
+        }
+    }
+
+    let query_hash = if req.hash.is_empty() {
+        root
+    } else {
+        match Blake3Hash::from_slice(&req.hash) {
+            Ok(h) => h,
+            Err(_) => return send_empty_drill_response(stream).await,
+        }
+    };
+
+    let children = match resolve_children(&cache, &canonical, &query_hash, database).await {
+        Some(c) => c,
+        None => return send_empty_drill_response(stream).await,
+    };
+
+    let proto_children = children_to_proto(&children);
+
     let response = MerkleDrillResponse {
         parent_hash: query_hash.as_bytes().to_vec(),
         children: proto_children,
@@ -846,10 +834,6 @@ pub async fn merkle_drill_response<S: RiftStream>(
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -864,10 +848,6 @@ mod tests {
     };
 
     use crate::handle::HandleDatabase;
-
-    // -----------------------------------------------------------------------
-    // Group A: metadata_to_attrs() and build_attrs()
-    // -----------------------------------------------------------------------
 
     #[test]
     fn metadata_to_attrs_regular_file_has_file_type() {
@@ -920,10 +900,6 @@ mod tests {
         assert_eq!(attrs.size, 0);
     }
 
-    // -----------------------------------------------------------------------
-    // Group B: resolve()
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn resolve_valid_handle_returns_correct_path() {
         let tmp = TempDir::new().unwrap();
@@ -943,15 +919,10 @@ mod tests {
     async fn resolve_unknown_uuid_returns_error() {
         let tmp = TempDir::new().unwrap();
         let handle_db = HandleDatabase::new();
-        // A valid-format UUID that was never registered in the database
         let unknown = Uuid::from_bytes([0x42; 16]);
         let result = resolve(tmp.path(), &unknown, &handle_db).await;
         assert!(result.is_err(), "unknown UUID must produce an error");
     }
-
-    // -----------------------------------------------------------------------
-    // Group C: stat_response()
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn stat_response_returns_attrs_for_valid_handle() {
@@ -987,21 +958,15 @@ mod tests {
         let share = tmp.path().to_path_buf();
         let handle_db = HandleDatabase::new();
 
-        // Garbage bytes that cannot decode as StatRequest
         let garbage = vec![0xFF, 0xFE, 0x00, 0xAB, 0xCD];
         let resp = stat_response(&garbage, &share, None, &handle_db, Chunker::default()).await;
 
-        // Malformed payload → decoder error → StatResponse { results: vec![] }
         assert_eq!(
             resp.results.len(),
             0,
             "malformed payload must yield empty results"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Group D: lookup_response()
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn lookup_response_existing_entry_returns_handle() {
@@ -1011,7 +976,6 @@ mod tests {
         std::fs::write(&child, b"data").unwrap();
 
         let handle_db = HandleDatabase::new();
-        // Register the parent directory so resolve() can find it
         let parent_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
 
         let req = LookupRequest {
@@ -1063,16 +1027,11 @@ mod tests {
         let garbage = vec![0xFF, 0xAB, 0x00, 0x01, 0x02];
         let resp = lookup_response(&garbage, &share, None, &handle_db, Chunker::default()).await;
 
-        // Must return an error variant, not panic
         match resp.result {
             Some(lookup_response::Result::Error(_)) => {}
             other => panic!("expected Error for garbage payload, got: {:?}", other),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Group E: readdir_response()
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn readdir_response_lists_all_entries() {
@@ -1108,7 +1067,6 @@ mod tests {
     async fn readdir_response_empty_directory() {
         let tmp = TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
-        // No files created — directory is empty
 
         let handle_db = HandleDatabase::new();
         let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
@@ -1139,31 +1097,23 @@ mod tests {
         let garbage = vec![0xFF, 0x00, 0xAB];
         let resp = readdir_response(&garbage, &share, &handle_db).await;
 
-        // Must return an error variant, not panic
         match resp.result {
             Some(readdir_response::Result::Error(_)) => {}
             other => panic!("expected Error for garbage payload, got: {:?}", other),
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Note on Group F (mkdir / unlink / rmdir):
-    // No handler functions for these operations exist in handler.rs yet.
-    // The protocol constants (MKDIR_REQUEST, UNLINK_REQUEST, RMDIR_REQUEST)
-    // are defined in rift-protocol but no server-side stubs are implemented.
-    // Tests will be added once the stubs land.
-    // -----------------------------------------------------------------------
+    // TODO: Add tests for mkdir / unlink / rmdir handlers once they're implemented.
     use crate::metadata::db::Database;
 
     use rift_protocol::messages::msg;
     use rift_transport::connection::InMemoryConnection;
     use rift_transport::RiftConnection;
 
+    /// SECURITY: Verifies that the MerkleDrill handler rejects handles pointing
+    /// outside the share, testing the resolve() path traversal guard.
     #[tokio::test]
     async fn drill_rejects_path_traversal() {
-        // SECURITY: MerkleDrill handler must reject handles pointing outside the share.
-        // This tests the resolve() path traversal guard.
-
         // Setup: share root is a temp dir
         let share = tempfile::tempdir().unwrap();
         let share_canonical = std::fs::canonicalize(share.path()).unwrap();
@@ -1218,7 +1168,6 @@ mod tests {
 
         let response = MerkleDrillResponse::decode(&resp_bytes[..]).unwrap();
 
-        // SECURITY: must return empty response, not serve data from outside the share
         assert!(
             response.parent_hash.is_empty(),
             "parent_hash must be empty for path traversal — got {:?}",
