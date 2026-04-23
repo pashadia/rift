@@ -1119,20 +1119,16 @@ mod tests {
     /// outside the share, testing the resolve() path traversal guard.
     #[tokio::test]
     async fn drill_rejects_path_traversal() {
-        // Setup: share root is a temp dir
         let share = tempfile::tempdir().unwrap();
         let share_canonical = std::fs::canonicalize(share.path()).unwrap();
 
-        // File outside the share
         let outside = tempfile::tempdir().unwrap();
         let outside_file = outside.path().join("secret.txt");
         std::fs::write(&outside_file, b"secret data").unwrap();
 
-        // Register a handle for the outside file in the HandleDatabase
         let handle_db = HandleDatabase::new();
         let outside_handle = handle_db.get_or_create_handle(&outside_file).await.unwrap();
 
-        // Verify test setup: handle points outside the share
         let stored = handle_db.get_path(&outside_handle).unwrap();
         let stored_canonical = std::fs::canonicalize(&stored).unwrap();
         assert!(
@@ -1140,22 +1136,18 @@ mod tests {
             "test setup: handle must point outside share root"
         );
 
-        // Create a stream pair: handler writes to server side, we read from client side
         let (client_conn, server_conn) = InMemoryConnection::pair();
         let mut client_stream = client_conn.open_stream().await.unwrap();
         let mut server_stream = server_conn.accept_stream().await.unwrap();
 
-        // Build a MerkleDrill request for the outside handle
         let drill_req = MerkleDrill {
             handle: outside_handle.into_bytes().to_vec(),
             hash: vec![],
         };
         let payload = drill_req.encode_to_vec();
 
-        // Handler requires a database
         let db = Database::open_in_memory().await.unwrap();
 
-        // Call the handler — should reject path traversal and return empty response
         merkle_drill_response(
             &mut server_stream,
             &payload,
@@ -1167,7 +1159,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Read the response from the client side
         let (type_id, resp_bytes) = client_stream.recv_frame().await.unwrap().unwrap();
         assert_eq!(type_id, msg::MERKLE_DRILL_RESPONSE);
 
