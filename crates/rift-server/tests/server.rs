@@ -72,7 +72,7 @@ mod helpers {
         let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
             .expect("server_endpoint failed");
         let addr = listener.local_addr();
-        let db: Arc<Option<Database>> = Arc::new(None);
+        let db: Arc<rift_server::handler::NoopCache> = Arc::new(rift_server::handler::NoopCache);
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
         tokio::spawn(rift_server::server::accept_loop(
             listener, share, db, handle_db, chunker,
@@ -161,7 +161,7 @@ async fn stat_response_rejects_wrong_size_handle_bytes() {
     let response = rift_server::handler::stat_response(
         &req.encode_to_vec(),
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -211,7 +211,7 @@ async fn stat_response_valid_handle_returns_attrs() {
     let response = rift_server::handler::stat_response(
         &req.encode_to_vec(),
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -237,7 +237,7 @@ async fn stat_response_invalid_handle_returns_error() {
     let response = rift_server::handler::stat_response(
         &req.encode_to_vec(),
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -269,7 +269,7 @@ async fn stat_response_multiple_handles() {
     let response = rift_server::handler::stat_response(
         &req.encode_to_vec(),
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -301,7 +301,7 @@ async fn lookup_response_finds_existing_entry() {
     let response = rift_server::handler::lookup_response(
         &req.encode_to_vec(),
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -333,7 +333,7 @@ async fn lookup_response_missing_entry_returns_error() {
     let response = rift_server::handler::lookup_response(
         &req.encode_to_vec(),
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -554,7 +554,7 @@ async fn stat_response_malformed_payload_does_not_panic() {
     let _ = rift_server::handler::stat_response(
         b"this is not protobuf",
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -568,7 +568,7 @@ async fn lookup_response_malformed_payload_does_not_panic() {
     let _ = rift_server::handler::lookup_response(
         b"\xff\xfe\x00garbage",
         &root,
-        None,
+        &rift_server::handler::NoopCache,
         &handle_db,
         TEST_CHUNKER,
     )
@@ -1234,7 +1234,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1263,7 +1263,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            None,
+            &rift_server::handler::NoopCache,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1294,7 +1294,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1338,7 +1338,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1379,7 +1379,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1410,7 +1410,7 @@ mod merkle_integration {
         let response1 = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1431,7 +1431,7 @@ mod merkle_integration {
         let response2 = rift_server::handler::stat_response(
             &req2.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1467,7 +1467,7 @@ mod merkle_integration {
         let response1 = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1486,7 +1486,7 @@ mod merkle_integration {
         let response2 = rift_server::handler::stat_response(
             &req2.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1516,7 +1516,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1560,7 +1560,7 @@ mod merkle_integration {
         let response = rift_server::handler::lookup_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1592,7 +1592,7 @@ mod merkle_integration {
         let response = rift_server::handler::lookup_response(
             &req.encode_to_vec(),
             &root,
-            None,
+            &rift_server::handler::NoopCache,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1641,7 +1641,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1677,7 +1677,7 @@ mod merkle_integration {
         let response = rift_server::handler::stat_response(
             &req.encode_to_vec(),
             &root,
-            Some(&db),
+            &db,
             &handle_db,
             TEST_CHUNKER,
         )
@@ -1701,7 +1701,10 @@ mod helpers_with_db {
     use super::*;
     use crate::helpers::gen_cert;
 
-    pub async fn start_server_with_db(share: PathBuf, db: Arc<Option<Database>>) -> SocketAddr {
+    pub async fn start_server_with_db<M: rift_server::handler::MerkleCache + 'static>(
+        share: PathBuf,
+        db: Arc<M>,
+    ) -> SocketAddr {
         let (cert, key) = gen_cert("rift-test-server");
         let listener = rift_transport::server_endpoint("127.0.0.1:0".parse().unwrap(), &cert, &key)
             .expect("server_endpoint failed");
@@ -1791,7 +1794,7 @@ async fn server_sends_root_hash_when_db_configured() {
     .await
     .unwrap();
 
-    let server_db = Arc::new(Some(db));
+    let server_db = Arc::new(db);
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -1846,7 +1849,7 @@ async fn server_computes_root_hash_when_cache_miss() {
     std::fs::write(&file_path, b"hello rift").unwrap();
 
     let db = Database::open_in_memory().await.unwrap();
-    let server_db = Arc::new(Some(db));
+    let server_db = Arc::new(db);
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -1915,7 +1918,7 @@ async fn stat_uses_cached_root_when_file_unchanged() {
     .await
     .unwrap();
 
-    let server_db = Arc::new(Some(db));
+    let server_db = Arc::new(db);
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -2874,7 +2877,7 @@ mod merkle_drill_tests {
 
         // Start server with DB
         let db = Database::open_in_memory().await.unwrap();
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -2949,7 +2952,7 @@ mod merkle_drill_tests {
 
         // Start server with DB
         let db = Database::open_in_memory().await.unwrap();
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -3029,7 +3032,7 @@ mod merkle_drill_tests {
 
         // Start server with DB
         let db = Database::open_in_memory().await.unwrap();
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -3086,7 +3089,7 @@ mod merkle_drill_tests {
 
         // Start server with DB
         let db = Database::open_in_memory().await.unwrap();
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
 
@@ -3130,7 +3133,7 @@ mod merkle_drill_tests {
         let db = Database::open_in_memory().await.unwrap();
         helpers_with_db::drop_merkle_tree_tables(&db).await;
 
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
         let file_handle = lookup_file_handle(&conn, &root_handle, "test_file.txt").await;
@@ -3190,7 +3193,7 @@ mod db_failure_resilience_tests {
         let db = Database::open_in_memory().await.unwrap();
         helpers_with_db::drop_merkle_cache(&db).await;
 
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
         let file_handle = lookup_file_handle(&conn, &root_handle, "test_stat.txt").await;
@@ -3230,7 +3233,7 @@ mod db_failure_resilience_tests {
         let db = Database::open_in_memory().await.unwrap();
         helpers_with_db::drop_merkle_cache(&db).await;
 
-        let server_db = Arc::new(Some(db));
+        let server_db = Arc::new(db);
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
         let file_handle = lookup_file_handle(&conn, &root_handle, "test_read.txt").await;

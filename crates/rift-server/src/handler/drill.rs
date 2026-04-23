@@ -13,8 +13,8 @@ use rift_transport::RiftStream;
 use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
+use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::resolve;
-use crate::metadata::db::Database;
 
 /// Convert internal `MerkleChild` enum values to proto `MerkleChildProto` messages.
 fn children_to_proto(children: &[MerkleChild]) -> Vec<MerkleChildProto> {
@@ -43,11 +43,11 @@ fn children_to_proto(children: &[MerkleChild]) -> Vec<MerkleChildProto> {
 
 /// Look up Merkle tree children, checking the in-memory cache first and
 /// falling back to the database. Returns `None` if not found in either.
-async fn resolve_children(
+async fn resolve_children<M: MerkleCache>(
     cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
     canonical: &Path,
     query_hash: &Blake3Hash,
-    database: &Database,
+    database: &M,
 ) -> Option<Vec<MerkleChild>> {
     match cache.get(query_hash) {
         Some(c) => Some(c.clone()),
@@ -84,11 +84,11 @@ async fn send_empty_drill_response<S: RiftStream>(stream: &mut S) -> anyhow::Res
 /// 6. Look up children (cache-first, then database)
 /// 7. Convert to proto and send response
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
-pub async fn merkle_drill_response<S: RiftStream>(
+pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
     payload: &[u8],
     share: &Path,
-    db: Option<&Database>,
+    db: &M,
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> anyhow::Result<()> {
@@ -105,11 +105,6 @@ pub async fn merkle_drill_response<S: RiftStream>(
     let canonical = match resolve(share, &handle, handle_db).await {
         Ok(p) => p,
         Err(_) => return send_empty_drill_response(stream).await,
-    };
-
-    let database = match db {
-        Some(d) => d,
-        None => return send_empty_drill_response(stream).await,
     };
 
     let content = match tokio::fs::read(&canonical).await {
@@ -134,7 +129,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
             .unwrap_or(0);
         let file_size = meta.len();
-        if let Err(e) = database
+        if let Err(e) = db
             .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
             .await
         {
@@ -151,7 +146,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
         }
     };
 
-    let children = match resolve_children(&cache, &canonical, &query_hash, database).await {
+    let children = match resolve_children(&cache, &canonical, &query_hash, db).await {
         Some(c) => c,
         None => return send_empty_drill_response(stream).await,
     };
@@ -222,7 +217,7 @@ mod tests {
             &mut server_stream,
             &payload,
             &share_canonical,
-            Some(&db),
+            &db,
             &handle_db,
             Chunker::default(),
         )

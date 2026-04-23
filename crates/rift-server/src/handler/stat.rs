@@ -13,8 +13,8 @@ use uuid::Uuid;
 use crate::handle::HandleDatabase;
 use crate::handler::attrs::build_attrs;
 use crate::handler::merkle_cache::get_or_compute_merkle_root;
+use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::{error_detail, io_err_kind_to_code, resolve};
-use crate::metadata::db::Database;
 
 /// Handle a `StatRequest`: stat each requested handle and return one
 /// `StatResult` per handle (success or error).
@@ -24,10 +24,10 @@ use crate::metadata::db::Database;
 /// preserving a 1:1 invariant. Invalid handles (wrong byte count, etc.)
 /// produce an `ErrorNotFound` result rather than being silently dropped.
 #[instrument(skip(share, db, handle_db), fields(share = %share.display()), level = "debug")]
-pub async fn stat_response(
+pub async fn stat_response<M: MerkleCache>(
     payload: &[u8],
     share: &Path,
-    db: Option<&Database>,
+    db: &M,
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> StatResponse {
@@ -57,12 +57,12 @@ fn stat_error(code: ErrorCode) -> StatResult {
     }
 }
 
-fn async_stat<'a>(
+fn async_stat<'a, M: MerkleCache>(
     share: &'a Path,
     handle_bytes: Vec<u8>,
     uuid: Uuid,
     handle_db: &'a HandleDatabase,
-    db: Option<&'a Database>,
+    db: &'a M,
     chunker: Chunker,
 ) -> BoxFuture<'a, StatResult> {
     Box::pin(async move {
@@ -100,6 +100,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::handle::HandleDatabase;
+    use crate::handler::merkle_cache_trait::NoopCache;
     use rift_common::crypto::Chunker;
     use rift_protocol::messages::{FileType, StatRequest};
 
@@ -119,7 +120,8 @@ mod tests {
         };
         let payload = req.encode_to_vec();
 
-        let resp = stat_response(&payload, &share, None, &handle_db, Chunker::default()).await;
+        let resp =
+            stat_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
 
         assert_eq!(resp.results.len(), 1);
         match &resp.results[0].result {
@@ -138,7 +140,8 @@ mod tests {
         let handle_db = HandleDatabase::new();
 
         let garbage = vec![0xFF, 0xFE, 0x00, 0xAB, 0xCD];
-        let resp = stat_response(&garbage, &share, None, &handle_db, Chunker::default()).await;
+        let resp =
+            stat_response(&garbage, &share, &NoopCache, &handle_db, Chunker::default()).await;
 
         assert_eq!(
             resp.results.len(),

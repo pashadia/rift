@@ -13,8 +13,8 @@ use rift_transport::RiftStream;
 use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
+use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::{io_err_kind_to_code, resolve};
-use crate::metadata::db::Database;
 
 /// Maximum number of chunks a client can request in a single ReadRequest.
 /// This prevents DoS attacks where a client requests u32::MAX chunks.
@@ -24,11 +24,11 @@ pub const MAX_CHUNK_COUNT: u32 = 256;
 /// even for empty files. The client should know the chunk count from stat; requesting
 /// a nonexistent chunk index indicates a bug or desync.
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
-pub async fn read_response<S: RiftStream>(
+pub async fn read_response<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
     payload: &[u8],
     share: &Path,
-    db: Option<&Database>,
+    db: &M,
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> anyhow::Result<()> {
@@ -192,22 +192,20 @@ pub async fn read_response<S: RiftStream>(
         .collect();
     let root = merkle.build(&leaf_hashes);
 
-    if let Some(database) = db {
-        if let Ok(file_meta) = tokio::fs::metadata(&canonical).await {
-            let mtime_ns = match file_meta.modified() {
-                Ok(t) => t
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-                Err(_) => 0,
-            };
-            let file_size = file_meta.len();
-            if let Err(e) = database
-                .put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes)
-                .await
-            {
-                tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle root");
-            }
+    if let Ok(file_meta) = tokio::fs::metadata(&canonical).await {
+        let mtime_ns = match file_meta.modified() {
+            Ok(t) => t
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        let file_size = file_meta.len();
+        if let Err(e) = db
+            .put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes)
+            .await
+        {
+            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle root");
         }
     }
 

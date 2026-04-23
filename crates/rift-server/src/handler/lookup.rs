@@ -13,8 +13,8 @@ use uuid::Uuid;
 use crate::handle::HandleDatabase;
 use crate::handler::attrs::build_attrs;
 use crate::handler::merkle_cache::get_or_compute_merkle_root;
+use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::{error_detail, io_err_kind_to_code, resolve};
-use crate::metadata::db::Database;
 
 /// Handle a `LookupRequest`: resolve `(parent_handle, name)` to a child
 /// handle and its attributes.
@@ -22,10 +22,10 @@ use crate::metadata::db::Database;
 /// Returns `ErrorNotFound` if either the parent or the child does not exist.
 /// Name components must be single path elements (no `/` or NUL).
 #[instrument(skip(share, db, handle_db), fields(share = %share.display()), level = "debug")]
-pub async fn lookup_response(
+pub async fn lookup_response<M: MerkleCache>(
     payload: &[u8],
     share: &Path,
-    db: Option<&Database>,
+    db: &M,
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> LookupResponse {
@@ -103,6 +103,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::handle::HandleDatabase;
+    use crate::handler::merkle_cache_trait::NoopCache;
     use rift_common::crypto::Chunker;
     use rift_protocol::messages::LookupRequest;
 
@@ -122,7 +123,8 @@ mod tests {
         };
         let payload = req.encode_to_vec();
 
-        let resp = lookup_response(&payload, &share, None, &handle_db, Chunker::default()).await;
+        let resp =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
 
         match resp.result {
             Some(lookup_response::Result::Entry(entry)) => {
@@ -148,7 +150,8 @@ mod tests {
         };
         let payload = req.encode_to_vec();
 
-        let resp = lookup_response(&payload, &share, None, &handle_db, Chunker::default()).await;
+        let resp =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
 
         match resp.result {
             Some(lookup_response::Result::Error(_)) => {}
@@ -163,7 +166,8 @@ mod tests {
         let handle_db = HandleDatabase::new();
 
         let garbage = vec![0xFF, 0xAB, 0x00, 0x01, 0x02];
-        let resp = lookup_response(&garbage, &share, None, &handle_db, Chunker::default()).await;
+        let resp =
+            lookup_response(&garbage, &share, &NoopCache, &handle_db, Chunker::default()).await;
 
         match resp.result {
             Some(lookup_response::Result::Error(_)) => {}

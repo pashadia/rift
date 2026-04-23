@@ -3,7 +3,7 @@ use std::path::Path;
 use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
 use tracing::instrument;
 
-use crate::metadata::db::Database;
+use super::merkle_cache_trait::MerkleCache;
 
 pub(crate) fn root_hash_for_type(is_dir: bool) -> Blake3Hash {
     if is_dir {
@@ -19,22 +19,20 @@ pub(crate) fn root_hash_for_type(is_dir: bool) -> Blake3Hash {
 /// - For regular files: Merkle root computed from content (cached if possible)
 /// - For non-files (directories, etc.): uses a constant sentinel hash
 #[instrument(skip_all, fields(path = %path.display()), level = "debug")]
-pub(crate) async fn get_or_compute_merkle_root(
+pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
     path: &Path,
     meta: &std::fs::Metadata,
-    db: Option<&Database>,
+    cache: &M,
     chunker: Chunker,
 ) -> Blake3Hash {
     if !meta.is_file() {
         return root_hash_for_type(true);
     }
 
-    if let Some(database) = db {
-        match database.get_merkle(path).await {
-            Ok(Some(entry)) => return entry.root,
-            Ok(None) => {}
-            Err(_) => {}
-        }
+    match cache.get_merkle(path).await {
+        Ok(Some(entry)) => return entry.root,
+        Ok(None) => {}
+        Err(_) => {}
     }
 
     let content = match tokio::fs::read(path).await {
@@ -55,22 +53,20 @@ pub(crate) async fn get_or_compute_merkle_root(
     let merkle = MerkleTree::default();
     let root = merkle.build(&leaf_hashes);
 
-    if let Some(database) = db {
-        if let Ok(file_meta) = tokio::fs::metadata(path).await {
-            let mtime_ns = match file_meta.modified() {
-                Ok(t) => t
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-                Err(_) => 0,
-            };
-            let file_size = file_meta.len();
-            if let Err(e) = database
-                .put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes)
-                .await
-            {
-                tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
-            }
+    if let Ok(file_meta) = tokio::fs::metadata(path).await {
+        let mtime_ns = match file_meta.modified() {
+            Ok(t) => t
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        let file_size = file_meta.len();
+        if let Err(e) = cache
+            .put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes)
+            .await
+        {
+            tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
         }
     }
 

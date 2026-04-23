@@ -37,7 +37,7 @@ pub async fn start_server(share: PathBuf) -> SocketAddr {
     // Spawn in a dedicated thread so the server stays alive
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
+        let db: Arc<rift_server::handler::NoopCache> = Arc::new(rift_server::handler::NoopCache);
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
         let chunker = rift_common::crypto::Chunker::new(64, 256, 1024);
         rt.block_on(async {

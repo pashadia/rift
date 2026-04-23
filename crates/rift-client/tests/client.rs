@@ -773,12 +773,15 @@ async fn client_merkle_drill_fetches_root_level() {
         .merkle_drill(file_handle, &[])
         .await
         .expect("merkle_drill failed");
-    // NOTE: The server handler is currently a stub that returns empty children.
-    // Once the hash-based handler is implemented (Task 7), this test should
-    // verify non-empty children and correct parent_hash length.
-    // For now, just verify the protocol round-trip works.
-    assert_eq!(result.parent_hash.len(), 0); // stub returns empty parent_hash
-    assert!(result.children.is_empty()); // stub returns empty children
+    assert_eq!(
+        result.parent_hash.len(),
+        32,
+        "parent_hash must be 32-byte Blake3 hash"
+    );
+    assert!(
+        !result.children.is_empty(),
+        "drill must return at least one child for a non-empty file"
+    );
 }
 
 /// Cache data (manifest + chunks) persists across client restarts

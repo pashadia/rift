@@ -30,7 +30,7 @@ use rift_transport::{
     send_welcome, RiftConnection, RiftListener, RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
 };
 
-use crate::{handle::HandleDatabase, handler, metadata::db::Database};
+use crate::{handle::HandleDatabase, handler, handler::merkle_cache_trait::MerkleCache};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -43,10 +43,10 @@ use crate::{handle::HandleDatabase, handler, metadata::db::Database};
 ///
 /// Generic over any [`RiftListener`] to allow testing with in-memory transports.
 #[instrument(skip(listener, db, handle_db), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
-pub async fn accept_loop<L>(
+pub async fn accept_loop<L, M: MerkleCache + 'static>(
     listener: L,
     share: PathBuf,
-    db: Arc<Option<Database>>,
+    db: Arc<M>,
     handle_db: Arc<HandleDatabase>,
     chunker: Chunker,
 ) -> anyhow::Result<()>
@@ -85,10 +85,10 @@ where
 // ---------------------------------------------------------------------------
 
 #[instrument(skip(conn, share, db, handle_db, chunker), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
-async fn serve_connection<C>(
+async fn serve_connection<C, M: MerkleCache + 'static>(
     conn: C,
     share: PathBuf,
-    db: Arc<Option<Database>>,
+    db: Arc<M>,
     handle_db: Arc<HandleDatabase>,
     chunker: Chunker,
 ) where
@@ -130,10 +130,10 @@ async fn serve_connection<C>(
 // ---------------------------------------------------------------------------
 
 #[instrument(skip_all, fields(share = %share.display()), err)]
-async fn handle_stream<S>(
+async fn handle_stream<S, M: MerkleCache>(
     mut stream: S,
     share: PathBuf,
-    db: Arc<Option<Database>>,
+    db: Arc<M>,
     handle_db: Arc<HandleDatabase>,
     chunker: Chunker,
 ) -> anyhow::Result<()>
@@ -201,7 +201,7 @@ where
         // Metadata operations (with optional Merkle cache)
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
-            let db_ref = db.as_ref().as_ref();
+            let db_ref = db.as_ref();
             let response =
                 handler::stat_response(&payload, &share, db_ref, &handle_db, chunker).await;
             stream
@@ -211,7 +211,7 @@ where
         }
 
         msg::LOOKUP_REQUEST => {
-            let db_ref = db.as_ref().as_ref();
+            let db_ref = db.as_ref();
             let response =
                 handler::lookup_response(&payload, &share, db_ref, &handle_db, chunker).await;
             stream
@@ -232,14 +232,14 @@ where
         // Data operations
         // ------------------------------------------------------------------
         msg::READ_REQUEST => {
-            let db_ref = db.as_ref().as_ref();
+            let db_ref = db.as_ref();
             handler::read_response(&mut stream, &payload, &share, db_ref, &handle_db, chunker)
                 .await
                 .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
         }
 
         msg::MERKLE_DRILL => {
-            let db_ref = db.as_ref().as_ref();
+            let db_ref = db.as_ref();
             handler::merkle_drill_response(
                 &mut stream,
                 &payload,
@@ -283,7 +283,7 @@ mod tests {
     use rift_transport::{client_handshake, InMemoryConnector, InMemoryListener, RiftConnection};
 
     use super::*;
-    use crate::{handle::HandleDatabase, metadata::db::Database};
+    use crate::{handle::HandleDatabase, handler::merkle_cache_trait::NoopCache};
 
     /// Helper: build a minimal server config pointing at a real temp directory.
     fn make_share() -> (tempfile::TempDir, PathBuf) {
@@ -303,7 +303,7 @@ mod tests {
         InMemoryConnector,
     ) {
         let (listener, connector) = InMemoryListener::new("test-server-fp", "test-client-fp");
-        let db: Arc<Option<Database>> = Arc::new(None);
+        let db: Arc<NoopCache> = Arc::new(NoopCache);
         let handle_db = Arc::new(HandleDatabase::new());
         let handle = tokio::spawn(accept_loop(
             listener,

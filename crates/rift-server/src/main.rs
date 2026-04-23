@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
 
     let listener = rift_transport::server_endpoint(listen_addr, &cert_der, &key_der)?;
 
-    let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
+    let db: Arc<rift_server::handler::NoopCache> = Arc::new(rift_server::handler::NoopCache);
     let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
 
     let share_path = server_config.shares[0].path.clone();
