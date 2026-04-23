@@ -181,8 +181,7 @@ impl MerkleTree {
             return Err("Leaf hash bytes must be a multiple of 32");
         }
 
-        let count = bytes.len() / 32;
-        let mut leaves = Vec::with_capacity(count);
+        let mut leaves = Vec::with_capacity(bytes.len() / 32);
         for chunk in bytes.chunks_exact(32) {
             leaves.push(Blake3Hash::from_slice(chunk).unwrap());
         }
@@ -1083,6 +1082,35 @@ mod merkle_cache_tests {
         let (root, cache) = tree.build_with_cache(&[]);
         assert_eq!(root, Blake3Hash::new(&[]));
         assert!(cache.is_empty());
+    }
+
+    // Kill mutant: replace * with / in chunk_index computation (chunk_idx * fanout → chunk_idx / fanout).
+    // With fanout=4 and ≥5 leaves, chunk_idx > 0 in some chunks, making the mutation observable.
+    #[test]
+    fn build_with_cache_leaf_indices_beyond_first_chunk() {
+        let tree = MerkleTree::new(4); // small fanout for clarity
+        let leaves: Vec<_> = (0..9).map(|i| Blake3Hash::new(&[i])).collect();
+        // chunk_idx=0 → indices 0..4, chunk_idx=1 → indices 4..8, chunk_idx=2 → index 8
+        let (_, cache) = tree.build_with_cache(&leaves);
+        let mut all_leaves: Vec<(u32, Blake3Hash)> = cache
+            .values()
+            .flatten()
+            .filter_map(|c| match c {
+                MerkleChild::Leaf {
+                    chunk_index, hash, ..
+                } => Some((*chunk_index, hash.clone())),
+                _ => None,
+            })
+            .collect();
+        all_leaves.sort_by_key(|(idx, _)| *idx);
+        assert_eq!(all_leaves.len(), 9, "should have 9 leaf children");
+        for (i, (chunk_index, hash)) in all_leaves.iter().enumerate() {
+            assert_eq!(
+                *chunk_index, i as u32,
+                "leaf at position {i} should have chunk_index={i}"
+            );
+            assert_eq!(*hash, leaves[i]);
+        }
     }
 }
 

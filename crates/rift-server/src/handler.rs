@@ -175,6 +175,7 @@ pub async fn stat_response(
 /// handle and its attributes.
 ///
 /// Returns `ErrorNotFound` if either the parent or the child does not exist.
+/// Name components must be single path elements (no `/` or NUL).
 #[instrument(skip(share, db, handle_db), fields(share = %share.display()), level = "debug")]
 pub async fn lookup_response(
     payload: &[u8],
@@ -188,7 +189,7 @@ pub async fn lookup_response(
         Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
     };
 
-    if req.name.is_empty() || req.name.contains('/') || req.name.contains('\0') {
+    if !is_valid_name_component(&req.name) {
         return lookup_error(ErrorCode::ErrorUnsupported);
     }
 
@@ -472,6 +473,11 @@ fn io_err_kind_to_code(kind: std::io::ErrorKind) -> ErrorCode {
         std::io::ErrorKind::PermissionDenied => ErrorCode::ErrorPermissionDenied,
         _ => ErrorCode::ErrorNotFound,
     }
+}
+
+/// Check that a lookup name is a single path component (non-empty, no `/`, no NUL).
+fn is_valid_name_component(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\0')
 }
 
 /// Maximum number of chunks a client can request in a single ReadRequest.
@@ -1103,7 +1109,6 @@ mod tests {
         }
     }
 
-    // TODO: Add tests for mkdir / unlink / rmdir handlers once they're implemented.
     use crate::metadata::db::Database;
 
     use rift_protocol::messages::msg;

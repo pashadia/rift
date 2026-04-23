@@ -251,4 +251,54 @@ mod tests {
         assert_eq!(map.len(), 1, "map must contain exactly one entry");
         assert_eq!(map.get_handle(&"test.txt".to_string()), Some(handle1));
     }
+
+    // Kill mutant: replace BidirectionalMap::remove_async body with None.
+    // Without these tests, remove_async was never exercised.
+    #[tokio::test]
+    async fn test_remove_async() {
+        let map = BidirectionalMap::<String>::new();
+        let handle = Uuid::now_v7();
+
+        map.insert_async(handle, "test.txt".to_string())
+            .await
+            .unwrap();
+
+        let removed = map.remove_async(&handle).await;
+        assert_eq!(removed, Some("test.txt".to_string()));
+        assert!(
+            map.get_by_handle(&handle).is_none(),
+            "entry should be removed"
+        );
+        assert!(
+            map.get_handle(&"test.txt".to_string()).is_none(),
+            "reverse lookup should be gone"
+        );
+        assert!(
+            map.is_empty(),
+            "map should be empty after removing the only entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_async_not_found() {
+        let map = BidirectionalMap::<String>::new();
+        let handle = Uuid::now_v7();
+        let result = map.remove_async(&handle).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_remove_async_only_removes_target() {
+        let map = BidirectionalMap::<String>::new();
+        let h1 = Uuid::now_v7();
+        let h2 = Uuid::now_v7();
+        map.insert_async(h1, "a.txt".to_string()).await.unwrap();
+        map.insert_async(h2, "b.txt".to_string()).await.unwrap();
+
+        let removed = map.remove_async(&h1).await;
+        assert_eq!(removed, Some("a.txt".to_string()));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get_by_handle(&h2), Some("b.txt".to_string()));
+        assert_eq!(map.get_handle(&"b.txt".to_string()), Some(h2));
+    }
 }

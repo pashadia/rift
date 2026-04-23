@@ -1,0 +1,6 @@
+# Skip mutants that are functionally equivalent — capacity pre-allocation
+# has no observable effect on correctness, only on performance.
+# See: https://mutants.rs/skip_calls.html
+exclude_re = [
+    "replace BidirectionalMap.*with_capacity -> Self with Default::default",
+]
