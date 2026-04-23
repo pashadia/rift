@@ -2110,8 +2110,8 @@ async fn server_rejects_excessive_chunk_count() {
 }
 
 #[tokio::test]
-async fn server_rejects_start_chunk_past_end() {
-    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+async fn server_returns_zero_chunks_for_start_chunk_past_end() {
+    use rift_protocol::messages::{lookup_response, msg, read_response, LookupRequest, ReadRequest, ReadResponse};
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
@@ -2149,15 +2149,12 @@ async fn server_rejects_start_chunk_past_end() {
     stream.finish_send().await.unwrap();
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
-    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    let response = ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
-        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
-            assert_eq!(
-                e.code,
-                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
-            );
+        Some(read_response::Result::Ok(success)) => {
+            assert_eq!(success.chunk_count, 0, "no chunks past end should return 0");
         }
-        _ => panic!("expected error for start_chunk past end, got success"),
+        other => panic!("expected success with 0 chunks, got: {:?}", other),
     }
 }
 
@@ -2310,9 +2307,9 @@ async fn server_allows_read_at_last_valid_chunk() {
 }
 
 #[tokio::test]
-async fn server_rejects_read_at_exact_boundary() {
-    // start_chunk == chunk_count (1 for "hello rift") should return ErrorNotFound
-    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReadRequest};
+async fn server_returns_zero_chunks_at_exact_boundary() {
+    // start_chunk == chunk_count (1 for "hello rift") — no chunks to transfer
+    use rift_protocol::messages::{lookup_response, msg, read_response, LookupRequest, ReadRequest, ReadResponse};
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
@@ -2336,7 +2333,7 @@ async fn server_rejects_read_at_exact_boundary() {
         _ => panic!("lookup failed"),
     };
 
-    // start_chunk == 1 (== number of chunks) should be rejected
+    // start_chunk == 1 (== number of chunks) — no chunks at this offset
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
@@ -2350,15 +2347,12 @@ async fn server_rejects_read_at_exact_boundary() {
     stream.finish_send().await.unwrap();
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
-    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    let response = ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
-        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
-            assert_eq!(
-                e.code,
-                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
-            );
+        Some(read_response::Result::Ok(success)) => {
+            assert_eq!(success.chunk_count, 0, "no chunks at boundary should return 0");
         }
-        _ => panic!("expected ErrorNotFound at exact boundary, got success"),
+        other => panic!("expected success with 0 chunks, got: {:?}", other),
     }
 }
 
@@ -2511,14 +2505,14 @@ async fn lookup_file_handle(
 }
 
 #[tokio::test]
-async fn multi_chunk_start_chunk_at_exact_boundary_returns_not_found() {
-    use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse, ErrorCode};
+async fn multi_chunk_start_chunk_at_exact_boundary_returns_zero_chunks() {
+    use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse};
     let (_dir, root, _content, chunk_count) = setup_multi_chunk_file().await;
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
     let file_handle = lookup_file_handle(&conn, &root_handle, "multichunk.bin").await;
 
-    // start_chunk == number of chunks is out of bounds
+    // start_chunk == number of chunks — no chunks at this offset
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
@@ -2534,10 +2528,10 @@ async fn multi_chunk_start_chunk_at_exact_boundary_returns_not_found() {
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let resp = ReadResponse::decode(&payload[..]).unwrap();
     match resp.result {
-        Some(read_response::Result::Error(e)) => {
-            assert_eq!(e.code, ErrorCode::ErrorNotFound as i32);
+        Some(read_response::Result::Ok(success)) => {
+            assert_eq!(success.chunk_count, 0, "no chunks at boundary should return 0");
         }
-        _ => panic!("expected ErrorNotFound at exact boundary, got success"),
+        other => panic!("expected success with 0 chunks, got: {:?}", other),
     }
 }
 

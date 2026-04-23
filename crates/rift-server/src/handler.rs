@@ -590,25 +590,6 @@ pub async fn read_response<S: RiftStream>(
         return Ok(());
     }
 
-    // Validate start_chunk is within bounds.
-    // Note: an empty file has 0 chunks — start_chunk=0 is valid, just returns
-    // ReadSuccess with chunk_count=0. Only requesting a non-zero start_chunk
-    // from an empty file (or past the end of a non-empty file) is an error.
-    if req.start_chunk as usize > 0 && req.start_chunk as usize >= chunk_boundaries.len() {
-        let response = ReadResponse {
-            result: Some(read_response::Result::Error(ErrorDetail {
-                code: ErrorCode::ErrorNotFound as i32,
-                message: "start_chunk exceeds file chunk count".to_string(),
-                metadata: None,
-            })),
-        };
-        stream
-            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-        return Ok(());
-    }
-
     let start = req.start_chunk as usize;
     let count = if req.chunk_count == 0 {
         chunk_boundaries.len().saturating_sub(start)
