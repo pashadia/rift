@@ -1717,6 +1717,42 @@ mod helpers_with_db {
         addr
     }
 
+    /// Sabotage a database by executing arbitrary SQL against it.
+    /// Useful for simulating write failures (e.g. dropping tables).
+    pub async fn sabotage_db(db: &Database, sql: impl Into<String>) {
+        let sql = sql.into();
+        db.call(move |conn| conn.execute_batch(&sql))
+            .await
+            .expect("sabotage SQL should succeed");
+    }
+
+    /// Drop the merkle_cache table, causing put_merkle to fail.
+    /// stat and read still return correct data; they just can't cache.
+    pub async fn drop_merkle_cache(db: &Database) {
+        sabotage_db(db, "DROP TABLE IF EXISTS merkle_cache").await;
+    }
+
+    /// Drop the merkle_tree_nodes and merkle_leaf_info tables,
+    /// causing put_tree to fail. Drill still returns correct data
+    /// from in-memory cache.
+    pub async fn drop_merkle_tree_tables(db: &Database) {
+        sabotage_db(
+            db,
+            "DROP TABLE IF EXISTS merkle_tree_nodes; DROP TABLE IF EXISTS merkle_leaf_info;",
+        )
+        .await;
+    }
+
+    /// Drop all merkle tables, causing every DB write to fail.
+    #[allow(dead_code)]
+    pub async fn drop_all_merkle_tables(db: &Database) {
+        sabotage_db(
+            db,
+            "DROP TABLE IF EXISTS merkle_cache; DROP TABLE IF EXISTS merkle_tree_nodes; DROP TABLE IF EXISTS merkle_leaf_info;",
+        )
+        .await;
+    }
+
     pub fn file_mtime_ns(path: &std::path::PathBuf) -> u64 {
         let meta = std::fs::metadata(path).unwrap();
         meta.modified()
@@ -3081,9 +3117,8 @@ mod merkle_drill_tests {
     }
 
     /// Merkle drill must return correct data even when put_tree fails.
-    /// This simulates a DB write failure by dropping the merkle_tree_nodes
-    /// table before the drill, forcing put_tree to error. The response
-    /// should still contain valid children computed from the file content.
+    /// The handler uses in-memory cache first, so drill works even
+    /// if DB writes fail.
     #[tokio::test]
     async fn drill_returns_correct_data_despite_db_write_failure() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3092,39 +3127,14 @@ mod merkle_drill_tests {
         let content = vec![0xCDu8; 128];
         std::fs::write(&file_path, &content).unwrap();
 
-        // Create DB & immediately sabotage it by dropping required tables
         let db = Database::open_in_memory().await.unwrap();
-        db.call(|conn| {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS merkle_tree_nodes; DROP TABLE IF EXISTS merkle_leaf_info;",
-            )
-        })
-        .await
-        .unwrap();
+        helpers_with_db::drop_merkle_tree_tables(&db).await;
 
         let server_db = Arc::new(Some(db));
         let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
         let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+        let file_handle = lookup_file_handle(&conn, &root_handle, "test_file.txt").await;
 
-        // Lookup file
-        let mut stream = conn.open_stream().await.unwrap();
-        let lookup_req = LookupRequest {
-            parent_handle: root_handle.clone(),
-            name: "test_file.txt".to_string(),
-        };
-        stream
-            .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
-            .await
-            .unwrap();
-        stream.finish_send().await.unwrap();
-        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
-        let lookup_resp = LookupResponse::decode(&payload[..]).unwrap();
-        let file_handle = match lookup_resp.result {
-            Some(lookup_response::Result::Entry(entry)) => entry.handle,
-            _ => panic!("lookup failed"),
-        };
-
-        // Drill — should succeed despite DB write failure
         let mut stream = conn.open_stream().await.unwrap();
         let drill_req = MerkleDrill {
             handle: file_handle,
@@ -3140,7 +3150,6 @@ mod merkle_drill_tests {
         assert_eq!(type_id, msg::MERKLE_DRILL_RESPONSE);
 
         let response = MerkleDrillResponse::decode(&payload[..]).unwrap();
-        // Response must still contain valid children computed from file content
         assert_eq!(
             response.parent_hash.len(),
             32,
@@ -3152,6 +3161,101 @@ mod merkle_drill_tests {
         );
         for child in &response.children {
             assert_eq!(child.hash.len(), 32, "each child hash should be 32 bytes");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB write failure resilience tests
+// ---------------------------------------------------------------------------
+
+/// Tests that server responses remain correct when DB writes fail.
+/// The server computes results in-memory first, then best-effort caches to DB.
+/// If the DB write fails, the response is still correct — only caching is lost.
+mod db_failure_resilience_tests {
+    use super::*;
+    use rift_server::metadata::db::Database;
+
+    /// Stat must return a correct root_hash even when put_merkle fails.
+    /// The root hash is computed from file content regardless of DB state.
+    #[tokio::test]
+    async fn stat_returns_correct_root_hash_despite_db_write_failure() {
+        use rift_protocol::messages::{stat_result, StatRequest, StatResponse};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test_stat.txt");
+        std::fs::write(&file_path, b"hello rift").unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        helpers_with_db::drop_merkle_cache(&db).await;
+
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+        let file_handle = lookup_file_handle(&conn, &root_handle, "test_stat.txt").await;
+
+        let mut stream = conn.open_stream().await.unwrap();
+        let req = StatRequest {
+            handles: vec![file_handle],
+        };
+        stream
+            .send_frame(msg::STAT_REQUEST, &req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+        let response = StatResponse::decode(&payload[..]).unwrap();
+        assert_eq!(response.results.len(), 1);
+        let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
+            panic!("expected attrs, got error");
+        };
+        assert_eq!(attrs.root_hash.len(), 32, "root_hash should be 32 bytes");
+        assert_eq!(attrs.size, 10, "file size should be 10 bytes");
+    }
+
+    /// Read must return correct chunk data even when put_merkle fails.
+    /// The read handler computes content/chunks from the file regardless of DB state.
+    #[tokio::test]
+    async fn read_returns_correct_data_despite_db_write_failure() {
+        use rift_protocol::messages::{read_response, ReadRequest, ReadResponse};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let file_path = root.join("test_read.txt");
+        let content = vec![0xAB_u8; 128];
+        std::fs::write(&file_path, &content).unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        helpers_with_db::drop_merkle_cache(&db).await;
+
+        let server_db = Arc::new(Some(db));
+        let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
+        let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+        let file_handle = lookup_file_handle(&conn, &root_handle, "test_read.txt").await;
+
+        let mut stream = conn.open_stream().await.unwrap();
+        let req = ReadRequest {
+            handle: file_handle,
+            start_chunk: 0,
+            chunk_count: 1,
+        };
+        stream
+            .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+            .await
+            .unwrap();
+        stream.finish_send().await.unwrap();
+
+        let (type_id, payload) = stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::READ_RESPONSE);
+
+        let response = ReadResponse::decode(&payload[..]).unwrap();
+        match response.result {
+            Some(read_response::Result::Ok(success)) => {
+                assert_eq!(success.chunk_count, 1, "should return exactly 1 chunk");
+            }
+            other => panic!("expected ReadSuccess, got: {:?}", other),
         }
     }
 }
