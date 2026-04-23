@@ -202,7 +202,8 @@ where
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::stat_response(&payload, &share, db_ref, &handle_db, chunker).await;
+            let response =
+                handler::stat_response(&payload, &share, db_ref, &handle_db, chunker).await;
             stream
                 .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -211,7 +212,8 @@ where
 
         msg::LOOKUP_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::lookup_response(&payload, &share, db_ref, &handle_db, chunker).await;
+            let response =
+                handler::lookup_response(&payload, &share, db_ref, &handle_db, chunker).await;
             stream
                 .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -238,9 +240,16 @@ where
 
         msg::MERKLE_DRILL => {
             let db_ref = db.as_ref().as_ref();
-            handler::merkle_drill_response(&mut stream, &payload, &share, db_ref, &handle_db, chunker)
-                .await
-                .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
+            handler::merkle_drill_response(
+                &mut stream,
+                &payload,
+                &share,
+                db_ref,
+                &handle_db,
+                chunker,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
         }
 
         // ------------------------------------------------------------------
@@ -296,7 +305,13 @@ mod tests {
         let (listener, connector) = InMemoryListener::new("test-server-fp", "test-client-fp");
         let db: Arc<Option<Database>> = Arc::new(None);
         let handle_db = Arc::new(HandleDatabase::new());
-        let handle = tokio::spawn(accept_loop(listener, share, db, handle_db, Chunker::default()));
+        let handle = tokio::spawn(accept_loop(
+            listener,
+            share,
+            db,
+            handle_db,
+            Chunker::default(),
+        ));
         (handle, connector)
     }
 

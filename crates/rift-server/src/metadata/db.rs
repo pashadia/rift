@@ -5,12 +5,45 @@ use tokio_rusqlite::rusqlite;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Result as SqliteResult;
 
+/// SQL DDL for creating the database schema.
+/// Contains CREATE TABLE statements for all tables.
+const SCHEMA_DDL: &str = r"
+    CREATE TABLE IF NOT EXISTS merkle_cache (
+        file_path   TEXT PRIMARY KEY,
+        mtime_ns   INTEGER NOT NULL,
+        file_size  INTEGER NOT NULL,
+        root_hash  BLOB NOT NULL,
+        leaf_hashes BLOB NOT NULL,
+        computed_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS merkle_tree_nodes (
+        file_path TEXT NOT NULL,
+        node_hash BLOB NOT NULL,
+        children BLOB NOT NULL,
+        PRIMARY KEY (file_path, node_hash)
+    );
+    CREATE TABLE IF NOT EXISTS merkle_leaf_info (
+        file_path TEXT NOT NULL,
+        chunk_hash BLOB NOT NULL,
+        chunk_offset INTEGER NOT NULL,
+        chunk_length INTEGER NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        PRIMARY KEY (file_path, chunk_hash)
+    );
+";
+
 /// A SQLite database for storing share metadata.
 ///
 /// Uses WAL mode for concurrent reads and atomic writes.
 /// Uses tokio-rusqlite for async access - no Mutex needed.
 pub struct Database {
     conn: Connection,
+}
+
+/// Initialize the database schema.
+/// Helper function to be called from within `Connection::call`.
+fn init_schema(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA_DDL)
 }
 
 impl Database {
@@ -32,33 +65,7 @@ impl Database {
         })
         .await?;
 
-        conn.call(|conn| {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS merkle_cache (
-                    file_path   TEXT PRIMARY KEY,
-                    mtime_ns   INTEGER NOT NULL,
-                    file_size  INTEGER NOT NULL,
-                    root_hash  BLOB NOT NULL,
-                    leaf_hashes BLOB NOT NULL,
-                    computed_at INTEGER NOT NULL
-                );
-                 CREATE TABLE IF NOT EXISTS merkle_tree_nodes (
-                    file_path TEXT NOT NULL,
-                    node_hash BLOB NOT NULL,
-                    children BLOB NOT NULL,
-                    PRIMARY KEY (file_path, node_hash)
-                );
-                 CREATE TABLE IF NOT EXISTS merkle_leaf_info (
-                    file_path TEXT NOT NULL,
-                    chunk_hash BLOB NOT NULL,
-                    chunk_offset INTEGER NOT NULL,
-                    chunk_length INTEGER NOT NULL,
-                    chunk_index INTEGER NOT NULL,
-                    PRIMARY KEY (file_path, chunk_hash)
-                );",
-            )
-        })
-        .await?;
+        conn.call(init_schema).await?;
 
         Ok(Self { conn })
     }
@@ -66,33 +73,7 @@ impl Database {
     pub async fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory().await?;
 
-        conn.call(|conn| {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS merkle_cache (
-                    file_path   TEXT PRIMARY KEY,
-                    mtime_ns   INTEGER NOT NULL,
-                    file_size  INTEGER NOT NULL,
-                    root_hash  BLOB NOT NULL,
-                    leaf_hashes BLOB NOT NULL,
-                    computed_at INTEGER NOT NULL
-                );
-                 CREATE TABLE IF NOT EXISTS merkle_tree_nodes (
-                    file_path TEXT NOT NULL,
-                    node_hash BLOB NOT NULL,
-                    children BLOB NOT NULL,
-                    PRIMARY KEY (file_path, node_hash)
-                );
-                 CREATE TABLE IF NOT EXISTS merkle_leaf_info (
-                    file_path TEXT NOT NULL,
-                    chunk_hash BLOB NOT NULL,
-                    chunk_offset INTEGER NOT NULL,
-                    chunk_length INTEGER NOT NULL,
-                    chunk_index INTEGER NOT NULL,
-                    PRIMARY KEY (file_path, chunk_hash)
-                );",
-            )
-        })
-        .await?;
+        conn.call(init_schema).await?;
 
         Ok(Self { conn })
     }
@@ -126,6 +107,83 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn open_and_open_in_memory_create_identical_schemas() {
+        // Create temp directory for the file-based database
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        // Open file-based database
+        let file_db = Database::open(&db_path).await.unwrap();
+
+        // Open in-memory database
+        let mem_db = Database::open_in_memory().await.unwrap();
+
+        // Extract schema from file database
+        let file_schema: Vec<(String, Option<String>)> = file_db
+            .call(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='table'")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+
+        // Extract schema from in-memory database
+        let mem_schema: Vec<(String, Option<String>)> = mem_db
+            .call(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='table'")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+
+        // Compare table counts
+        assert_eq!(
+            file_schema.len(),
+            mem_schema.len(),
+            "Table counts should match. File: {:?}, Memory: {:?}",
+            file_schema.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            mem_schema.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+
+        // Compare each table's SQL definition
+        let file_tables: std::collections::HashMap<String, Option<String>> =
+            file_schema.into_iter().collect();
+        let mem_tables: std::collections::HashMap<String, Option<String>> =
+            mem_schema.into_iter().collect();
+
+        for (table_name, file_sql) in &file_tables {
+            let mem_sql = mem_tables.get(table_name).cloned().unwrap();
+            assert!(
+                mem_tables.contains_key(table_name),
+                "Table '{}' exists in file db but not in memory db",
+                table_name
+            );
+            assert_eq!(
+                file_sql, &mem_sql,
+                "Table '{}' has different SQL definitions",
+                table_name
+            );
+        }
+
+        // Ensure memory db doesn't have extra tables
+        for table_name in mem_tables.keys() {
+            assert!(
+                file_tables.contains_key(table_name),
+                "Table '{}' exists in memory db but not in file db",
+                table_name
+            );
+        }
     }
 
     #[tokio::test]

@@ -26,8 +26,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use rift_protocol::messages::{
-    lookup_response, msg, stat_result, ErrorCode, ErrorDetail, LookupRequest, LookupResponse, ReaddirRequest,
-    ReaddirResponse, StatRequest, StatResponse,
+    lookup_response, msg, stat_result, ErrorCode, ErrorDetail, LookupRequest, LookupResponse,
+    ReaddirRequest, ReaddirResponse, StatRequest, StatResponse,
 };
 use rift_transport::{
     client_endpoint, client_handshake, connect, AcceptAnyPolicy, RiftConnection, RiftListener,
@@ -158,8 +158,14 @@ async fn stat_response_rejects_wrong_size_handle_bytes() {
     let req = StatRequest {
         handles: vec![b"short".to_vec()],
     };
-    let response =
-        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER).await;
+    let response = rift_server::handler::stat_response(
+        &req.encode_to_vec(),
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
     assert_eq!(response.results.len(), 1);
     assert!(
         matches!(
@@ -202,8 +208,14 @@ async fn stat_response_valid_handle_returns_attrs() {
     let req = StatRequest {
         handles: vec![file_handle.as_bytes().to_vec()],
     };
-    let response =
-        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER).await;
+    let response = rift_server::handler::stat_response(
+        &req.encode_to_vec(),
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -222,8 +234,14 @@ async fn stat_response_invalid_handle_returns_error() {
     let req = StatRequest {
         handles: vec![invalid_handle.as_bytes().to_vec()],
     };
-    let response =
-        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER).await;
+    let response = rift_server::handler::stat_response(
+        &req.encode_to_vec(),
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
     assert_eq!(response.results.len(), 1);
     assert!(matches!(
         response.results[0].result,
@@ -248,8 +266,14 @@ async fn stat_response_multiple_handles() {
             invalid_handle.as_bytes().to_vec(),
         ],
     };
-    let response =
-        rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER).await;
+    let response = rift_server::handler::stat_response(
+        &req.encode_to_vec(),
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
     assert_eq!(response.results.len(), 2);
     assert!(matches!(
         response.results[0].result,
@@ -274,8 +298,14 @@ async fn lookup_response_finds_existing_entry() {
         parent_handle: root_handle.as_bytes().to_vec(),
         name: "hello.txt".to_string(),
     };
-    let response =
-        rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER).await;
+    let response = rift_server::handler::lookup_response(
+        &req.encode_to_vec(),
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Entry(_))
@@ -300,8 +330,14 @@ async fn lookup_response_missing_entry_returns_error() {
         parent_handle: root_handle.as_bytes().to_vec(),
         name: "does_not_exist.txt".to_string(),
     };
-    let response =
-        rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER).await;
+    let response = rift_server::handler::lookup_response(
+        &req.encode_to_vec(),
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
     assert!(matches!(
         response.result,
         Some(lookup_response::Result::Error(_))
@@ -515,16 +551,28 @@ async fn resolve_rejects_intermediate_symlink_escape() {
 async fn stat_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
     let handle_db = rift_server::handle::HandleDatabase::new();
-    let _ =
-        rift_server::handler::stat_response(b"this is not protobuf", &root, None, &handle_db, TEST_CHUNKER).await;
+    let _ = rift_server::handler::stat_response(
+        b"this is not protobuf",
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn lookup_response_malformed_payload_does_not_panic() {
     let (_dir, root) = helpers::make_share();
     let handle_db = rift_server::handle::HandleDatabase::new();
-    let _ = rift_server::handler::lookup_response(b"\xff\xfe\x00garbage", &root, None, &handle_db, TEST_CHUNKER)
-        .await;
+    let _ = rift_server::handler::lookup_response(
+        b"\xff\xfe\x00garbage",
+        &root,
+        None,
+        &handle_db,
+        TEST_CHUNKER,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1183,9 +1231,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -1207,9 +1260,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            None,
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -1233,9 +1291,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![subdir_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         assert_eq!(response.results.len(), 1);
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
@@ -1272,9 +1335,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -1308,9 +1376,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -1334,9 +1407,14 @@ mod merkle_integration {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
 
-        let response1 =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response1 = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
         let stat_result::Result::Attrs(attrs1) = response1.results[0].result.as_ref().unwrap()
         else {
             panic!("expected attrs");
@@ -1354,7 +1432,8 @@ mod merkle_integration {
             &req2.encode_to_vec(),
             &root,
             Some(&db),
-            &handle_db, TEST_CHUNKER,
+            &handle_db,
+            TEST_CHUNKER,
         )
         .await;
         let stat_result::Result::Attrs(attrs2) = response2.results[0].result.as_ref().unwrap()
@@ -1385,9 +1464,14 @@ mod merkle_integration {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
 
-        let response1 =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response1 = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
         let stat_result::Result::Attrs(attrs1) = response1.results[0].result.as_ref().unwrap()
         else {
             panic!("expected attrs");
@@ -1403,7 +1487,8 @@ mod merkle_integration {
             &req2.encode_to_vec(),
             &root,
             Some(&db),
-            &handle_db, TEST_CHUNKER,
+            &handle_db,
+            TEST_CHUNKER,
         )
         .await;
         let stat_result::Result::Attrs(attrs2) = response2.results[0].result.as_ref().unwrap()
@@ -1428,9 +1513,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         let stat_result::Result::Attrs(attrs) = response.results[0].result.as_ref().unwrap() else {
             panic!("expected attrs");
@@ -1471,7 +1561,8 @@ mod merkle_integration {
             &req.encode_to_vec(),
             &root,
             Some(&db),
-            &handle_db, TEST_CHUNKER,
+            &handle_db,
+            TEST_CHUNKER,
         )
         .await;
 
@@ -1498,9 +1589,14 @@ mod merkle_integration {
             parent_handle: root_handle.as_bytes().to_vec(),
             name: "hello.txt".to_string(),
         };
-        let response =
-            rift_server::handler::lookup_response(&req.encode_to_vec(), &root, None, &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::lookup_response(
+            &req.encode_to_vec(),
+            &root,
+            None,
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         let lookup_response::Result::Entry(entry) = response.result.as_ref().unwrap() else {
             panic!("expected entry");
@@ -1542,9 +1638,14 @@ mod merkle_integration {
                 file2_handle.as_bytes().to_vec(),
             ],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         assert_eq!(response.results.len(), 2);
         let stat_result::Result::Attrs(attrs1) = response.results[0].result.as_ref().unwrap()
@@ -1573,9 +1674,14 @@ mod merkle_integration {
         let req = StatRequest {
             handles: vec![invalid_handle.as_bytes().to_vec()],
         };
-        let response =
-            rift_server::handler::stat_response(&req.encode_to_vec(), &root, Some(&db), &handle_db, TEST_CHUNKER)
-                .await;
+        let response = rift_server::handler::stat_response(
+            &req.encode_to_vec(),
+            &root,
+            Some(&db),
+            &handle_db,
+            TEST_CHUNKER,
+        )
+        .await;
 
         assert_eq!(response.results.len(), 1);
         assert!(matches!(
@@ -1602,7 +1708,11 @@ mod helpers_with_db {
         let addr = listener.local_addr();
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
         tokio::spawn(rift_server::server::accept_loop(
-            listener, share, db, handle_db, TEST_CHUNKER,
+            listener,
+            share,
+            db,
+            handle_db,
+            TEST_CHUNKER,
         ));
         addr
     }
@@ -2006,10 +2116,15 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
     let root = temp_dir.path().to_path_buf();
 
     // Generate 4KB of varied content — enough for 10+ chunks with TEST_CHUNKER (avg=256)
-    let content: Vec<u8> = (0..128).flat_map(|i| {
-        let pattern = format!("chunk_{:04x}_", i);
-        pattern.into_bytes().into_iter().chain(std::iter::repeat_n(i as u8, 24))
-    }).collect();
+    let content: Vec<u8> = (0..128)
+        .flat_map(|i| {
+            let pattern = format!("chunk_{:04x}_", i);
+            pattern
+                .into_bytes()
+                .into_iter()
+                .chain(std::iter::repeat_n(i as u8, 24))
+        })
+        .collect();
     std::fs::write(root.join("many_chunks.bin"), &content).unwrap();
 
     // Verify we have at least 10 chunks with test chunker
@@ -2198,7 +2313,10 @@ async fn server_rejects_start_chunk_past_end() {
     let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
         Some(rift_protocol::messages::read_response::Result::Error(e)) => {
-            assert_eq!(e.code, rift_protocol::messages::ErrorCode::ErrorNotFound as i32);
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
+            );
         }
         other => panic!("expected ErrorNotFound, got: {:?}", other),
     }
@@ -2396,7 +2514,10 @@ async fn server_rejects_read_at_exact_boundary() {
     let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
         Some(rift_protocol::messages::read_response::Result::Error(e)) => {
-            assert_eq!(e.code, rift_protocol::messages::ErrorCode::ErrorNotFound as i32);
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
+            );
         }
         other => panic!("expected ErrorNotFound, got: {:?}", other),
     }
@@ -2453,7 +2574,9 @@ async fn server_allows_read_with_chunk_count_zero() {
 async fn server_rejects_read_on_empty_file() {
     // An empty file has 0 chunks. No chunk index is valid, including 0.
     // The client should know from stat that the file is empty.
-    use rift_protocol::messages::{read_response, lookup_response, msg, LookupRequest, ReadRequest, ReadResponse};
+    use rift_protocol::messages::{
+        lookup_response, msg, read_response, LookupRequest, ReadRequest, ReadResponse,
+    };
 
     let (_dir, root) = helpers::make_share();
     std::fs::write(root.join("empty.txt"), b"").unwrap();
@@ -2495,9 +2618,15 @@ async fn server_rejects_read_on_empty_file() {
     let response = ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
         Some(read_response::Result::Error(e)) => {
-            assert_eq!(e.code, rift_protocol::messages::ErrorCode::ErrorNotFound as i32);
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorNotFound as i32
+            );
         }
-        other => panic!("expected ErrorNotFound for empty file read, got: {:?}", other),
+        other => panic!(
+            "expected ErrorNotFound for empty file read, got: {:?}",
+            other
+        ),
     }
 }
 
@@ -2515,10 +2644,15 @@ fn max_chunk_count_value_is_256() {
 async fn setup_multi_chunk_file() -> (TempDir, PathBuf, Vec<u8>, usize) {
     let (_dir, root) = helpers::make_share();
     // 4KB varied content → 16+ chunks with TEST_CHUNKER
-    let content: Vec<u8> = (0..128).flat_map(|i| {
-        let pattern = format!("data_{:04x}_", i);
-        pattern.into_bytes().into_iter().chain(std::iter::repeat_n(i as u8, 16))
-    }).collect();
+    let content: Vec<u8> = (0..128)
+        .flat_map(|i| {
+            let pattern = format!("data_{:04x}_", i);
+            pattern
+                .into_bytes()
+                .into_iter()
+                .chain(std::iter::repeat_n(i as u8, 16))
+        })
+        .collect();
     std::fs::write(root.join("multichunk.bin"), &content).unwrap();
     let chunks = TEST_CHUNKER.chunk(&content);
     (_dir, root, content, chunks.len())
@@ -2551,7 +2685,7 @@ async fn lookup_file_handle(
 
 #[tokio::test]
 async fn multi_chunk_start_chunk_at_exact_boundary_returns_error() {
-    use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse, ErrorCode};
+    use rift_protocol::messages::{msg, read_response, ErrorCode, ReadRequest, ReadResponse};
     let (_dir, root, _content, chunk_count) = setup_multi_chunk_file().await;
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
@@ -2627,7 +2761,7 @@ async fn multi_chunk_requesting_more_than_available_returns_what_exists() {
     let req = ReadRequest {
         handle: file_handle,
         start_chunk: start,
-        chunk_count: 200,  // way more than available, but < MAX_CHUNK_COUNT
+        chunk_count: 200, // way more than available, but < MAX_CHUNK_COUNT
     };
     stream
         .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
@@ -2643,7 +2777,8 @@ async fn multi_chunk_requesting_more_than_available_returns_what_exists() {
     };
     assert_eq!(
         success.chunk_count as usize, expected_count,
-        "should return only the remaining {} chunks, not 200", expected_count
+        "should return only the remaining {} chunks, not 200",
+        expected_count
     );
 }
 
@@ -2678,7 +2813,8 @@ async fn multi_chunk_read_all_from_offset_with_chunk_count_zero() {
     };
     assert_eq!(
         success.chunk_count as usize, expected_count,
-        "chunk_count=0 from offset {} should return {} chunks", start, expected_count
+        "chunk_count=0 from offset {} should return {} chunks",
+        start, expected_count
     );
 }
 
