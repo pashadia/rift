@@ -25,7 +25,7 @@ use prost::Message as _;
 use tracing::{debug, debug_span, instrument, warn, Instrument};
 
 use rift_common::crypto::Chunker;
-use rift_protocol::messages::{msg, RiftHello, RiftWelcome, ShareInfo};
+use rift_protocol::messages::{msg, ErrorCode, ErrorDetail, RiftHello, RiftWelcome, ShareInfo};
 use rift_transport::{
     send_welcome, RiftConnection, RiftListener, RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
 };
@@ -247,8 +247,16 @@ where
         // Unknown
         // ------------------------------------------------------------------
         other => {
-            // TODO(v1): send ERROR_RESPONSE so clients surface a real error.
-            debug!("unknown message type 0x{other:02X} — closing stream");
+            debug!("unknown message type 0x{other:02X}");
+            let error = ErrorDetail {
+                code: ErrorCode::ErrorUnsupported as i32,
+                message: format!("unknown message type 0x{other:02X}"),
+                metadata: None,
+            };
+            let _ = stream
+                .send_frame(msg::ERROR_RESPONSE, &error.encode_to_vec())
+                .await;
+            let _ = stream.finish_send().await;
         }
     }
 

@@ -65,6 +65,9 @@ pub mod msg {
 
     // Raw data frames
     pub const BLOCK_DATA: u8 = 0xF0;
+
+    // Error responses
+    pub const ERROR_RESPONSE: u8 = 0x70;
 }
 
 #[cfg(test)]
@@ -1070,6 +1073,7 @@ mod tests {
             DIR_DELETED,
             DIR_RENAMED,
             BLOCK_DATA,
+            ERROR_RESPONSE,
         ];
         let mut seen = std::collections::HashSet::new();
         for &id in &ids {

@@ -26,7 +26,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use rift_protocol::messages::{
-    lookup_response, msg, stat_result, LookupRequest, LookupResponse, ReaddirRequest,
+    lookup_response, msg, stat_result, ErrorCode, ErrorDetail, LookupRequest, LookupResponse, ReaddirRequest,
     ReaddirResponse, StatRequest, StatResponse,
 };
 use rift_transport::{
@@ -870,6 +870,52 @@ async fn server_rejects_wrong_protocol_version() {
         }
         Ok(None) | Err(_) => {
             // Stream closed by server — also acceptable rejection behaviour.
+        }
+    }
+}
+
+/// Unknown message types must receive an ERROR_RESPONSE before the stream closes.
+/// This ensures clients get a clear error instead of a silent close.
+#[tokio::test]
+async fn server_rejects_unknown_message_type_with_error_response() {
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, _root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Send a frame with an unused type ID (0x70 is ERROR_RESPONSE, so use 0x71 which is unused)
+    let mut stream = conn.open_stream().await.unwrap();
+    let unknown_type_id: u8 = 0x71;
+    stream
+        .send_frame(unknown_type_id, b"some payload")
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    // The server must respond with ERROR_RESPONSE before closing
+    match stream.recv_frame().await {
+        Ok(Some((type_id, payload))) => {
+            assert_eq!(
+                type_id,
+                msg::ERROR_RESPONSE,
+                "server must send ERROR_RESPONSE for unknown message type"
+            );
+            let error = ErrorDetail::decode(&payload[..]).expect("valid ErrorDetail");
+            assert_eq!(
+                error.code,
+                ErrorCode::ErrorUnsupported as i32,
+                "error code must be ErrorUnsupported"
+            );
+            assert!(
+                error.message.contains("0x71"),
+                "error message should include unknown type ID: {}",
+                error.message
+            );
+        }
+        Ok(None) => {
+            panic!("server closed stream without sending ERROR_RESPONSE");
+        }
+        Err(e) => {
+            panic!("stream error: {}", e);
         }
     }
 }
