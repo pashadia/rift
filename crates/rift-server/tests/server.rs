@@ -1862,9 +1862,9 @@ async fn server_read_partial_chunks_returns_requested_only() {
     // Create a file with multiple chunks using varied content
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
-    // Write content with varied bytes to trigger multiple CDC chunks
-    let large_content: Vec<u8> = (0..100).flat_map(|i| vec![i; 4096]).collect();
-    std::fs::write(root.join("large.bin"), &large_content).unwrap();
+    // Write 2KB of varied content — enough for multiple chunks with TEST_CHUNKER (avg=256)
+    let content: Vec<u8> = (0..64).flat_map(|i| vec![i; 32]).collect();
+    std::fs::write(root.join("large.bin"), &content).unwrap();
 
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
@@ -1959,15 +1959,11 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
 
-    // Generate content large enough to produce 20+ chunks
-    // Default FastCDC: min=32KB, avg=128KB, max=512KB
-    // Use many unique patterns to force chunk boundaries
-    let mut content = Vec::with_capacity(5 * 1024 * 1024);
-    for i in 0..100_000 {
-        // Write varied bytes to trigger CDC boundaries
-        let chunk = format!("chunk_{:05x}_data_", i);
-        content.extend_from_slice(chunk.as_bytes());
-    }
+    // Generate 4KB of varied content — enough for 10+ chunks with TEST_CHUNKER (avg=256)
+    let content: Vec<u8> = (0..128).flat_map(|i| {
+        let pattern = format!("chunk_{:04x}_", i);
+        pattern.into_bytes().into_iter().chain(std::iter::repeat(i as u8).take(24))
+    }).collect();
     std::fs::write(root.join("many_chunks.bin"), &content).unwrap();
 
     // Verify we have at least 10 chunks with test chunker
@@ -2552,23 +2548,21 @@ mod merkle_drill_tests {
 
     #[tokio::test]
     async fn drill_subtree_returns_grandchildren() {
-        // Create a file large enough to have subtree nodes (>64 chunks).
-        // Use random-ish data to ensure the CDC chunker produces many small chunks.
+        // Create a file with >64 chunks for subtree nodes.
+        // With TEST_CHUNKER (avg=256), ~20KB of varied data produces 64+ chunks.
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("large_file.bin");
-        // Generate 10MB of pseudo-random data to ensure many chunks (>64) for subtree nodes
-        // The default FastCDC chunker produces ~128KB avg chunks, so we need ~10MB
-        // to reliably get >64 chunks and thus create Subtree intermediate nodes.
+        // Generate ~20KB of pseudo-random data — enough for 64+ chunks with TEST_CHUNKER
         let mut rng_state: u64 = 0x123456789ABCDEF0u64;
-        let mut content: Vec<u8> = Vec::with_capacity(10 * 1024 * 1024);
-        while content.len() < 10 * 1024 * 1024 {
+        let mut content: Vec<u8> = Vec::with_capacity(20 * 1024);
+        while content.len() < 20 * 1024 {
             rng_state ^= rng_state << 13;
             rng_state ^= rng_state >> 7;
             rng_state ^= rng_state << 17;
             content.extend_from_slice(&rng_state.to_le_bytes());
         }
-        content.truncate(10 * 1024 * 1024);
+        content.truncate(20 * 1024);
         std::fs::write(&file_path, &content).unwrap();
 
         // Start server with DB

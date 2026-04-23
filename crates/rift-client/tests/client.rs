@@ -718,8 +718,8 @@ async fn client_read_chunks_returns_data() {
 async fn client_read_chunks_returns_multiple_chunks() {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
-    // Create content with multiple chunks
-    let content: Vec<u8> = (0..100).flat_map(|i| vec![i; 4096]).collect();
+    // Create 2KB of varied content — enough for multiple chunks with TEST_CHUNKER (avg=256)
+    let content: Vec<u8> = (0..64).flat_map(|i| vec![i; 32]).collect();
     std::fs::write(root.join("large.bin"), &content).unwrap();
 
     let addr = helpers::start_server(root).await;
