@@ -215,14 +215,14 @@ pub async fn lookup_response(
 
     let share_canonical = match tokio::fs::canonicalize(share).await {
         Ok(p) => p,
-        Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
+        Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
     let child_path = parent_canonical.join(&req.name);
 
     let child_canonical = match tokio::fs::canonicalize(&child_path).await {
         Ok(p) => p,
-        Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
+        Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
     let symlink_out_of_the_share = !child_canonical.starts_with(&share_canonical);
@@ -237,7 +237,7 @@ pub async fn lookup_response(
 
     let handle = match handle_db.get_or_create_handle(&child_canonical).await {
         Ok(uuid) => uuid.as_bytes().to_vec(),
-        Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
+        Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
     let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db, chunker).await;
@@ -274,7 +274,14 @@ pub async fn readdir_response(
 
     let dir_canonical = match resolve(share, &dir_uuid, handle_db).await {
         Ok(p) => p,
-        Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
+        Err(e) => {
+            let code = e
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map(|io| io_err_kind_to_code(io.kind()))
+                .unwrap_or(ErrorCode::ErrorNotFound);
+            return readdir_error(code);
+        }
     };
 
     // Collect entries using async functional approach with tokio
@@ -379,15 +386,20 @@ fn async_stat<'a>(
     Box::pin(async move {
         let canonical = match resolve(share, &uuid, handle_db).await {
             Ok(p) => p,
-            Err(_) => {
-                return stat_error(ErrorCode::ErrorNotFound);
+            Err(e) => {
+                let code = e
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .map(|io| io_err_kind_to_code(io.kind()))
+                    .unwrap_or(ErrorCode::ErrorNotFound);
+                return stat_error(code);
             }
         };
 
         let meta = match tokio::fs::metadata(&canonical).await {
             Ok(m) => m,
-            Err(_) => {
-                return stat_error(ErrorCode::ErrorNotFound);
+            Err(e) => {
+                return stat_error(io_err_kind_to_code(e.kind()));
             }
         };
 
