@@ -153,6 +153,17 @@ struct MountFixture {
     _handle: fuse3::raw::MountHandle,
 }
 
+impl Drop for MountFixture {
+    fn drop(&mut self) {
+        // Explicit unmount to prevent mount accumulation on test failure/panic.
+        // Ignore errors - if unmount fails, the temp dir cleanup will handle it.
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(self.mount_point.path())
+            .output();
+    }
+}
+
 impl MountFixture {
     async fn new<R: RemoteShare + 'static>(remote: R, root_handle: Uuid) -> Self {
         let view = RiftShareView::new(Arc::new(remote), root_handle);
