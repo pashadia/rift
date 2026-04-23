@@ -1962,7 +1962,7 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
     // Generate 4KB of varied content — enough for 10+ chunks with TEST_CHUNKER (avg=256)
     let content: Vec<u8> = (0..128).flat_map(|i| {
         let pattern = format!("chunk_{:04x}_", i);
-        pattern.into_bytes().into_iter().chain(std::iter::repeat(i as u8).take(24))
+        pattern.into_bytes().into_iter().chain(std::iter::repeat_n(i as u8, 24))
     }).collect();
     std::fs::write(root.join("many_chunks.bin"), &content).unwrap();
 
@@ -2110,14 +2110,14 @@ async fn server_rejects_excessive_chunk_count() {
 }
 
 #[tokio::test]
-async fn server_returns_zero_chunks_for_start_chunk_past_end() {
-    use rift_protocol::messages::{lookup_response, msg, read_response, LookupRequest, ReadRequest, ReadResponse};
+async fn server_rejects_start_chunk_past_end() {
+    use rift_protocol::messages::{lookup_response, msg, ReadRequest};
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
-    // First lookup hello.txt to get its handle
+    // Lookup hello.txt (1 chunk)
     let mut stream = conn.open_stream().await.unwrap();
     let lookup_req = LookupRequest {
         parent_handle: root_handle,
@@ -2135,11 +2135,11 @@ async fn server_returns_zero_chunks_for_start_chunk_past_end() {
         _ => panic!("lookup failed"),
     };
 
-    // Send ReadRequest with start_chunk past the end of the file
+    // start_chunk past the only chunk → ErrorNotFound
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
-        start_chunk: 1000, // Way past end of a small file
+        start_chunk: 1000,
         chunk_count: 1,
     };
     stream
@@ -2149,12 +2149,12 @@ async fn server_returns_zero_chunks_for_start_chunk_past_end() {
     stream.finish_send().await.unwrap();
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
-    let response = ReadResponse::decode(&payload[..]).unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
-        Some(read_response::Result::Ok(success)) => {
-            assert_eq!(success.chunk_count, 0, "no chunks past end should return 0");
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(e.code, rift_protocol::messages::ErrorCode::ErrorNotFound as i32);
         }
-        other => panic!("expected success with 0 chunks, got: {:?}", other),
+        other => panic!("expected ErrorNotFound, got: {:?}", other),
     }
 }
 
@@ -2307,15 +2307,15 @@ async fn server_allows_read_at_last_valid_chunk() {
 }
 
 #[tokio::test]
-async fn server_returns_zero_chunks_at_exact_boundary() {
-    // start_chunk == chunk_count (1 for "hello rift") — no chunks to transfer
-    use rift_protocol::messages::{lookup_response, msg, read_response, LookupRequest, ReadRequest, ReadResponse};
+async fn server_rejects_read_at_exact_boundary() {
+    // start_chunk == chunk_count (1 for hello.txt) → ErrorNotFound
+    use rift_protocol::messages::{lookup_response, msg, ReadRequest};
 
     let (_dir, root) = helpers::make_share();
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
 
-    // Lookup hello.txt
+    // Lookup hello.txt (1 chunk)
     let mut stream = conn.open_stream().await.unwrap();
     let lookup_req = LookupRequest {
         parent_handle: root_handle,
@@ -2333,7 +2333,7 @@ async fn server_returns_zero_chunks_at_exact_boundary() {
         _ => panic!("lookup failed"),
     };
 
-    // start_chunk == 1 (== number of chunks) — no chunks at this offset
+    // start_chunk == 1 (== number of chunks) → no such chunk
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
@@ -2347,12 +2347,12 @@ async fn server_returns_zero_chunks_at_exact_boundary() {
     stream.finish_send().await.unwrap();
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
-    let response = ReadResponse::decode(&payload[..]).unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
-        Some(read_response::Result::Ok(success)) => {
-            assert_eq!(success.chunk_count, 0, "no chunks at boundary should return 0");
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(e.code, rift_protocol::messages::ErrorCode::ErrorNotFound as i32);
         }
-        other => panic!("expected success with 0 chunks, got: {:?}", other),
+        other => panic!("expected ErrorNotFound, got: {:?}", other),
     }
 }
 
@@ -2404,10 +2404,9 @@ async fn server_allows_read_with_chunk_count_zero() {
 }
 
 #[tokio::test]
-async fn server_read_empty_file_returns_zero_chunks() {
-    // An empty file has 0 chunks — reading it should return ReadSuccess { chunk_count: 0 },
-    // not an error. The client recreates the file by writing received chunks;
-    // zero chunks means an empty file.
+async fn server_rejects_read_on_empty_file() {
+    // An empty file has 0 chunks. No chunk index is valid, including 0.
+    // The client should know from stat that the file is empty.
     use rift_protocol::messages::{read_response, lookup_response, msg, LookupRequest, ReadRequest, ReadResponse};
 
     let (_dir, root) = helpers::make_share();
@@ -2433,7 +2432,7 @@ async fn server_read_empty_file_returns_zero_chunks() {
         _ => panic!("lookup failed"),
     };
 
-    // Read empty file — should return success with 0 chunks
+    // Read empty file with start_chunk=0 → ErrorNotFound
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
@@ -2449,10 +2448,10 @@ async fn server_read_empty_file_returns_zero_chunks() {
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let response = ReadResponse::decode(&payload[..]).unwrap();
     match response.result {
-        Some(read_response::Result::Ok(success)) => {
-            assert_eq!(success.chunk_count, 0, "empty file should have 0 chunks");
+        Some(read_response::Result::Error(e)) => {
+            assert_eq!(e.code, rift_protocol::messages::ErrorCode::ErrorNotFound as i32);
         }
-        other => panic!("expected success with 0 chunks for empty file, got: {:?}", other),
+        other => panic!("expected ErrorNotFound for empty file read, got: {:?}", other),
     }
 }
 
@@ -2472,7 +2471,7 @@ async fn setup_multi_chunk_file() -> (TempDir, PathBuf, Vec<u8>, usize) {
     // 4KB varied content → 16+ chunks with TEST_CHUNKER
     let content: Vec<u8> = (0..128).flat_map(|i| {
         let pattern = format!("data_{:04x}_", i);
-        pattern.into_bytes().into_iter().chain(std::iter::repeat(i as u8).take(16))
+        pattern.into_bytes().into_iter().chain(std::iter::repeat_n(i as u8, 16))
     }).collect();
     std::fs::write(root.join("multichunk.bin"), &content).unwrap();
     let chunks = TEST_CHUNKER.chunk(&content);
@@ -2505,14 +2504,14 @@ async fn lookup_file_handle(
 }
 
 #[tokio::test]
-async fn multi_chunk_start_chunk_at_exact_boundary_returns_zero_chunks() {
-    use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse};
+async fn multi_chunk_start_chunk_at_exact_boundary_returns_error() {
+    use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse, ErrorCode};
     let (_dir, root, _content, chunk_count) = setup_multi_chunk_file().await;
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
     let file_handle = lookup_file_handle(&conn, &root_handle, "multichunk.bin").await;
 
-    // start_chunk == number of chunks — no chunks at this offset
+    // start_chunk == number of chunks → ErrorNotFound
     let mut stream = conn.open_stream().await.unwrap();
     let req = ReadRequest {
         handle: file_handle,
@@ -2528,21 +2527,20 @@ async fn multi_chunk_start_chunk_at_exact_boundary_returns_zero_chunks() {
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let resp = ReadResponse::decode(&payload[..]).unwrap();
     match resp.result {
-        Some(read_response::Result::Ok(success)) => {
-            assert_eq!(success.chunk_count, 0, "no chunks at boundary should return 0");
+        Some(read_response::Result::Error(e)) => {
+            assert_eq!(e.code, ErrorCode::ErrorNotFound as i32);
         }
-        other => panic!("expected success with 0 chunks, got: {:?}", other),
+        other => panic!("expected ErrorNotFound, got: {:?}", other),
     }
 }
 
 #[tokio::test]
 async fn multi_chunk_start_chunk_at_last_valid_returns_data() {
     use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse};
-    let (_dir, root, content, chunk_count) = setup_multi_chunk_file().await;
+    let (_dir, root, _content, chunk_count) = setup_multi_chunk_file().await;
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
     let file_handle = lookup_file_handle(&conn, &root_handle, "multichunk.bin").await;
-    let chunk_boundaries = TEST_CHUNKER.chunk(&content);
 
     // start_chunk == last valid index should return exactly 1 chunk
     let last = (chunk_count - 1) as u32;
@@ -2570,11 +2568,10 @@ async fn multi_chunk_start_chunk_at_last_valid_returns_data() {
 #[tokio::test]
 async fn multi_chunk_requesting_more_than_available_returns_what_exists() {
     use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse};
-    let (_dir, root, content, chunk_count) = setup_multi_chunk_file().await;
+    let (_dir, root, _content, chunk_count) = setup_multi_chunk_file().await;
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
     let file_handle = lookup_file_handle(&conn, &root_handle, "multichunk.bin").await;
-    let chunk_boundaries = TEST_CHUNKER.chunk(&content);
 
     // Request 200 chunks from offset 3 — file has fewer than that.
     // Should silently truncate and return only the remaining chunks.
@@ -2607,7 +2604,7 @@ async fn multi_chunk_requesting_more_than_available_returns_what_exists() {
 #[tokio::test]
 async fn multi_chunk_read_all_from_offset_with_chunk_count_zero() {
     use rift_protocol::messages::{msg, read_response, ReadRequest, ReadResponse};
-    let (_dir, root, content, chunk_count) = setup_multi_chunk_file().await;
+    let (_dir, root, _content, chunk_count) = setup_multi_chunk_file().await;
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
     let file_handle = lookup_file_handle(&conn, &root_handle, "multichunk.bin").await;
