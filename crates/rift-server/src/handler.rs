@@ -13,7 +13,7 @@ use futures::FutureExt;
 use prost::Message as _;
 use tracing::instrument;
 
-use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
+use rift_common::crypto::{Blake3Hash, Chunker, MerkleChild, MerkleTree};
 use rift_protocol::messages::{
     lookup_response, msg, read_response, readdir_response, stat_result, BlockHeader, ChunkInfo,
     ErrorCode, ErrorDetail, FileAttrs, FileType, LookupRequest, LookupResponse, LookupResult,
@@ -155,6 +155,7 @@ pub async fn stat_response(
     share: &Path,
     db: Option<&Database>,
     handle_db: &HandleDatabase,
+    chunker: Chunker,
 ) -> StatResponse {
     let req = match StatRequest::decode(payload) {
         Ok(r) => r,
@@ -169,7 +170,7 @@ pub async fn stat_response(
         .handles
         .into_iter()
         .map(|handle_bytes| match Uuid::from_slice(&handle_bytes) {
-            Ok(uuid) => async_stat(share, handle_bytes, uuid, handle_db, db).boxed(),
+            Ok(uuid) => async_stat(share, handle_bytes, uuid, handle_db, db, chunker).boxed(),
             Err(_) => async { stat_error(ErrorCode::ErrorNotFound) }.boxed(),
         })
         .collect();
@@ -189,6 +190,7 @@ pub async fn lookup_response(
     share: &Path,
     db: Option<&Database>,
     handle_db: &HandleDatabase,
+    chunker: Chunker,
 ) -> LookupResponse {
     let req = match LookupRequest::decode(payload) {
         Ok(r) => r,
@@ -238,7 +240,7 @@ pub async fn lookup_response(
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
 
-    let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db).await;
+    let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db, chunker).await;
 
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
@@ -372,6 +374,7 @@ fn async_stat<'a>(
     uuid: Uuid,
     handle_db: &'a HandleDatabase,
     db: Option<&'a Database>,
+    chunker: Chunker,
 ) -> BoxFuture<'a, StatResult> {
     Box::pin(async move {
         let canonical = match resolve(share, &uuid, handle_db).await {
@@ -388,7 +391,7 @@ fn async_stat<'a>(
             }
         };
 
-        let root_hash = get_or_compute_merkle_root(&canonical, &meta, db).await;
+        let root_hash = get_or_compute_merkle_root(&canonical, &meta, db, chunker).await;
         StatResult {
             handle: handle_bytes,
             result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
@@ -417,8 +420,9 @@ async fn get_or_compute_merkle_root(
     path: &Path,
     meta: &std::fs::Metadata,
     db: Option<&Database>,
+    chunker: Chunker,
 ) -> Blake3Hash {
-    use rift_common::crypto::{Chunker, MerkleTree};
+    use rift_common::crypto::MerkleTree;
 
     if !meta.is_file() {
         return root_hash_for_type(true);
@@ -437,7 +441,6 @@ async fn get_or_compute_merkle_root(
         Err(_) => return root_hash_for_type(true),
     };
 
-    let chunker = Chunker::default();
     let chunk_boundaries = chunker.chunk(&content);
 
     let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
@@ -493,6 +496,7 @@ pub async fn read_response<S: RiftStream>(
     share: &Path,
     db: Option<&Database>,
     handle_db: &HandleDatabase,
+    chunker: Chunker,
 ) -> anyhow::Result<()> {
     let req = match ReadRequest::decode(payload) {
         Ok(r) => r,
@@ -567,8 +571,7 @@ pub async fn read_response<S: RiftStream>(
         }
     };
 
-    use rift_common::crypto::{Chunker, MerkleTree};
-    let chunker = Chunker::default();
+    use rift_common::crypto::MerkleTree;
     let chunk_boundaries = chunker.chunk(&content);
 
     // Validate chunk_count is within acceptable limits
@@ -697,6 +700,7 @@ pub async fn merkle_drill_response<S: RiftStream>(
     share: &Path,
     db: Option<&Database>,
     handle_db: &HandleDatabase,
+    chunker: Chunker,
 ) -> anyhow::Result<()> {
     // Helper: send empty response and finish
     async fn send_empty<S: RiftStream>(stream: &mut S) -> anyhow::Result<()> {
@@ -741,9 +745,6 @@ pub async fn merkle_drill_response<S: RiftStream>(
     };
 
     // 5. Build Merkle tree with cache
-    use rift_common::crypto::Chunker;
-
-    let chunker = Chunker::default();
     let chunk_boundaries = chunker.chunk(&content);
 
     let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
@@ -942,7 +943,7 @@ mod tests {
         };
         let payload = req.encode_to_vec();
 
-        let resp = stat_response(&payload, &share, None, &handle_db).await;
+        let resp = stat_response(&payload, &share, None, &handle_db, Chunker::default()).await;
 
         assert_eq!(resp.results.len(), 1);
         match &resp.results[0].result {
@@ -962,7 +963,7 @@ mod tests {
 
         // Garbage bytes that cannot decode as StatRequest
         let garbage = vec![0xFF, 0xFE, 0x00, 0xAB, 0xCD];
-        let resp = stat_response(&garbage, &share, None, &handle_db).await;
+        let resp = stat_response(&garbage, &share, None, &handle_db, Chunker::default()).await;
 
         // Malformed payload → decoder error → StatResponse { results: vec![] }
         assert_eq!(
@@ -993,7 +994,7 @@ mod tests {
         };
         let payload = req.encode_to_vec();
 
-        let resp = lookup_response(&payload, &share, None, &handle_db).await;
+        let resp = lookup_response(&payload, &share, None, &handle_db, Chunker::default()).await;
 
         match resp.result {
             Some(lookup_response::Result::Entry(entry)) => {
@@ -1019,7 +1020,7 @@ mod tests {
         };
         let payload = req.encode_to_vec();
 
-        let resp = lookup_response(&payload, &share, None, &handle_db).await;
+        let resp = lookup_response(&payload, &share, None, &handle_db, Chunker::default()).await;
 
         match resp.result {
             Some(lookup_response::Result::Error(_)) => {}
@@ -1034,7 +1035,7 @@ mod tests {
         let handle_db = HandleDatabase::new();
 
         let garbage = vec![0xFF, 0xAB, 0x00, 0x01, 0x02];
-        let resp = lookup_response(&garbage, &share, None, &handle_db).await;
+        let resp = lookup_response(&garbage, &share, None, &handle_db, Chunker::default()).await;
 
         // Must return an error variant, not panic
         match resp.result {
@@ -1180,6 +1181,7 @@ mod tests {
             &share_canonical,
             Some(&db),
             &handle_db,
+            Chunker::default(),
         )
         .await
         .unwrap();

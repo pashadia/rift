@@ -24,6 +24,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use tracing::{debug, debug_span, instrument, warn, Instrument};
 
+use rift_common::crypto::Chunker;
 use rift_protocol::messages::{msg, RiftHello, RiftWelcome, ShareInfo};
 use rift_transport::{
     send_welcome, RiftConnection, RiftListener, RiftStream, TransportError, RIFT_PROTOCOL_VERSION,
@@ -47,6 +48,7 @@ pub async fn accept_loop<L>(
     share: PathBuf,
     db: Arc<Option<Database>>,
     handle_db: Arc<HandleDatabase>,
+    chunker: Chunker,
 ) -> anyhow::Result<()>
 where
     L: RiftListener,
@@ -61,9 +63,10 @@ where
                 let handle_db = handle_db.clone();
                 let peer = conn.peer_fingerprint().to_string();
                 let conn_span = debug_span!("server.connection", peer = %peer);
+                let chunker = chunker;
                 tokio::spawn(
                     async move {
-                        serve_connection(conn, share, db, handle_db).await;
+                        serve_connection(conn, share, db, handle_db, chunker).await;
                     }
                     .instrument(conn_span),
                 );
@@ -81,12 +84,13 @@ where
 // Per-connection loop
 // ---------------------------------------------------------------------------
 
-#[instrument(skip(conn, share, db, handle_db), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
+#[instrument(skip(conn, share, db, handle_db, chunker), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
 async fn serve_connection<C>(
     conn: C,
     share: PathBuf,
     db: Arc<Option<Database>>,
     handle_db: Arc<HandleDatabase>,
+    chunker: Chunker,
 ) where
     C: RiftConnection,
     C::Stream: 'static,
@@ -102,10 +106,11 @@ async fn serve_connection<C>(
                 let share = share.clone();
                 let db = db.clone();
                 let handle_db = handle_db.clone();
+                let chunker = chunker;
                 let stream_span = debug_span!("server.stream", share = %share.display());
                 tokio::spawn(
                     async move {
-                        if let Err(e) = handle_stream(stream, share, db, handle_db).await {
+                        if let Err(e) = handle_stream(stream, share, db, handle_db, chunker).await {
                             debug!("stream error: {}", e);
                         }
                     }
@@ -130,6 +135,7 @@ async fn handle_stream<S>(
     share: PathBuf,
     db: Arc<Option<Database>>,
     handle_db: Arc<HandleDatabase>,
+    chunker: Chunker,
 ) -> anyhow::Result<()>
 where
     S: RiftStream,
@@ -196,7 +202,7 @@ where
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::stat_response(&payload, &share, db_ref, &handle_db).await;
+            let response = handler::stat_response(&payload, &share, db_ref, &handle_db, chunker).await;
             stream
                 .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -205,7 +211,7 @@ where
 
         msg::LOOKUP_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            let response = handler::lookup_response(&payload, &share, db_ref, &handle_db).await;
+            let response = handler::lookup_response(&payload, &share, db_ref, &handle_db, chunker).await;
             stream
                 .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -225,14 +231,14 @@ where
         // ------------------------------------------------------------------
         msg::READ_REQUEST => {
             let db_ref = db.as_ref().as_ref();
-            handler::read_response(&mut stream, &payload, &share, db_ref, &handle_db)
+            handler::read_response(&mut stream, &payload, &share, db_ref, &handle_db, chunker)
                 .await
                 .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
         }
 
         msg::MERKLE_DRILL => {
             let db_ref = db.as_ref().as_ref();
-            handler::merkle_drill_response(&mut stream, &payload, &share, db_ref, &handle_db)
+            handler::merkle_drill_response(&mut stream, &payload, &share, db_ref, &handle_db, chunker)
                 .await
                 .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
         }
@@ -282,7 +288,7 @@ mod tests {
         let (listener, connector) = InMemoryListener::new("test-server-fp", "test-client-fp");
         let db: Arc<Option<Database>> = Arc::new(None);
         let handle_db = Arc::new(HandleDatabase::new());
-        let handle = tokio::spawn(accept_loop(listener, share, db, handle_db));
+        let handle = tokio::spawn(accept_loop(listener, share, db, handle_db, Chunker::default()));
         (handle, connector)
     }
 

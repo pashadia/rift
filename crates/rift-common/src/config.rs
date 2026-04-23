@@ -1,5 +1,6 @@
 //! Configuration file parsing and types
 
+use crate::crypto::Chunker;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,6 +10,10 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    /// Chunker parameters for content-addressed chunking.
+    /// Defaults to production parameters (32/128/512 KB).
+    #[serde(default)]
+    pub chunker: Chunker,
     #[serde(default)]
     pub shares: Vec<ShareConfig>,
 }
@@ -19,6 +24,7 @@ impl Default for ServerConfig {
             listen_addr: "0.0.0.0:4433".to_string(),
             cert_path: None,
             key_path: None,
+            chunker: Chunker::default(),
             shares: Vec::new(),
         }
     }

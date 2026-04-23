@@ -40,11 +40,15 @@ impl AsRef<[u8]> for Blake3Hash {
     }
 }
 
-/// FastCDC chunker with Rift's default parameters (32/128/512 KB)
+/// FastCDC chunker with configurable parameters.
+///
+/// Defaults to production parameters (32/128/512 KB).
+/// Use [`Chunker::new`] with smaller values for testing.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Chunker {
-    min_size: usize,
-    avg_size: usize,
-    max_size: usize,
+    pub min_size: usize,
+    pub avg_size: usize,
+    pub max_size: usize,
 }
 
 impl Default for Chunker {

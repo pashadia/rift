@@ -39,8 +39,9 @@ pub async fn start_server(share: PathBuf) -> SocketAddr {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db: Arc<Option<rift_server::metadata::db::Database>> = Arc::new(None);
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
+        let chunker = rift_common::crypto::Chunker::new(64, 256, 1024);
         rt.block_on(async {
-            rift_server::server::accept_loop(listener, share, db, handle_db).await
+            rift_server::server::accept_loop(listener, share, db, handle_db, chunker).await
         })
     });
 
