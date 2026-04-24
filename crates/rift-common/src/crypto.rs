@@ -286,12 +286,17 @@ impl MerkleTree {
             })
             .collect();
 
-        // Fill in length field on leaf MerkleChild entries
+        // Fill in length field on leaf MerkleChild entries using O(1) hash lookup
+        let length_map: HashMap<&Blake3Hash, u64> = leaf_infos
+            .iter()
+            .map(|info| (&info.hash, info.length))
+            .collect();
+
         for children in cache.values_mut() {
             for child in children.iter_mut() {
                 if let MerkleChild::Leaf { hash, length, .. } = child {
-                    if let Some(info) = leaf_infos.iter().find(|info| info.hash == *hash) {
-                        *length = info.length;
+                    if let Some(&len) = length_map.get(hash) {
+                        *length = len;
                     }
                 }
             }
