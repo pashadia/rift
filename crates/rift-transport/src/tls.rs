@@ -290,6 +290,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use rustls::server::danger::ClientCertVerifier;
+
     use super::*;
 
     fn gen_cert(cn: &str) -> (Vec<u8>, Vec<u8>) {
@@ -346,5 +348,11 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let result = server_endpoint(addr, cert, key);
         assert!(result.is_err(), "expected Err for invalid cert bytes");
+    }
+
+    #[test]
+    fn accept_any_client_cert_verifier_mandates_client_auth() {
+        let verifier = AcceptAnyClientCertVerifier;
+        assert!(verifier.client_auth_mandatory());
     }
 }
