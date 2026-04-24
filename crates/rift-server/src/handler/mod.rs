@@ -111,6 +111,8 @@ pub async fn resolve(
     // the symlink target hasn't been swapped between Step 1 and the open.
     // On non-Linux, this is a no-op — the race window still exists but is
     // extremely narrow (microseconds).
+    let mut fd_resolved: Option<PathBuf> = None;
+
     #[cfg(target_os = "linux")]
     {
         // Only verify for files, not directories (directories can't be swapped
@@ -137,22 +139,35 @@ pub async fn resolve(
                     // If the fd resolves to a different path than our initial
                     // canonicalization, the file was replaced between our checks.
                     // Use the fd-canonical path which is guaranteed stable.
-                    let fd_resolved = fd_canonical;
-                    if fd_resolved != canonical {
+                    if fd_canonical != canonical {
                         tracing::warn!(
                             original = %canonical.display(),
-                            resolved = %fd_resolved.display(),
+                            resolved = %fd_canonical.display(),
                             "TOCTOU: file path changed between resolution and open, using fd-resolved path"
                         );
+                        fd_resolved = Some(fd_canonical);
                     }
-                    // Drop file — we just needed it for verification.
-                    drop(file);
                 }
+                // Drop file — we just needed it for verification.
+                drop(file);
             }
         }
     }
 
-    Ok(ResolvedPath { canonical })
+    Ok(ResolvedPath {
+        canonical: effective_path(canonical, fd_resolved),
+    })
+}
+
+/// Given an initially-canonicalized path and an optional fd-resolved path
+/// (from re-canonicalizing via /proc/self/fd/N), return the path that
+/// should be used for subsequent filesystem operations.
+///
+/// When fd_resolved is Some and differs from canonical, the fd-resolved
+/// path is returned (it is guaranteed stable since the fd was open).
+/// Otherwise, canonical is returned as-is.
+pub(crate) fn effective_path(canonical: PathBuf, fd_resolved: Option<PathBuf>) -> PathBuf {
+    fd_resolved.unwrap_or(canonical)
 }
 
 pub(crate) fn error_detail(
@@ -181,6 +196,46 @@ mod tests {
 
     use crate::handle::HandleDatabase;
 
+    // ── effective_path tests ──────────────────────────────────────────
+
+    #[test]
+    fn effective_path_returns_canonical_when_no_fd_resolved() {
+        let path = PathBuf::from("/share/file.txt");
+        let result = effective_path(path.clone(), None);
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn effective_path_returns_canonical_when_fd_resolved_matches() {
+        let path = PathBuf::from("/share/file.txt");
+        let result = effective_path(path.clone(), Some(path.clone()));
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn effective_path_returns_fd_resolved_when_different() {
+        let canonical = PathBuf::from("/share/old_target.txt");
+        let fd_resolved = PathBuf::from("/share/new_target.txt");
+        let result = effective_path(canonical, Some(fd_resolved.clone()));
+        assert_eq!(
+            result, fd_resolved,
+            "effective_path must prefer the fd-resolved path when it differs from canonical"
+        );
+    }
+
+    #[test]
+    fn effective_path_returns_fd_resolved_for_deeply_nested_mismatch() {
+        let canonical = PathBuf::from("/share/a/b/c/old.txt");
+        let fd_resolved = PathBuf::from("/share/a/b/c/new.txt");
+        let result = effective_path(canonical, Some(fd_resolved.clone()));
+        assert_eq!(
+            result, fd_resolved,
+            "effective_path must prefer the fd-resolved path regardless of path depth"
+        );
+    }
+
+    // ── resolve() integration tests ───────────────────────────────────
+
     #[tokio::test]
     async fn resolve_valid_handle_returns_correct_path() {
         let tmp = TempDir::new().unwrap();
@@ -203,5 +258,42 @@ mod tests {
         let unknown = Uuid::from_bytes([0x42; 16]);
         let result = resolve(tmp.path(), &unknown, &handle_db).await;
         assert!(result.is_err(), "unknown UUID must produce an error");
+    }
+
+    /// Directories are skipped in the TOCTOU fd check (directories cannot be
+    /// swapped with an outside symlink via rename).  The canonical path should
+    /// still be returned correctly.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn resolve_directory_uses_canonical_path() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let dir = share.join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&dir).await.unwrap();
+
+        let resolved = resolve(&share, &uuid, &handle_db).await.unwrap();
+
+        assert_eq!(resolved.canonical, dir.canonicalize().unwrap());
+    }
+
+    /// Baseline: a regular file with no TOCTOU race should return its canonical
+    /// path.  This mirrors the existing test but provides a baseline for the
+    /// refactored code.
+    #[tokio::test]
+    async fn resolve_file_uses_effective_path_even_without_toctou_race() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("file.txt");
+        std::fs::write(&file, b"content").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let resolved = resolve(&share, &uuid, &handle_db).await.unwrap();
+
+        assert_eq!(resolved.canonical, file.canonicalize().unwrap());
     }
 }
