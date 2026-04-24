@@ -162,6 +162,25 @@ impl MerkleTree {
         current_level.into_iter().next().unwrap()
     }
 
+    /// Verify that `parent_hash` matches the hash computed from `children`.
+    ///
+    /// Uses the same hashing scheme as `build()`: a single child is identity
+    /// (parent == child), while two or more children are BLAKE3-hashed together.
+    pub fn verify_node(parent_hash: &Blake3Hash, children: &[Blake3Hash]) -> bool {
+        if children.is_empty() {
+            return *parent_hash == Blake3Hash::new(&[]);
+        }
+        if children.len() == 1 {
+            return *parent_hash == children[0];
+        }
+        let mut hasher = Hasher::new();
+        for child in children {
+            hasher.update(child.as_bytes());
+        }
+        let computed = Blake3Hash(*hasher.finalize().as_bytes());
+        computed == *parent_hash
+    }
+
     /// Serialize leaf hashes into a packed byte array for storage.
     ///
     /// Each 32-byte hash is stored contiguously. No additional framing.
@@ -1169,5 +1188,111 @@ mod merkle_offset_tests {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for MerkleTree::verify_node (parent hash verification)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod verify_node_tests {
+    use super::*;
+
+    // Test 1: Single leaf — root == leaf hash (identity), verify_node returns true
+    #[test]
+    fn verify_node_single_leaf_identity() {
+        let leaf = Blake3Hash::new(b"single-leaf");
+        // For a single leaf, the root is the leaf itself
+        assert!(MerkleTree::verify_node(&leaf, std::slice::from_ref(&leaf)));
+    }
+
+    // Test 2: Two leaves — root == blake3(leaf0 || leaf1), verify_node returns true
+    #[test]
+    fn verify_node_two_leaves() {
+        let leaf0 = Blake3Hash::new(b"leaf-a");
+        let leaf1 = Blake3Hash::new(b"leaf-b");
+        let tree = MerkleTree::default();
+        let root = tree.build(&[leaf0.clone(), leaf1.clone()]);
+        assert!(MerkleTree::verify_node(&root, &[leaf0, leaf1]));
+    }
+
+    // Test 3: 64 leaves (exactly one fanout group) — verify_node returns true
+    #[test]
+    fn verify_node_64_leaves_one_fanout_group() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<Blake3Hash> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+        let root = tree.build(&leaves);
+        // The root is the hash of all 64 children
+        assert!(MerkleTree::verify_node(&root, &leaves));
+    }
+
+    // Test 4: 65 leaves (2 groups, root has 2 subtree children) — verify_node returns true
+    #[test]
+    fn verify_node_65_leaves_two_groups() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<Blake3Hash> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let root = tree.build(&leaves);
+
+        // Level 1 has 2 intermediate nodes
+        //   chunk_0 = hash(leaves[0..64])
+        //   chunk_1 = hash(leaves[64..65])
+        // Root = hash(chunk_0 || chunk_1)
+
+        // Compute chunk_0 and chunk_1
+        let mut hasher0 = blake3::Hasher::new();
+        for h in &leaves[0..64] {
+            hasher0.update(h.as_bytes());
+        }
+        let chunk0 = Blake3Hash(*hasher0.finalize().as_bytes());
+
+        let mut hasher1 = blake3::Hasher::new();
+        for h in &leaves[64..65] {
+            hasher1.update(h.as_bytes());
+        }
+        let chunk1 = Blake3Hash(*hasher1.finalize().as_bytes());
+
+        // Verify the root from 2 subtree children
+        assert!(MerkleTree::verify_node(&root, &[chunk0, chunk1]));
+    }
+
+    // Test 5: Tampered child hash — verify_node returns false
+    #[test]
+    fn verify_node_tampered_child_returns_false() {
+        let leaf0 = Blake3Hash::new(b"original-0");
+        let leaf1 = Blake3Hash::new(b"original-1");
+        let tree = MerkleTree::default();
+        let root = tree.build(&[leaf0.clone(), leaf1.clone()]);
+
+        // Tamper leaf1
+        let tampered = Blake3Hash::new(b"tampered-1");
+        assert_ne!(leaf1, tampered, "sanity: tampered hash must differ");
+        assert!(!MerkleTree::verify_node(&root, &[leaf0, tampered]));
+    }
+
+    // Test 6: Wrong parent hash — verify_node returns false
+    #[test]
+    fn verify_node_wrong_parent_returns_false() {
+        let leaf0 = Blake3Hash::new(b"some-leaf");
+        let leaf1 = Blake3Hash::new(b"other-leaf");
+        let tree = MerkleTree::default();
+        let root = tree.build(&[leaf0.clone(), leaf1.clone()]);
+
+        // Use a different parent hash
+        let wrong_parent = Blake3Hash::new(b"wrong-parent");
+        assert_ne!(root, wrong_parent, "sanity: wrong parent must differ");
+        assert!(!MerkleTree::verify_node(&wrong_parent, &[leaf0, leaf1]));
+    }
+
+    // Test 7: Single-leaf file — root == blake3(file_content), verify_node returns true
+    #[test]
+    fn verify_node_single_leaf_file_content() {
+        let file_content = b"hello world";
+        let leaf_hash = Blake3Hash::new(file_content);
+        // For a single-leaf file, root == leaf hash == blake3(file_content)
+        assert!(MerkleTree::verify_node(
+            &leaf_hash,
+            std::slice::from_ref(&leaf_hash)
+        ));
     }
 }
