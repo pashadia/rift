@@ -192,6 +192,12 @@ impl MerkleTree {
     ///
     /// The `cache` maps each intermediate node's hash to its children (as `MerkleChild`).
     /// Leaf nodes appear as `MerkleChild::Leaf` entries in the cache at the level above them.
+    /// Build the Merkle tree and return both the root hash and a cache of
+    /// internal nodes.
+    ///
+    /// **Caveat**: leaf `MerkleChild` entries produced by this method have
+    /// `length: 0`. Use [`build_with_cache_and_offsets`] instead, which
+    /// fills in correct lengths from chunk boundary data.
     ///
     /// Uses level-based leaf detection: nodes at the bottom level are always leaves,
     /// nodes at higher levels are always subtrees. This avoids any ambiguity from
