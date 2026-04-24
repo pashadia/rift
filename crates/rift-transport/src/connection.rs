@@ -541,4 +541,43 @@ mod recording_tests {
         assert_eq!(frames2[0].type_id, 0x20);
         assert_eq!(frames2[0].payload, b"client2");
     }
+
+    #[tokio::test]
+    async fn recording_stream_recv_frame_delegates() {
+        let (client, server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(client);
+
+        let mut recording_stream = recording.open_stream().await.unwrap();
+        let mut server_stream = server.accept_stream().await.unwrap();
+
+        // Peer sends a frame through the underlying in-memory connection.
+        server_stream
+            .send_frame(0xAB, b"mutant-killer")
+            .await
+            .unwrap();
+
+        // RecordingStream::recv_frame must delegate and return the exact frame.
+        let (type_id, payload) = recording_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, 0xAB);
+        assert_eq!(&payload[..], b"mutant-killer");
+    }
+
+    #[tokio::test]
+    async fn recording_stream_finish_send_delegates() {
+        let (client, server) = InMemoryConnection::pair();
+        let recording = RecordingConnection::new(client);
+
+        let mut recording_stream = recording.open_stream().await.unwrap();
+        let mut server_stream = server.accept_stream().await.unwrap();
+
+        // Close the send side via the RecordingStream wrapper.
+        recording_stream.finish_send().await.unwrap();
+
+        // The half-close must propagate so the peer sees None.
+        let next = server_stream.recv_frame().await.unwrap();
+        assert!(
+            next.is_none(),
+            "expected EOF after finish_send on RecordingStream"
+        );
+    }
 }
