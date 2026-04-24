@@ -2,6 +2,7 @@ use crate::cache::db::FileCache;
 use crate::handle::HandleCache;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
+use rift_common::crypto::Blake3Hash;
 use rift_common::FsError;
 use rift_protocol::messages::FileAttrs;
 use std::path::Path;
@@ -43,6 +44,23 @@ pub trait ShareView: Send + Sync + 'static {
     ) -> Result<Vec<u8>, FsError>;
 }
 
+/// A fully-resolved leaf node with verified metadata.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct ResolvedLeaf {
+    chunk_index: u32,
+    length: u64,
+    hash: Blake3Hash,
+}
+
+/// Result of recursively drilling into the Merkle tree.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct ResolvedMerkle {
+    root_hash: Blake3Hash,
+    leaves: Vec<ResolvedLeaf>,
+}
+
 /// The `RiftShareView` is the primary implementation of the `ShareView` trait.
 /// It resolves paths to UUID handles via a `HandleCache` and delegates
 /// protocol operations to a `RemoteShare`.
@@ -81,6 +99,71 @@ impl<R: RemoteShare> RiftShareView<R> {
         self.handles
             .get_by_path(Path::new(&relative))
             .ok_or(FsError::NotFound)
+    }
+
+    /// Recursively drills into the Merkle tree, verifying hashes at each level,
+    /// and returns all resolved leaf nodes sorted by chunk_index.
+    async fn resolve_merkle_tree(
+        &self,
+        handle: Uuid,
+        root_hash: &Blake3Hash,
+    ) -> Result<ResolvedMerkle, FsError> {
+        use rift_common::crypto::MerkleTree;
+
+        let drill = self
+            .remote
+            .merkle_drill(handle, &[])
+            .await
+            .map_err(|_| FsError::Io)?;
+
+        let root_hash_from_drill =
+            Blake3Hash::from_slice(&drill.parent_hash).map_err(|_| FsError::Io)?;
+
+        if root_hash_from_drill != *root_hash {
+            tracing::error!("merkle root hash mismatch");
+            return Err(FsError::Io);
+        }
+
+        let mut leaves = Vec::new();
+        let mut stack: Vec<(Blake3Hash, Vec<crate::client::MerkleChildInfo>)> =
+            vec![(root_hash_from_drill.clone(), drill.children)];
+
+        while let Some((parent_hash, children)) = stack.pop() {
+            let child_hashes: Vec<Blake3Hash> = children
+                .iter()
+                .filter_map(|c| Blake3Hash::from_slice(&c.hash).ok())
+                .collect();
+
+            if !MerkleTree::verify_node(&parent_hash, &child_hashes) {
+                tracing::error!("merkle verification failed at node");
+                return Err(FsError::Io);
+            }
+
+            for child in children {
+                let child_hash = Blake3Hash::from_slice(&child.hash).map_err(|_| FsError::Io)?;
+
+                if child.is_subtree {
+                    let drill = self
+                        .remote
+                        .merkle_drill(handle, &child.hash)
+                        .await
+                        .map_err(|_| FsError::Io)?;
+                    stack.push((child_hash, drill.children));
+                } else {
+                    leaves.push(ResolvedLeaf {
+                        chunk_index: child.chunk_index,
+                        length: child.length,
+                        hash: child_hash,
+                    });
+                }
+            }
+        }
+
+        leaves.sort_by_key(|l| l.chunk_index);
+        Ok(ResolvedMerkle {
+            root_hash: root_hash_from_drill,
+            leaves,
+        })
     }
 }
 
@@ -248,23 +331,28 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         let end = (offset + length).min(file_size);
 
-        let drill_result = self
-            .remote
-            .merkle_drill(handle, &[])
-            .await
-            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+        // Step 4: Recursively resolve the full Merkle tree, verifying hashes.
+        let root_hash = Blake3Hash::from_slice(&merkle_root).map_err(|_| FsError::Io)?;
 
-        // Build cumulative byte-start table from actual FastCDC chunk sizes.
-        // Children that are leaves have length; subtrees don't contribute to chunk sizes.
-        let mut chunk_starts: Vec<u64> = Vec::new();
+        let resolved = self.resolve_merkle_tree(handle, &root_hash).await?;
+
+        if resolved.leaves.is_empty() && file_size > 0 {
+            return Err(FsError::Io);
+        }
+
+        // Build chunk_starts from the complete sorted leaf list.
+        let mut chunk_starts: Vec<u64> = Vec::with_capacity(resolved.leaves.len() + 1);
         let mut acc = 0u64;
-        for child in &drill_result.children {
-            if !child.is_subtree {
-                chunk_starts.push(acc);
-                acc += child.length;
-            }
+        for leaf in &resolved.leaves {
+            chunk_starts.push(acc);
+            acc += leaf.length;
         }
         chunk_starts.push(acc); // sentinel = total file size
+
+        if acc != file_size {
+            tracing::error!("chunk_starts total {} != file_size {}", acc, file_size);
+            return Err(FsError::Io);
+        }
 
         let start_chunk = chunk_starts
             .partition_point(|&s| s <= offset)
@@ -281,6 +369,28 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .read_chunks(handle, start_chunk, chunk_count)
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+
+        // Step 5: Verify each chunk's hash and length.
+        for chunk in &read_result.chunks {
+            let computed = Blake3Hash::new(&chunk.data);
+            let expected = Blake3Hash::from_slice(&chunk.hash).map_err(|_| FsError::Io)?;
+            if computed != expected {
+                tracing::error!("chunk {} hash mismatch", chunk.index);
+                return Err(FsError::Io);
+            }
+            if chunk.data.len() as u64 != chunk.length {
+                tracing::error!("chunk {} length mismatch", chunk.index);
+                return Err(FsError::Io);
+            }
+        }
+
+        // Verify the Merkle root from TRANSFER_COMPLETE matches the expected root.
+        let computed_root =
+            Blake3Hash::from_slice(&read_result.merkle_root).map_err(|_| FsError::Io)?;
+        if computed_root != root_hash {
+            tracing::error!("transfer root hash mismatch");
+            return Err(FsError::Io);
+        }
 
         if let Some(ref cache) = self.cache {
             for chunk in &read_result.chunks {
@@ -357,7 +467,9 @@ mod tests {
     use super::*;
     use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
     use async_trait::async_trait;
+    use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
     use rift_protocol::messages::ReaddirEntry;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -367,7 +479,8 @@ mod tests {
         readdir_result: Mutex<Option<anyhow::Result<Vec<ReaddirEntry>>>>,
         stat_batch_result: Mutex<Option<anyhow::Result<Vec<Result<FileAttrs, FsError>>>>>,
         read_chunks_result: Mutex<Option<anyhow::Result<ChunkReadResult>>>,
-        merkle_drill_result: Mutex<Option<anyhow::Result<MerkleDrillResult>>>,
+        /// Map from hash (as Vec<u8>) to drill result. Empty Vec key = root drill.
+        merkle_drill_results: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
         read_chunks_called: Mutex<u32>,
         /// (start_chunk, chunk_count) from the most recent read_chunks call
         last_read_chunks_args: Mutex<Option<(u32, u32)>>,
@@ -381,7 +494,7 @@ mod tests {
                 readdir_result: Mutex::new(None),
                 stat_batch_result: Mutex::new(None),
                 read_chunks_result: Mutex::new(None),
-                merkle_drill_result: Mutex::new(None),
+                merkle_drill_results: Mutex::new(HashMap::new()),
                 read_chunks_called: Mutex::new(0),
                 last_read_chunks_args: Mutex::new(None),
             }
@@ -404,7 +517,14 @@ mod tests {
         }
 
         async fn set_merkle_drill(&self, result: anyhow::Result<MerkleDrillResult>) {
-            *self.merkle_drill_result.lock().await = Some(result);
+            // Backwards-compatible: stores as the root (empty hash) drill result
+            let drill = result.expect("set_merkle_drill requires Ok result; use set_merkle_drill_for_hash for error cases");
+            self.merkle_drill_results.lock().await.insert(vec![], drill);
+        }
+
+        /// Store a merkle_drill result keyed by hash. Empty Vec = root drill.
+        async fn set_merkle_drill_for_hash(&self, hash: Vec<u8>, result: MerkleDrillResult) {
+            self.merkle_drill_results.lock().await.insert(hash, result);
         }
 
         async fn get_read_chunks_call_count(&self) -> u32 {
@@ -467,13 +587,12 @@ mod tests {
         async fn merkle_drill(
             &self,
             _handle: Uuid,
-            _hash: &[u8],
+            hash: &[u8],
         ) -> anyhow::Result<MerkleDrillResult> {
-            self.merkle_drill_result
-                .lock()
-                .await
-                .take()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("no merkle_drill result set")))
+            let mut map = self.merkle_drill_results.lock().await;
+            map.remove(hash)
+                .or_else(|| map.remove(&vec![]))
+                .ok_or_else(|| anyhow::anyhow!("no merkle_drill result for hash {:?}", hash))
         }
     }
 
@@ -488,6 +607,41 @@ mod tests {
             gid: 1000,
             ..Default::default()
         }
+    }
+
+    /// Compute the BLAKE3 hash of data and return as [u8; 32].
+    fn blake3_of(data: &[u8]) -> [u8; 32] {
+        rift_common::crypto::Blake3Hash::new(data)
+            .as_bytes()
+            .to_owned()
+    }
+
+    /// Build self-consistent mock chunks from raw data vecs.
+    /// Returns (chunk_hashes, root_hash, chunk_data_vec).
+    /// Each chunk's hash = blake3(data), root = MerkleTree::build(hashes).
+    fn build_mock_chunks(chunks_data: Vec<Vec<u8>>) -> (Vec<[u8; 32]>, [u8; 32], Vec<ChunkData>) {
+        use rift_common::crypto::MerkleTree;
+        let chunk_hashes: Vec<[u8; 32]> = chunks_data.iter().map(|d| blake3_of(d)).collect();
+        let blake_hashes: Vec<_> = chunk_hashes
+            .iter()
+            .map(|h| rift_common::crypto::Blake3Hash::from_array(*h))
+            .collect();
+        let tree = MerkleTree::default();
+        let root = tree.build(&blake_hashes);
+        let root_hash = *root.as_bytes();
+
+        let chunk_data: Vec<ChunkData> = chunks_data
+            .iter()
+            .enumerate()
+            .map(|(i, d)| ChunkData {
+                index: i as u32,
+                length: d.len() as u64,
+                hash: chunk_hashes[i],
+                data: d.clone(),
+            })
+            .collect();
+
+        (chunk_hashes, root_hash, chunk_data)
     }
 
     #[tokio::test]
@@ -598,8 +752,10 @@ mod tests {
         view.handles
             .insert(std::path::PathBuf::from("test_file"), file_uuid);
 
-        let root_hash = [0xAB; 32];
         let content = b"hello world";
+        let chunk_hash = blake3_of(content);
+        // Single-chunk file: root hash == chunk hash
+        let root_hash = chunk_hash;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(
@@ -612,7 +768,7 @@ mod tests {
                 parent_hash: root_hash.to_vec(),
                 children: vec![MerkleChildInfo {
                     is_subtree: false,
-                    hash: root_hash.to_vec(),
+                    hash: chunk_hash.to_vec(),
                     length: content.len() as u64,
                     chunk_index: 0,
                 }],
@@ -623,7 +779,7 @@ mod tests {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
-                    hash: root_hash,
+                    hash: chunk_hash,
                     data: content.to_vec(),
                 }],
                 merkle_root: root_hash.to_vec(),
@@ -648,10 +804,14 @@ mod tests {
     /// Read offset=120, length=50 must request start_chunk=1 from the server — not chunk 0.
     #[tokio::test]
     async fn read_requests_correct_start_chunk_index_from_server() {
-        let chunk0_hash = [0x10u8; 32];
-        let chunk1_hash = [0x11u8; 32];
-        let chunk2_hash = [0x12u8; 32];
-        let root_hash = [0xABu8; 32];
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let chunk2_data = vec![0xCCu8; 150];
+        let (chunk_hashes, root_hash, _) = build_mock_chunks(vec![
+            chunk0_data.clone(),
+            chunk1_data.clone(),
+            chunk2_data.clone(),
+        ]);
         let sizes = [100u64, 200, 150];
         let file_size: u64 = sizes.iter().sum();
 
@@ -668,23 +828,23 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: vec![0u8; 32],
+                parent_hash: root_hash.to_vec(),
                 children: vec![
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk0_hash.to_vec(),
+                        hash: chunk_hashes[0].to_vec(),
                         length: sizes[0],
                         chunk_index: 0,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk1_hash.to_vec(),
+                        hash: chunk_hashes[1].to_vec(),
                         length: sizes[1],
                         chunk_index: 1,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk2_hash.to_vec(),
+                        hash: chunk_hashes[2].to_vec(),
                         length: sizes[2],
                         chunk_index: 2,
                     },
@@ -696,8 +856,8 @@ mod tests {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
-                    hash: chunk1_hash,
-                    data: vec![0xBBu8; 200],
+                    hash: chunk_hashes[1],
+                    data: chunk1_data,
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -755,9 +915,10 @@ mod tests {
     /// POSIX read(2): a short return at EOF is correct, not an error.
     #[tokio::test]
     async fn read_length_clamped_to_file_end() {
-        let chunk0_hash = [0x10u8; 32];
-        let chunk1_hash = [0x11u8; 32];
-        let root_hash = [0xABu8; 32];
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data: Vec<u8> = (0u8..200u8).collect();
+        let (chunk_hashes, root_hash, _) =
+            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
         let sizes = [100u64, 200];
         let file_size: u64 = sizes.iter().sum(); // 300
 
@@ -772,31 +933,29 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: vec![0u8; 32],
+                parent_hash: root_hash.to_vec(),
                 children: vec![
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk0_hash.to_vec(),
+                        hash: chunk_hashes[0].to_vec(),
                         length: sizes[0],
                         chunk_index: 0,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk1_hash.to_vec(),
+                        hash: chunk_hashes[1].to_vec(),
                         length: sizes[1],
                         chunk_index: 1,
                     },
                 ],
             }))
             .await;
-        // chunk1 has sequential bytes so we can verify the slice position
-        let chunk1_data: Vec<u8> = (0u8..200u8).collect();
         remote
             .set_read_chunks(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
-                    hash: chunk1_hash,
+                    hash: chunk_hashes[1],
                     data: chunk1_data.clone(),
                 }],
                 merkle_root: root_hash.to_vec(),
@@ -829,12 +988,12 @@ mod tests {
     /// For sizes=[100, 200, 150] the stored offsets must be [0, 100, 300].
     #[tokio::test]
     async fn manifest_cache_stores_actual_chunk_byte_offsets() {
-        let chunk0_hash = [0x10u8; 32];
-        let chunk1_hash = [0x11u8; 32];
-        let chunk2_hash = [0x12u8; 32];
-        let root_hash = [0xABu8; 32];
-        let sizes = [100u64, 200, 150];
-        let file_size: u64 = sizes.iter().sum();
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let chunk2_data = vec![0xCCu8; 150];
+        let (chunk_hashes, root_hash, all_chunks) =
+            build_mock_chunks(vec![chunk0_data, chunk1_data, chunk2_data]);
+        let file_size: u64 = 100 + 200 + 150;
 
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("cache");
@@ -854,46 +1013,32 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: vec![0u8; 32],
+                parent_hash: root_hash.to_vec(),
                 children: vec![
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk0_hash.to_vec(),
-                        length: sizes[0],
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
                         chunk_index: 0,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk1_hash.to_vec(),
-                        length: sizes[1],
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
                         chunk_index: 1,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[2].to_vec(),
+                        length: 150,
+                        chunk_index: 2,
                     },
                 ],
             }))
             .await;
-        // Simulating a read that spans chunks 0, 1, 2 (whole file).
         remote
             .set_read_chunks(Ok(ChunkReadResult {
-                chunks: vec![
-                    ChunkData {
-                        index: 0,
-                        length: 100,
-                        hash: chunk0_hash,
-                        data: vec![0xAAu8; 100],
-                    },
-                    ChunkData {
-                        index: 1,
-                        length: 200,
-                        hash: chunk1_hash,
-                        data: vec![0xBBu8; 200],
-                    },
-                    ChunkData {
-                        index: 2,
-                        length: 150,
-                        hash: chunk2_hash,
-                        data: vec![0xCCu8; 150],
-                    },
-                ],
+                chunks: all_chunks,
                 merkle_root: root_hash.to_vec(),
             }))
             .await;
@@ -928,11 +1073,11 @@ mod tests {
     /// start_offset must be 0, and only chunk 1 should be requested.
     #[tokio::test]
     async fn read_starting_at_exact_chunk_boundary() {
-        let chunk0_hash = [0x10u8; 32];
-        let chunk1_hash = [0x11u8; 32];
-        let root_hash = [0xABu8; 32];
-        let sizes = [100u64, 200];
-        let file_size: u64 = sizes.iter().sum();
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let (chunk_hashes, root_hash, _) =
+            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+        let file_size: u64 = 100 + 200;
 
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
@@ -945,31 +1090,30 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: vec![0u8; 32],
+                parent_hash: root_hash.to_vec(),
                 children: vec![
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk0_hash.to_vec(),
-                        length: sizes[0],
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
                         chunk_index: 0,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk1_hash.to_vec(),
-                        length: sizes[1],
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
                         chunk_index: 1,
                     },
                 ],
             }))
             .await;
-        // Return 0xBB for the first 10 bytes of chunk 1
         remote
             .set_read_chunks(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
-                    hash: chunk1_hash,
-                    data: vec![0xBBu8; 200],
+                    hash: chunk_hashes[1],
+                    data: chunk1_data,
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -998,13 +1142,11 @@ mod tests {
     /// read_chunks must be called with start_chunk=0, chunk_count=2.
     #[tokio::test]
     async fn read_spanning_two_chunks_assembles_data_correctly() {
-        // chunk0: bytes 0..99 with value 0xAA
-        // chunk1: bytes 100..299 with value 0xBB
-        let chunk0_hash = [0x10u8; 32];
-        let chunk1_hash = [0x11u8; 32];
-        let root_hash = [0xABu8; 32];
-        let sizes = [100u64, 200];
-        let file_size: u64 = sizes.iter().sum();
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let (chunk_hashes, root_hash, all_chunks) =
+            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+        let file_size: u64 = 100 + 200;
 
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
@@ -1019,18 +1161,18 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: vec![0u8; 32],
+                parent_hash: root_hash.to_vec(),
                 children: vec![
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk0_hash.to_vec(),
-                        length: sizes[0],
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
                         chunk_index: 0,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk1_hash.to_vec(),
-                        length: sizes[1],
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
                         chunk_index: 1,
                     },
                 ],
@@ -1038,20 +1180,7 @@ mod tests {
             .await;
         remote
             .set_read_chunks(Ok(ChunkReadResult {
-                chunks: vec![
-                    ChunkData {
-                        index: 0,
-                        length: 100,
-                        hash: chunk0_hash,
-                        data: vec![0xAAu8; 100],
-                    },
-                    ChunkData {
-                        index: 1,
-                        length: 200,
-                        hash: chunk1_hash,
-                        data: vec![0xBBu8; 200],
-                    },
-                ],
+                chunks: all_chunks,
                 merkle_root: root_hash.to_vec(),
             }))
             .await;
@@ -1084,16 +1213,12 @@ mod tests {
     /// Broken:   start_offset = 120 % 131072 = 120 →  chunk1_data[120..170]  (wrong bytes)
     #[tokio::test]
     async fn read_offset_within_second_chunk_returns_correct_bytes() {
-        // chunk 1 has recognisable byte values: byte[i] == i as u8
+        let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data: Vec<u8> = (0u8..=199u8).collect();
-
-        let chunk0_hash = [0x10u8; 32];
-        let chunk1_hash = [0x11u8; 32];
-        let root_hash = [0xABu8; 32];
-
-        // sizes: chunk0=100, chunk1=200, chunk2=150  →  total=450
-        let sizes = [100u64, 200, 150];
-        let file_size: u64 = sizes.iter().sum();
+        let (chunk_hashes, root_hash, _) =
+            build_mock_chunks(vec![chunk0_data, chunk1_data.clone()]);
+        // sizes: chunk0=100, chunk1=200  →  total=300
+        let file_size: u64 = 100 + 200;
 
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
@@ -1108,30 +1233,29 @@ mod tests {
             .await;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: vec![0u8; 32],
+                parent_hash: root_hash.to_vec(),
                 children: vec![
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk0_hash.to_vec(),
-                        length: sizes[0],
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
                         chunk_index: 0,
                     },
                     MerkleChildInfo {
                         is_subtree: false,
-                        hash: chunk1_hash.to_vec(),
-                        length: sizes[1],
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
                         chunk_index: 1,
                     },
                 ],
             }))
             .await;
-        // The fixed code requests only chunk 1; return it regardless of index params.
         remote
             .set_read_chunks(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
-                    hash: chunk1_hash,
+                    hash: chunk_hashes[1],
                     data: chunk1_data.clone(),
                 }],
                 merkle_root: root_hash.to_vec(),
@@ -1160,5 +1284,797 @@ mod tests {
 
         let result = view.read(Path::new("nonexistent"), 0, 1024, None).await;
         assert!(matches!(result, Err(FsError::NotFound)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 6: MockRemote must support multiple merkle_drill calls by hash.
+    // The old take()-based design allowed only one call; this test verifies
+    // that we can drill root (empty hash) then a subtree child.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn mock_remote_merkle_drill_supports_multiple_calls_by_hash() {
+        let remote = MockRemote::new();
+        let handle = Uuid::now_v7();
+
+        let root_hash = vec![0xAB; 32];
+        let subtree_hash = vec![0xCD; 32];
+
+        // Root drill result
+        let root_drill = MerkleDrillResult {
+            parent_hash: root_hash.clone(),
+            children: vec![MerkleChildInfo {
+                is_subtree: true,
+                hash: subtree_hash.clone(),
+                length: 0,
+                chunk_index: 0,
+            }],
+        };
+
+        // Subtree drill result
+        let subtree_drill = MerkleDrillResult {
+            parent_hash: subtree_hash.clone(),
+            children: vec![MerkleChildInfo {
+                is_subtree: false,
+                hash: vec![0xEE; 32],
+                length: 500,
+                chunk_index: 0,
+            }],
+        };
+
+        remote.set_merkle_drill_for_hash(vec![], root_drill).await;
+        remote
+            .set_merkle_drill_for_hash(subtree_hash.clone(), subtree_drill)
+            .await;
+
+        // First call: drill root (empty hash)
+        let result1 = remote
+            .merkle_drill(handle, &[])
+            .await
+            .expect("root drill should succeed");
+        assert_eq!(result1.parent_hash, root_hash);
+        assert_eq!(result1.children.len(), 1);
+        assert!(result1.children[0].is_subtree);
+
+        // Second call: drill the subtree child
+        let result2 = remote
+            .merkle_drill(handle, &subtree_hash)
+            .await
+            .expect("subtree drill should succeed");
+        assert_eq!(result2.parent_hash, subtree_hash);
+        assert_eq!(result2.children.len(), 1);
+        assert!(!result2.children[0].is_subtree);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: ResolvedLeaf and ResolvedMerkle types must exist
+    // and be constructible with the expected fields.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn resolved_merkle_holds_root_hash_and_sorted_leaves() {
+        use rift_common::crypto::Blake3Hash;
+
+        let leaf0 = ResolvedLeaf {
+            chunk_index: 0,
+            length: 100,
+            hash: Blake3Hash::from_array([0x10; 32]),
+        };
+        let leaf1 = ResolvedLeaf {
+            chunk_index: 1,
+            length: 200,
+            hash: Blake3Hash::from_array([0x11; 32]),
+        };
+
+        let resolved = ResolvedMerkle {
+            root_hash: Blake3Hash::from_array([0xAB; 32]),
+            leaves: vec![leaf0, leaf1],
+        };
+
+        assert_eq!(resolved.leaves.len(), 2);
+        assert_eq!(resolved.root_hash, Blake3Hash::from_array([0xAB; 32]));
+        assert_eq!(resolved.leaves[0].chunk_index, 0);
+        assert_eq!(resolved.leaves[1].length, 200);
+    }
+
+    // =======================================================================
+    // resolve_merkle_tree tests (Step 3)
+    // =======================================================================
+
+    /// Empty file (0 leaves) -> resolve returns empty leaves
+    #[tokio::test]
+    async fn resolve_merkle_tree_empty_file_returns_empty() {
+        use rift_common::crypto::Blake3Hash;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        // Build a real Merkle tree from 0 leaves
+        // Empty file root hash is hash of empty data
+        let root_hash = Blake3Hash::new(&[]);
+
+        // Root drill returns empty children
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash.as_bytes().to_vec(),
+                    children: vec![],
+                },
+            )
+            .await;
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &root_hash).await;
+        assert!(result.is_ok(), "empty file should resolve successfully");
+        let resolved = result.unwrap();
+        assert!(
+            resolved.leaves.is_empty(),
+            "empty file should have zero leaves"
+        );
+    }
+
+    /// One leaf (single-chunk file) -> resolves correctly
+    #[tokio::test]
+    async fn resolve_merkle_tree_single_leaf_resolves() {
+        use rift_common::crypto::{Blake3Hash, MerkleTree};
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        let leaf_data = b"hello world";
+        let leaf_hash = Blake3Hash::new(leaf_data);
+        let leaf_length = leaf_data.len() as u64;
+
+        let tree = MerkleTree::new(64);
+        let root_hash = tree.build(std::slice::from_ref(&leaf_hash));
+
+        // Root drill returns this leaf as a direct child
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash.as_bytes().to_vec(),
+                    children: vec![MerkleChildInfo {
+                        is_subtree: false,
+                        hash: leaf_hash.as_bytes().to_vec(),
+                        length: leaf_length,
+                        chunk_index: 0,
+                    }],
+                },
+            )
+            .await;
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &root_hash).await;
+        assert!(result.is_ok(), "single leaf should resolve successfully");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.leaves.len(), 1);
+        assert_eq!(resolved.leaves[0].chunk_index, 0);
+        assert_eq!(resolved.leaves[0].length, leaf_length);
+    }
+
+    /// 21 leaves (all at root, < fanout of 64)
+    #[tokio::test]
+    async fn resolve_merkle_tree_21_leaves_flat() {
+        use rift_common::crypto::{Blake3Hash, MerkleTree};
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        let n = 21;
+        let leaf_hashes: Vec<Blake3Hash> = (0..n).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let tree = MerkleTree::new(64);
+        let root_hash = tree.build(&leaf_hashes);
+
+        let mut children = Vec::new();
+        for i in 0..n {
+            children.push(MerkleChildInfo {
+                is_subtree: false,
+                hash: leaf_hashes[i as usize].as_bytes().to_vec(),
+                length: 100,
+                chunk_index: i,
+            });
+        }
+
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash.as_bytes().to_vec(),
+                    children,
+                },
+            )
+            .await;
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &root_hash).await;
+        assert!(result.is_ok(), "21 leaves should resolve");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.leaves.len(), 21);
+        // Check sorted by chunk_index
+        for (i, leaf) in resolved.leaves.iter().enumerate() {
+            assert_eq!(leaf.chunk_index, i as u32);
+        }
+    }
+
+    /// 67 leaves (with subtrees at root) — exercises recursive drilling.
+    /// With fanout=64, 67 leaves means the root has 2 children:
+    ///   - subtree for leaves 0..63
+    ///   - subtree for leaf 64..66
+    #[tokio::test]
+    async fn resolve_merkle_tree_67_leaves_with_subtrees() {
+        use rift_common::crypto::{Blake3Hash, MerkleTree};
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        let n = 67;
+        let leaf_hashes: Vec<Blake3Hash> = (0..n)
+            .map(|i| Blake3Hash::new(&(i as u64).to_le_bytes()))
+            .collect();
+        let tree = MerkleTree::new(64);
+        let (root_hash, cache) = tree.build_with_cache(&leaf_hashes);
+
+        // Set up merkle_drill for root and each subtree
+        let root_children = cache.get(&root_hash).expect("root should be in cache");
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash.as_bytes().to_vec(),
+                    children: root_children
+                        .iter()
+                        .map(|c| match c {
+                            MerkleChild::Subtree(h) => MerkleChildInfo {
+                                is_subtree: true,
+                                hash: h.as_bytes().to_vec(),
+                                length: 0,
+                                chunk_index: 0,
+                            },
+                            MerkleChild::Leaf {
+                                hash,
+                                length,
+                                chunk_index,
+                            } => MerkleChildInfo {
+                                is_subtree: false,
+                                hash: hash.as_bytes().to_vec(),
+                                length: *length,
+                                chunk_index: *chunk_index,
+                            },
+                        })
+                        .collect(),
+                },
+            )
+            .await;
+
+        // Set up drill for each subtree
+        for child in root_children {
+            if let MerkleChild::Subtree(subtree_hash) = child {
+                let sub_children = cache.get(subtree_hash).expect("subtree should be in cache");
+                remote
+                    .set_merkle_drill_for_hash(
+                        subtree_hash.as_bytes().to_vec(),
+                        MerkleDrillResult {
+                            parent_hash: subtree_hash.as_bytes().to_vec(),
+                            children: sub_children
+                                .iter()
+                                .map(|c| match c {
+                                    MerkleChild::Leaf {
+                                        hash,
+                                        length,
+                                        chunk_index,
+                                    } => MerkleChildInfo {
+                                        is_subtree: false,
+                                        hash: hash.as_bytes().to_vec(),
+                                        length: *length,
+                                        chunk_index: *chunk_index,
+                                    },
+                                    MerkleChild::Subtree(_) => {
+                                        // In a deeper tree this would be another subtree,
+                                        // but with 67 leaves and fanout 64, this won't happen
+                                        panic!("unexpected deeper subtree");
+                                    }
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await;
+            }
+        }
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &root_hash).await;
+        assert!(result.is_ok(), "67 leaves with subtrees should resolve");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.leaves.len(), 67, "should resolve all 67 leaves");
+        // Check sorted by chunk_index
+        for (i, leaf) in resolved.leaves.iter().enumerate() {
+            assert_eq!(leaf.chunk_index, i as u32);
+        }
+    }
+
+    /// Wrong child hash -> FsError::Io
+    #[tokio::test]
+    async fn resolve_merkle_tree_wrong_child_hash_returns_io_error() {
+        use rift_common::crypto::{Blake3Hash, MerkleTree};
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        let leaf0_hash = Blake3Hash::new(b"leaf0");
+        let leaf1_hash = Blake3Hash::new(b"leaf1");
+        let tree = MerkleTree::new(64);
+        let root_hash = tree.build(&[leaf0_hash.clone(), leaf1_hash.clone()]);
+
+        // Tamper with leaf1's hash in the drill result
+        let wrong_hash = Blake3Hash::new(b"wrong");
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash.as_bytes().to_vec(),
+                    children: vec![
+                        MerkleChildInfo {
+                            is_subtree: false,
+                            hash: leaf0_hash.as_bytes().to_vec(),
+                            length: 100,
+                            chunk_index: 0,
+                        },
+                        MerkleChildInfo {
+                            is_subtree: false,
+                            // Wrong hash!
+                            hash: wrong_hash.as_bytes().to_vec(),
+                            length: 100,
+                            chunk_index: 1,
+                        },
+                    ],
+                },
+            )
+            .await;
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &root_hash).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "wrong child hash should return FsError::Io, got {:?}",
+            result
+        );
+    }
+
+    /// Wrong parent hash (drill returns a different parent than root) -> FsError::Io
+    #[tokio::test]
+    async fn resolve_merkle_tree_wrong_parent_hash_returns_io_error() {
+        use rift_common::crypto::Blake3Hash;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        let real_root_hash = Blake3Hash::from_array([0xAB; 32]);
+        let wrong_parent_hash = Blake3Hash::from_array([0xCD; 32]);
+
+        // The drill returns parent_hash that doesn't match the expected root_hash
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: wrong_parent_hash.as_bytes().to_vec(),
+                    children: vec![],
+                },
+            )
+            .await;
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &real_root_hash).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "wrong root hash should return FsError::Io, got {:?}",
+            result
+        );
+    }
+
+    /// Mock receives correct drill calls: first empty hash (root), then subtree hashes
+    #[tokio::test]
+    async fn resolve_merkle_tree_makes_correct_drill_calls() {
+        use rift_common::crypto::{Blake3Hash, MerkleTree};
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+
+        let n = 67;
+        let leaf_hashes: Vec<Blake3Hash> = (0..n)
+            .map(|i| Blake3Hash::new(&(i as u64).to_le_bytes()))
+            .collect();
+        let tree = MerkleTree::new(64);
+        let (root_hash, cache) = tree.build_with_cache(&leaf_hashes);
+
+        // Track which hashes get drilled
+
+        // Set up drills using real Merkle tree data
+        let root_children = cache.get(&root_hash).unwrap();
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash.as_bytes().to_vec(),
+                    children: root_children
+                        .iter()
+                        .map(|c| match c {
+                            MerkleChild::Subtree(h) => MerkleChildInfo {
+                                is_subtree: true,
+                                hash: h.as_bytes().to_vec(),
+                                length: 0,
+                                chunk_index: 0,
+                            },
+                            MerkleChild::Leaf {
+                                hash,
+                                length,
+                                chunk_index,
+                            } => MerkleChildInfo {
+                                is_subtree: false,
+                                hash: hash.as_bytes().to_vec(),
+                                length: *length,
+                                chunk_index: *chunk_index,
+                            },
+                        })
+                        .collect(),
+                },
+            )
+            .await;
+
+        for child in root_children {
+            if let MerkleChild::Subtree(subtree_hash) = child {
+                let sub_children = cache.get(subtree_hash).unwrap();
+                remote
+                    .set_merkle_drill_for_hash(
+                        subtree_hash.as_bytes().to_vec(),
+                        MerkleDrillResult {
+                            parent_hash: subtree_hash.as_bytes().to_vec(),
+                            children: sub_children
+                                .iter()
+                                .map(|c| match c {
+                                    MerkleChild::Leaf {
+                                        hash,
+                                        length,
+                                        chunk_index,
+                                    } => MerkleChildInfo {
+                                        is_subtree: false,
+                                        hash: hash.as_bytes().to_vec(),
+                                        length: *length,
+                                        chunk_index: *chunk_index,
+                                    },
+                                    MerkleChild::Subtree(_) => {
+                                        panic!("unexpected deeper subtree");
+                                    }
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await;
+            }
+        }
+
+        let view = RiftShareView::new(remote.clone(), root);
+        let handle = Uuid::now_v7();
+        let result = view.resolve_merkle_tree(handle, &root_hash).await;
+        assert!(result.is_ok(), "should resolve successfully");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.leaves.len(), 67);
+    }
+
+    // =======================================================================
+    // Steps 4+5: read() with subtree resolution and hash verification
+    // =======================================================================
+
+    /// Read a file with 67+ chunks (requiring subtrees in the Merkle tree)
+    /// and verify the data is correctly assembled.
+    #[tokio::test]
+    async fn read_with_subtrees_resolves_all_chunks_correctly() {
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root_uuid);
+
+        let n = 67u32;
+        let chunk_size: u64 = 128 * 1024; // 128 KB per chunk
+        let file_size = chunk_size * n as u64;
+
+        // Build the Merkle tree from actual chunk-data hashes
+        let chunk_data_vecs: Vec<Vec<u8>> =
+            (0..n).map(|i| vec![i as u8; chunk_size as usize]).collect();
+        let leaf_hashes: Vec<Blake3Hash> = chunk_data_vecs
+            .iter()
+            .map(|data| Blake3Hash::new(data))
+            .collect();
+        let chunk_lengths: Vec<(usize, usize)> = (0..n as usize)
+            .map(|i| (i * chunk_size as usize, chunk_size as usize))
+            .collect();
+        let tree = MerkleTree::new(64);
+        let (root_hash_val, cache, _leaf_infos) =
+            tree.build_with_cache_and_offsets(&leaf_hashes, &chunk_lengths);
+
+        // Set up merkle_drill for root
+        let root_children = cache.get(&root_hash_val).unwrap();
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash_val.as_bytes().to_vec(),
+                    children: root_children
+                        .iter()
+                        .map(|c| match c {
+                            MerkleChild::Subtree(h) => MerkleChildInfo {
+                                is_subtree: true,
+                                hash: h.as_bytes().to_vec(),
+                                length: 0,
+                                chunk_index: 0,
+                            },
+                            MerkleChild::Leaf {
+                                hash,
+                                length,
+                                chunk_index,
+                            } => MerkleChildInfo {
+                                is_subtree: false,
+                                hash: hash.as_bytes().to_vec(),
+                                length: *length,
+                                chunk_index: *chunk_index,
+                            },
+                        })
+                        .collect(),
+                },
+            )
+            .await;
+
+        // Set up drill for each subtree
+        for child in root_children {
+            if let MerkleChild::Subtree(subtree_hash) = child {
+                let sub_children = cache.get(subtree_hash).unwrap();
+                remote
+                    .set_merkle_drill_for_hash(
+                        subtree_hash.as_bytes().to_vec(),
+                        MerkleDrillResult {
+                            parent_hash: subtree_hash.as_bytes().to_vec(),
+                            children: sub_children
+                                .iter()
+                                .map(|c| match c {
+                                    MerkleChild::Leaf {
+                                        hash,
+                                        length,
+                                        chunk_index,
+                                    } => MerkleChildInfo {
+                                        is_subtree: false,
+                                        hash: hash.as_bytes().to_vec(),
+                                        length: *length,
+                                        chunk_index: *chunk_index,
+                                    },
+                                    MerkleChild::Subtree(_) => {
+                                        panic!("unexpected deeper subtree");
+                                    }
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await;
+            }
+        }
+
+        // Build chunk data for read_chunks
+        let mut chunks = Vec::new();
+        for i in 0..n {
+            chunks.push(ChunkData {
+                index: i,
+                length: chunk_size,
+                hash: *leaf_hashes[i as usize].as_bytes(),
+                data: vec![i as u8; chunk_size as usize],
+            });
+        }
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                file_size,
+                *root_hash_val.as_bytes(),
+            ))]))
+            .await;
+
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks,
+                merkle_root: root_hash_val.as_bytes().to_vec(),
+            }))
+            .await;
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("big_file"), file_uuid);
+
+        // Read the entire file
+        let result = view.read(Path::new("big_file"), 0, file_size, None).await;
+        assert!(result.is_ok(), "read with subtrees should succeed");
+        let data = result.unwrap();
+        assert_eq!(data.len(), file_size as usize);
+        // Verify each chunk's content
+        for i in 0..n as usize {
+            let start = i * chunk_size as usize;
+            let end = start + chunk_size as usize;
+            assert_eq!(data[start..end], vec![i as u8; chunk_size as usize]);
+        }
+    }
+
+    /// read_chunks returning wrong data should cause FsError::Io (hash mismatch)
+    #[tokio::test]
+    async fn read_rejects_wrong_chunk_data() {
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root_uuid);
+
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk0_hash = Blake3Hash::new(&chunk0_data);
+        let root_hash_val = Blake3Hash::from_array([0xAB; 32]);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                100,
+                *root_hash_val.as_bytes(),
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash_val.as_bytes().to_vec(),
+                    children: vec![MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.as_bytes().to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    }],
+                },
+            )
+            .await;
+
+        // Return WRONG data (different from the hash)
+        let wrong_data = vec![0xBBu8; 100];
+        // Wrong hash in ChunkData (matches nothing)
+        let wrong_hash: [u8; 32] = [0xFF; 32];
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: 100,
+                    hash: wrong_hash,
+                    data: wrong_data,
+                }],
+                merkle_root: root_hash_val.as_bytes().to_vec(),
+            }))
+            .await;
+
+        let result = view.read(Path::new("test_file"), 0, 100, None).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "wrong chunk data should return FsError::Io, got {:?}",
+            result
+        );
+    }
+
+    /// read_chunks returning wrong merkle_root should cause FsError::Io
+    #[tokio::test]
+    async fn read_rejects_wrong_merkle_root() {
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root_uuid);
+
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk0_hash = Blake3Hash::new(&chunk0_data);
+        let root_hash_val = Blake3Hash::from_array([0xAB; 32]);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                100,
+                *root_hash_val.as_bytes(),
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash_val.as_bytes().to_vec(),
+                    children: vec![MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.as_bytes().to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    }],
+                },
+            )
+            .await;
+
+        // Return correct chunk data but wrong merkle_root
+        let wrong_root = [0xFF; 32];
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: 100,
+                    hash: *chunk0_hash.as_bytes(),
+                    data: chunk0_data,
+                }],
+                merkle_root: wrong_root.to_vec(),
+            }))
+            .await;
+
+        let result = view.read(Path::new("test_file"), 0, 100, None).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "wrong merkle_root should return FsError::Io, got {:?}",
+            result
+        );
+    }
+
+    /// read_chunks returning wrong chunk length should cause FsError::Io
+    #[tokio::test]
+    async fn read_rejects_wrong_chunk_length() {
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root_uuid);
+
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk0_hash = Blake3Hash::new(&chunk0_data);
+        let root_hash_val = Blake3Hash::from_array([0xAB; 32]);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                100,
+                *root_hash_val.as_bytes(),
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill_for_hash(
+                vec![],
+                MerkleDrillResult {
+                    parent_hash: root_hash_val.as_bytes().to_vec(),
+                    children: vec![MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk0_hash.as_bytes().to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    }],
+                },
+            )
+            .await;
+
+        // Return wrong length (claims 200 bytes but actually has 100)
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: 200, // Wrong!
+                    hash: *chunk0_hash.as_bytes(),
+                    data: chunk0_data,
+                }],
+                merkle_root: root_hash_val.as_bytes().to_vec(),
+            }))
+            .await;
+
+        let result = view.read(Path::new("test_file"), 0, 100, None).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "wrong chunk length should return FsError::Io, got {:?}",
+            result
+        );
     }
 }
