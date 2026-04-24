@@ -224,3 +224,64 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use prost::Message;
+    use rift_common::crypto::Chunker;
+    use rift_transport::connection::InMemoryConnection;
+    use rift_transport::RiftConnection;
+
+    use crate::handle::HandleDatabase;
+    use crate::handler::NoopCache;
+
+    #[tokio::test]
+    async fn read_rejects_excessive_chunk_count_before_any_io() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        // chunk_count exceeds the limit, but handle is empty and share does not
+        // exist — if the server touches the filesystem at all it would fail.
+        let req = ReadRequest {
+            handle: vec![], // invalid — not even 16 bytes
+            start_chunk: 0,
+            chunk_count: MAX_CHUNK_COUNT + 1,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            std::path::Path::new("/nonexistent_share"),
+            &NoopCache,
+            &HandleDatabase::new(),
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let (type_id, payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::READ_RESPONSE);
+        let resp = ReadResponse::decode(&payload[..]).unwrap();
+        match resp.result {
+            Some(read_response::Result::Error(e)) => {
+                // Getting ErrorUnsupported proves the chunk_count check ran
+                // before handle validation (which would yield ErrorNotFound).
+                assert_eq!(
+                    e.code,
+                    ErrorCode::ErrorUnsupported as i32,
+                    "must reject with ErrorUnsupported, not {:?}",
+                    e.code
+                );
+                assert!(
+                    e.message.contains("chunk_count exceeds maximum"),
+                    "unexpected error message: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+}

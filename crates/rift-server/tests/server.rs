@@ -2303,6 +2303,46 @@ async fn server_rejects_excessive_chunk_count() {
     }
 }
 
+/// Rejecting excessive chunk_count must happen before filesystem access.
+/// Using the root handle (a directory) proves this: if the server attempted to
+/// read the directory it would get a non-file error, but we should see
+/// ErrorUnsupported first because the chunk_count guard runs before resolve().
+#[tokio::test]
+async fn server_rejects_excessive_chunk_count_before_file_access() {
+    use rift_protocol::messages::{msg, ReadRequest};
+
+    let (_dir, root) = helpers::make_share();
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Send ReadRequest with a valid directory handle but chunk_count over limit.
+    // The server should reject with ErrorUnsupported before touching the filesystem.
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = ReadRequest {
+        handle: root_handle,
+        start_chunk: 0,
+        chunk_count: u32::MAX,
+    };
+    stream
+        .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
+    let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
+    match response.result {
+        Some(rift_protocol::messages::read_response::Result::Error(e)) => {
+            assert_eq!(
+                e.code,
+                rift_protocol::messages::ErrorCode::ErrorUnsupported as i32,
+                "must reject with ErrorUnsupported before filesystem access"
+            );
+        }
+        _ => panic!("expected error for excessive chunk_count, got success"),
+    }
+}
+
 #[tokio::test]
 async fn server_rejects_start_chunk_past_end() {
     use rift_protocol::messages::{lookup_response, msg, ReadRequest};
