@@ -72,17 +72,54 @@ async fn send_empty_drill_response<S: RiftStream>(stream: &mut S) -> anyhow::Res
     Ok(())
 }
 
+/// Build the Merkle tree for a file and cache it in the DB.
+///
+/// Returns `(root_hash, in_memory_cache)` on success.
+async fn build_and_cache_tree<M: MerkleCache>(
+    canonical: &Path,
+    content: &[u8],
+    chunker: Chunker,
+    db: &M,
+) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>) {
+    let chunk_boundaries = chunker.chunk(content);
+
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
+        .collect();
+
+    let merkle = MerkleTree::default();
+    let (root, cache, leaf_infos) =
+        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+    // Store tree in database (best-effort)
+    if let Ok(meta) = tokio::fs::metadata(canonical).await {
+        let mtime_ns = meta
+            .modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
+            .unwrap_or(0);
+        let file_size = meta.len();
+        if let Err(e) = db
+            .put_tree(canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
+            .await
+        {
+            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
+        }
+    }
+
+    (root, cache)
+}
+
 /// Handle a `MerkleDrill` request: look up children at a given hash in the file's
 /// Merkle tree.
 ///
-/// Algorithm:
+/// Algorithm (cache-first):
 /// 1. Parse request and validate handle
 /// 2. Resolve handle to canonical path
-/// 3. Read file content and build Merkle tree with cache
-/// 4. Cache tree in database (best-effort)
-/// 5. Determine query hash (root if empty, otherwise from request)
-/// 6. Look up children (cache-first, then database)
-/// 7. Convert to proto and send response
+/// 3. Determine query hash (root hash from `get_merkle` cache, or from request)
+/// 4. **Try database first**: if `get_children` returns cached data, return immediately
+/// 5. If cache miss: read file, build tree, cache it, then look up children
+/// 6. Convert to proto and send response
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
 pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
@@ -107,38 +144,38 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
         Err(_) => return send_empty_drill_response(stream).await,
     };
 
-    let content = match tokio::fs::read(&canonical).await {
-        Ok(c) => c,
-        Err(_) => return send_empty_drill_response(stream).await,
-    };
-
-    let chunk_boundaries = chunker.chunk(&content);
-
-    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
-        .iter()
-        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
-        .collect();
-
-    let merkle = MerkleTree::default();
-    let (root, cache, leaf_infos) =
-        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
-
-    if let Ok(meta) = tokio::fs::metadata(&canonical).await {
-        let mtime_ns = meta
-            .modified()
-            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
-            .unwrap_or(0);
-        let file_size = meta.len();
-        if let Err(e) = db
-            .put_tree(&canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)
-            .await
-        {
-            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
-        }
-    }
-
+    // Step 1: Determine the query hash.
+    // For root drill (empty hash): try DB cache for root hash first.
+    // For subtree drill: parse the hash from the request.
     let query_hash = if req.hash.is_empty() {
-        root
+        // Root drill — try to get root hash from DB cache
+        match db.get_merkle(&canonical).await {
+            Ok(Some(entry)) => entry.root,
+            _ => {
+                // Cache miss — must build the tree
+                let content = match tokio::fs::read(&canonical).await {
+                    Ok(c) => c,
+                    Err(_) => return send_empty_drill_response(stream).await,
+                };
+                let (root, cache) = build_and_cache_tree(&canonical, &content, chunker, db).await;
+
+                // Look up root's children in the in-memory cache
+                let children = match resolve_children(&cache, &canonical, &root, db).await {
+                    Some(c) => c,
+                    None => return send_empty_drill_response(stream).await,
+                };
+
+                let response = MerkleDrillResponse {
+                    parent_hash: root.as_bytes().to_vec(),
+                    children: children_to_proto(&children),
+                };
+                stream
+                    .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
+                    .await?;
+                stream.finish_send().await?;
+                return Ok(());
+            }
+        }
     } else {
         match Blake3Hash::from_slice(&req.hash) {
             Ok(h) => h,
@@ -146,16 +183,42 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
         }
     };
 
+    // Step 2: Try DB first for the requested subtree hash
+    if let Ok(Some(children)) = db.get_children(&canonical, &query_hash).await {
+        let response = MerkleDrillResponse {
+            parent_hash: query_hash.as_bytes().to_vec(),
+            children: children_to_proto(&children),
+        };
+        stream
+            .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        return Ok(());
+    }
+
+    // Step 3: Cache miss — read file and build tree
+    let content = match tokio::fs::read(&canonical).await {
+        Ok(c) => c,
+        Err(_) => return send_empty_drill_response(stream).await,
+    };
+
+    let (root, cache) = build_and_cache_tree(&canonical, &content, chunker, db).await;
+
+    // Step 4: Look up children at the query hash
     let children = match resolve_children(&cache, &canonical, &query_hash, db).await {
         Some(c) => c,
         None => return send_empty_drill_response(stream).await,
     };
 
-    let proto_children = children_to_proto(&children);
+    let parent_hash = if req.hash.is_empty() {
+        root.as_bytes().to_vec()
+    } else {
+        query_hash.as_bytes().to_vec()
+    };
 
     let response = MerkleDrillResponse {
-        parent_hash: query_hash.as_bytes().to_vec(),
-        children: proto_children,
+        parent_hash,
+        children: children_to_proto(&children),
     };
     stream
         .send_frame(msg::MERKLE_DRILL_RESPONSE, &response.encode_to_vec())
