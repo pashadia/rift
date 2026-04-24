@@ -69,7 +69,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     };
 
     let canonical = match resolve(share, &handle, handle_db).await {
-        Ok(p) => p,
+        Ok(r) => r.canonical,
         Err(_) => {
             let response = ReadResponse {
                 result: Some(read_response::Result::Error(ErrorDetail {

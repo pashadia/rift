@@ -67,7 +67,7 @@ fn async_stat<'a, M: MerkleCache>(
 ) -> BoxFuture<'a, StatResult> {
     Box::pin(async move {
         let canonical = match resolve(share, &uuid, handle_db).await {
-            Ok(p) => p,
+            Ok(r) => r.canonical,
             Err(e) => {
                 let code = e
                     .root_cause()

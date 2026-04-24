@@ -121,7 +121,7 @@ async fn resolve_returns_share_root_for_uuid_handle() {
         .unwrap();
 
     // Assert: Should resolve to canonical root path
-    assert_eq!(resolved, root.canonicalize().unwrap());
+    assert_eq!(resolved.canonical, root.canonicalize().unwrap());
 }
 
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn resolve_resolves_relative_path() {
     let resolved = rift_server::handler::resolve(&root, &file_handle, &handle_db)
         .await
         .unwrap();
-    assert_eq!(resolved, file_path.canonicalize().unwrap());
+    assert_eq!(resolved.canonical, file_path.canonicalize().unwrap());
 }
 
 #[tokio::test]

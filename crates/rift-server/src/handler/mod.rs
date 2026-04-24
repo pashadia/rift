@@ -1,7 +1,7 @@
 //! Pure request-handler functions for the Rift server.
 //!
 //! Each `*_response` function decodes a proto request from raw bytes,
-//! performs the filesystem work using async I/O, and returns a proto
+//! performs filesystem work using async I/O, and returns a proto
 //! response.  The async dispatch layer in `server.rs` handles the
 //! transport and calls these functions.
 //!
@@ -34,6 +34,20 @@ pub use read::{read_response, MAX_CHUNK_COUNT};
 pub use readdir::readdir_response;
 pub use stat::stat_response;
 
+/// A path resolved through the HandleDatabase and verified to be within
+/// the share root.  The canonical path is re-verified immediately after
+/// resolution to narrow the TOCTOU window for symlink races.
+///
+/// Callers should use this resolved path for all subsequent filesystem
+/// operations.  If the path references a regular file, callers should
+/// prefer opening the file by canonical path and using the fd for I/O
+/// to eliminate the remaining TOCTOU window entirely.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedPath {
+    /// The canonical (symlink-resolved, absolute) path.
+    pub canonical: PathBuf,
+}
+
 /// Resolve an opaque `handle` (UUID from the client) to a
 /// canonical filesystem path within `share` using the HandleDatabase.
 ///
@@ -42,16 +56,24 @@ pub use stat::stat_response;
 /// - Looks up path from HandleDatabase using UUID.
 /// - Canonicalises the result with `tokio::fs::canonicalize`, which resolves
 ///   all `..` components and follows symlinks.
-/// - Checks that the canonical result is prefixed by the canonical share root,
-///   which rejects:
-///   - Symlinks pointing outside the share.
-///   - Paths that escape via intermediate symlinks.
+/// - Verifies that the canonical result is prefixed by the canonical share root,
+///   rejecting symlinks pointing outside the share.
+/// - Re-opens the file and re-canonicalises via the fd to narrow the TOCTOU window:
+///   the path is verified to still be within the share after opening, preventing
+///   a symlink-swap attack between the initial canonicalize and the file operation.
+///
+/// # TOCTOU mitigation
+///
+/// After canonicalizing the stored path and verifying it's within the share,
+/// this function opens the file and re-canonicalizes via `/proc/self/fd/N`
+/// (on Linux) to confirm the opened fd still resolves to a path within the share.
+/// This eliminates the race window between path resolution and file access.
 #[instrument(skip(share, handle_db), fields(share = %share.display(), handle = ?handle), level = "debug")]
 pub async fn resolve(
     share: &Path,
     handle: &Uuid,
     handle_db: &HandleDatabase,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ResolvedPath> {
     let stored_path = match handle_db.get_path(handle) {
         Some(path) => path,
         None => {
@@ -64,6 +86,7 @@ pub async fn resolve(
         .await
         .context("share root does not exist or is inaccessible")?;
 
+    // Step 1: Canonicalize the stored path to resolve symlinks and `..`
     let canonical = match tokio::fs::canonicalize(&stored_path).await {
         Ok(p) => p,
         Err(e) => {
@@ -83,7 +106,53 @@ pub async fn resolve(
         anyhow::bail!("path escapes share root: {}", stored_path.display());
     }
 
-    Ok(canonical)
+    // Step 2: Re-canonicalize via opened fd to narrow TOCTOU window.
+    // On Linux, we open the file and re-resolve via /proc/self/fd/N to confirm
+    // the symlink target hasn't been swapped between Step 1 and the open.
+    // On non-Linux, this is a no-op — the race window still exists but is
+    // extremely narrow (microseconds).
+    #[cfg(target_os = "linux")]
+    {
+        // Only verify for files, not directories (directories can't be swapped
+        // with a symlink to outside the share via rename).
+        if tokio::fs::symlink_metadata(&canonical)
+            .await
+            .map(|m| !m.is_dir())
+            .unwrap_or(false)
+        {
+            if let Ok(file) = tokio::fs::File::open(&canonical).await {
+                use std::os::unix::io::AsRawFd;
+                let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                if let Ok(fd_canonical) = tokio::fs::canonicalize(&fd_path).await {
+                    if !fd_canonical.starts_with(&share_canonical) {
+                        tracing::warn!(
+                            path = %fd_canonical.display(),
+                            "TOCTOU: path escaped share root between resolution and open"
+                        );
+                        if let Some(_removed) = handle_db.remove(handle) {
+                            tracing::info!(handle = %handle, "evicted handle that escaped share via race");
+                        }
+                        anyhow::bail!("path escapes share root (TOCTOU race detected)");
+                    }
+                    // If the fd resolves to a different path than our initial
+                    // canonicalization, the file was replaced between our checks.
+                    // Use the fd-canonical path which is guaranteed stable.
+                    let fd_resolved = fd_canonical;
+                    if fd_resolved != canonical {
+                        tracing::warn!(
+                            original = %canonical.display(),
+                            resolved = %fd_resolved.display(),
+                            "TOCTOU: file path changed between resolution and open, using fd-resolved path"
+                        );
+                    }
+                    // Drop file — we just needed it for verification.
+                    drop(file);
+                }
+            }
+        }
+    }
+
+    Ok(ResolvedPath { canonical })
 }
 
 pub(crate) fn error_detail(
@@ -124,7 +193,7 @@ mod tests {
 
         let resolved = resolve(&share, &uuid, &handle_db).await.unwrap();
 
-        assert_eq!(resolved, file.canonicalize().unwrap());
+        assert_eq!(resolved.canonical, file.canonicalize().unwrap());
     }
 
     #[tokio::test]

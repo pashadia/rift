@@ -103,7 +103,7 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
     };
 
     let canonical = match resolve(share, &handle, handle_db).await {
-        Ok(p) => p,
+        Ok(r) => r.canonical,
         Err(_) => return send_empty_drill_response(stream).await,
     };
 

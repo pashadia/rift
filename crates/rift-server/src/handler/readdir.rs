@@ -35,7 +35,7 @@ pub async fn readdir_response(
     };
 
     let dir_canonical = match resolve(share, &dir_uuid, handle_db).await {
-        Ok(p) => p,
+        Ok(r) => r.canonical,
         Err(e) => {
             let code = e
                 .root_cause()

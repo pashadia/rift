@@ -44,7 +44,7 @@ pub async fn lookup_response<M: MerkleCache>(
     };
 
     let parent_canonical = match resolve(share, &parent_uuid, handle_db).await {
-        Ok(p) => p,
+        Ok(r) => r.canonical,
         Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
     };
 
