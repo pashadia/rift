@@ -50,6 +50,22 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     };
 
+    // Validate chunk_count before any filesystem access to prevent DoS.
+    if req.chunk_count > MAX_CHUNK_COUNT {
+        let response = ReadResponse {
+            result: Some(read_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorUnsupported as i32,
+                message: format!("chunk_count exceeds maximum of {}", MAX_CHUNK_COUNT),
+                metadata: None,
+            })),
+        };
+        stream
+            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        return Ok(());
+    }
+
     let handle = match Uuid::from_slice(&req.handle) {
         Ok(u) => u,
         Err(_) => {
@@ -104,22 +120,11 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     };
 
-    let chunk_boundaries = chunker.chunk(&content);
+    // TODO: Cache chunk boundaries in the DB so that subsequent reads
+    // can seek to individual chunks instead of loading the entire file.
+    // This requires extending the MerkleCache schema to store boundaries.
 
-    if req.chunk_count > MAX_CHUNK_COUNT {
-        let response = ReadResponse {
-            result: Some(read_response::Result::Error(ErrorDetail {
-                code: ErrorCode::ErrorUnsupported as i32,
-                message: format!("chunk_count exceeds maximum of {}", MAX_CHUNK_COUNT),
-                metadata: None,
-            })),
-        };
-        stream
-            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-        return Ok(());
-    }
+    let chunk_boundaries = chunker.chunk(&content);
 
     if req.start_chunk as usize >= chunk_boundaries.len() {
         let response = ReadResponse {
