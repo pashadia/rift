@@ -148,15 +148,24 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         req.chunk_count as usize
     };
 
+    // Compute ALL leaf hashes once.
+    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+        .iter()
+        .map(|(offset, length)| {
+            let chunk_data = &content[*offset..*offset + length];
+            Blake3Hash::new(chunk_data)
+        })
+        .collect();
+
+    // Derive chunks_to_read from pre-computed hashes.
     let chunks_to_read: Vec<_> = chunk_boundaries
         .iter()
+        .enumerate()
         .skip(start)
         .take(count)
-        .enumerate()
         .map(|(i, (offset, length))| {
-            let chunk_data = &content[*offset..*offset + length];
-            let hash = Blake3Hash::new(chunk_data);
-            (start + i, *offset, *length, hash)
+            let hash = leaf_hashes[i].clone();
+            (i, *offset, *length, hash)
         })
         .collect();
 
@@ -188,13 +197,6 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     }
 
     let merkle = MerkleTree::default();
-    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
-        .iter()
-        .map(|(offset, length)| {
-            let chunk_data = &content[*offset..*offset + length];
-            Blake3Hash::new(chunk_data)
-        })
-        .collect();
     let root = merkle.build(&leaf_hashes);
 
     if let Ok(file_meta) = tokio::fs::metadata(&canonical).await {
