@@ -1,24 +1,6 @@
 use rift_common::crypto::Blake3Hash;
 use rift_protocol::messages::{FileAttrs, FileType};
 
-use crate::handler::merkle_cache::sentinel_hash_for_non_file;
-
-/// Convert `std::fs::Metadata` to a proto `FileAttrs` message.
-///
-/// Uses Unix-specific metadata fields (`mode`, `uid`, `gid`, `nlink`).
-/// Uses constant hashes for directories and symlinks since they don't have content.
-pub fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
-    let file_type = if meta.is_dir() {
-        FileType::Directory
-    } else if meta.is_symlink() {
-        FileType::Symlink
-    } else {
-        FileType::Regular
-    };
-    let root_hash = sentinel_hash_for_non_file(file_type);
-    build_attrs(meta, root_hash)
-}
-
 /// Build `FileAttrs` from filesystem metadata and Merkle root hash.
 ///
 /// The `root_hash` is always 32 bytes (blake3). For directories and symlinks,
@@ -60,6 +42,23 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    use crate::handler::merkle_cache::sentinel_hash_for_non_file;
+
+    /// Convert `std::fs::Metadata` to a proto `FileAttrs` message.
+    ///
+    /// Convenience for unit tests: uses sentinel hashes for directories and symlinks.
+    fn metadata_to_attrs(meta: &std::fs::Metadata) -> FileAttrs {
+        let file_type = if meta.is_dir() {
+            FileType::Directory
+        } else if meta.is_symlink() {
+            FileType::Symlink
+        } else {
+            FileType::Regular
+        };
+        let root_hash = sentinel_hash_for_non_file(file_type);
+        build_attrs(meta, root_hash)
+    }
+
     #[test]
     fn metadata_to_attrs_directory_has_dir_type() {
         let tmp = TempDir::new().unwrap();
@@ -70,6 +69,35 @@ mod tests {
         let attrs = metadata_to_attrs(&meta);
 
         assert_eq!(attrs.file_type, FileType::Directory as i32);
+    }
+
+    #[test]
+    fn metadata_to_attrs_regular_file_panics() {
+        // metadata_to_attrs uses sentinel_hash_for_non_file(FileType::Regular),
+        // which is unreachable! by design — regular files require content-based
+        // Merkle roots via get_or_compute_merkle_root. Verify the panic.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("regular.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let result = std::panic::catch_unwind(|| metadata_to_attrs(&meta));
+        assert!(result.is_err(), "Regular files via metadata_to_attrs must panic — use build_attrs with real Merkle root instead");
+    }
+
+    #[test]
+    fn build_attrs_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("regular.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let expected_hash = Blake3Hash::new(b"test");
+        let attrs = build_attrs(&meta, expected_hash.clone());
+
+        assert_eq!(attrs.file_type, FileType::Regular as i32);
+        assert_eq!(attrs.size, 5);
+        assert_eq!(attrs.root_hash, expected_hash.as_bytes().to_vec());
     }
 
     #[test]

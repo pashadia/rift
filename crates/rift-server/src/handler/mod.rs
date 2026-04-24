@@ -26,7 +26,7 @@ pub mod read;
 pub mod readdir;
 pub mod stat;
 
-pub use attrs::{build_attrs, metadata_to_attrs};
+pub use attrs::build_attrs;
 pub use drill::merkle_drill_response;
 pub use lookup::lookup_response;
 pub use merkle_cache_trait::{MerkleCache, NoopCache};

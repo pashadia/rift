@@ -177,11 +177,15 @@ async fn stat_response_rejects_wrong_size_handle_bytes() {
 }
 
 #[test]
-fn metadata_to_attrs_directory() {
+fn build_attrs_directory() {
     use rift_protocol::messages::FileType;
-    let (_dir, root) = helpers::make_share();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
     let meta = std::fs::metadata(&root).unwrap();
-    let attrs = rift_server::handler::metadata_to_attrs(&meta);
+    let attrs = rift_server::handler::build_attrs(
+        &meta,
+        rift_common::crypto::Blake3Hash::new(b"<directory>"),
+    );
     assert_eq!(attrs.file_type, FileType::Directory as i32);
 }
 
