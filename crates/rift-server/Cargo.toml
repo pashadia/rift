@@ -30,7 +30,7 @@ tokio-rusqlite = "0.7"
 uuid.workspace = true
 scc.workspace = true
 xattr.workspace = true
-walkdir = "1"
+walkdir = "2"
 tokio-stream = { version = "0.1", features = ["fs"] }
 futures = "0.3"
 
