@@ -159,13 +159,54 @@ async fn recv_hello_on_wrong_message_type_returns_error() {
             result.is_err(),
             "recv_hello should reject non-RIFT_HELLO frames"
         );
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_str.contains("expected RIFT_HELLO"),
+            "expected type-mismatch error, got: {err_str}"
+        );
     });
 
-    // Client: inject a STAT_REQUEST (wrong message type) instead of RIFT_HELLO
+    // Client: inject a STAT_REQUEST (wrong message type) instead of RIFT_HELLO.
+    // Empty payload is a valid default protobuf, so if the type check is bypassed
+    // the decode will succeed — exposing the mutant.
     let mut cs = client_conn.open_stream().await.unwrap();
     use rift_protocol::messages::msg;
     use rift_transport::RiftStream;
-    cs.send_frame(msg::STAT_REQUEST, b"not-a-hello")
+    cs.send_frame(msg::STAT_REQUEST, b"").await.unwrap();
+    cs.finish_send().await.unwrap();
+
+    server_task.await.unwrap();
+}
+
+/// Same as `recv_hello_on_wrong_message_type_returns_error` but the payload is
+/// non-empty garbage — this tests the decode-error path separately from the
+/// type-check path, ensuring both are covered.
+#[tokio::test]
+async fn recv_hello_on_wrong_message_type_with_garbage_payload_returns_error() {
+    let (listener, connector) = InMemoryListener::new("server", "client");
+
+    let client_conn = connector.connect().unwrap();
+    let server_conn = listener.accept().await.unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let mut s = server_conn.accept_stream().await.unwrap();
+        let result = recv_hello(&mut s).await;
+        assert!(
+            result.is_err(),
+            "recv_hello should reject non-RIFT_HELLO frames"
+        );
+        // Payload is not a valid protobuf — error must be a decode failure
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_str.contains("Codec") || err_str.contains("decode"),
+            "expected a codec/decode error, not a stream-level error, got: {err_str}"
+        );
+    });
+
+    let mut cs = client_conn.open_stream().await.unwrap();
+    use rift_protocol::messages::msg;
+    use rift_transport::RiftStream;
+    cs.send_frame(msg::STAT_REQUEST, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
         .await
         .unwrap();
     cs.finish_send().await.unwrap();
@@ -185,12 +226,12 @@ async fn client_handshake_rejects_wrong_response_type() {
         let mut s = server_conn.accept_stream().await.unwrap();
         let hello = recv_hello(&mut s).await.unwrap();
         assert_eq!(hello.share_name, "my-share");
-        // Send wrong message type instead of RIFT_WELCOME
+        // Send wrong message type instead of RIFT_WELCOME.
+        // Empty payload is a valid default protobuf, so if the type check is
+        // bypassed the decode will succeed — exposing the mutant.
         use rift_protocol::messages::msg;
         use rift_transport::RiftStream;
-        s.send_frame(msg::STAT_REQUEST, b"not-a-welcome")
-            .await
-            .unwrap();
+        s.send_frame(msg::STAT_REQUEST, b"").await.unwrap();
         s.finish_send().await.unwrap();
     });
 
@@ -199,6 +240,11 @@ async fn client_handshake_rejects_wrong_response_type() {
     assert!(
         result.is_err(),
         "client_handshake should reject non-WELCOME frames"
+    );
+    let err_str = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_str.contains("stream closed before RiftWelcome received"),
+        "expected stream-closed error, got: {err_str}"
     );
 
     server_task.await.unwrap();

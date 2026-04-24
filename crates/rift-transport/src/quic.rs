@@ -71,16 +71,6 @@ impl QuicConnection {
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
-
-    /// Close the connection immediately.
-    ///
-    /// Any in-flight streams will be reset.  Pending `open_stream` or
-    /// `accept_stream` calls will return `TransportError::ConnectionClosed`.
-    #[instrument(skip(self), fields(peer = %self.peer_fingerprint))]
-    pub fn close(&self) {
-        self.closed.store(true, Ordering::Relaxed);
-        self.inner.close(0u32.into(), b"closed by client");
-    }
 }
 
 impl Clone for QuicConnection {
@@ -122,7 +112,8 @@ impl RiftConnection for QuicConnection {
     }
 
     fn close(&self) {
-        self.close();
+        self.closed.store(true, Ordering::Relaxed);
+        self.inner.close(0u32.into(), b"closed by client");
     }
 }
 

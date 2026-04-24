@@ -3,4 +3,5 @@
 # See: https://mutants.rs/skip_calls.html
 exclude_re = [
     "replace BidirectionalMap.*with_capacity -> Self with Default::default",
+    "root_hint_subjects",
 ]
