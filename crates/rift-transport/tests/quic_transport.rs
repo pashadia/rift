@@ -45,9 +45,14 @@ async fn quic_client_connects_to_server() {
 
     let ep = client_endpoint(&client_cert, &client_key).expect("client_endpoint failed");
     let policy = Arc::new(AcceptAnyPolicy);
-    let _client_conn = connect(&ep, addr, "test-server", policy)
+    let client_conn = connect(&ep, addr, "test-server", policy)
         .await
         .expect("connect failed");
+
+    assert!(
+        !client_conn.is_closed(),
+        "fresh connection should not be closed"
+    );
 
     server_task.await.expect("server task panicked");
 }
@@ -359,8 +364,8 @@ async fn quic_connection_close_detected_on_accept_stream() {
         // Accepting a stream on a closed connection should error
         let result = conn.accept_stream().await;
         assert!(
-            result.is_err() || conn.is_closed(),
-            "expected error or is_closed after client dropped"
+            result.is_err(),
+            "expected accept_stream error after client dropped"
         );
     });
 
