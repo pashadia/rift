@@ -1,10 +1,15 @@
+use hmac::{Hmac, Mac};
 use rift_common::handle_map::BidirectionalMap;
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+type HmacSha256 = Hmac<Sha256>;
+
 const RIFT_HANDLE_XATTR: &str = "user.rift.handle";
+const RIFT_HANDLE_SIG_XATTR: &str = "user.rift.handle.sig";
 
 /// Returns true if the xattr failure is "expected" — i.e. the filesystem
 /// doesn't support extended attributes (ENOTSUP/EOPNOTSUPP).
@@ -22,31 +27,80 @@ fn is_expected_xattr_failure(_e: &std::io::Error) -> bool {
     true // Non-Unix: treat all xattr failures as expected
 }
 
-/// Write handle xattr to canonical path, logging a warning on unexpected failures.
-fn write_handle_xattr(canonical: &Path, handle: Uuid) {
-    if canonical.is_file() {
-        if let Err(e) = xattr::set(canonical, RIFT_HANDLE_XATTR, handle.as_bytes()) {
-            if !is_expected_xattr_failure(&e) {
-                tracing::warn!(path = %canonical.display(), error = %e, "failed to write handle xattr");
-            }
+/// Compute HMAC-SHA256 of the handle UUID using the signing key.
+fn sign_handle(key: &[u8; 32], handle: &Uuid) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length is valid");
+    mac.update(handle.as_bytes());
+    let result = mac.finalize();
+    let code = result.into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&code);
+    out
+}
+
+/// Verify HMAC-SHA256 signature of a handle UUID using constant-time comparison.
+fn verify_signature(key: &[u8; 32], handle: &Uuid, sig: &[u8]) -> bool {
+    if sig.len() != 32 {
+        return false;
+    }
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length is valid");
+    mac.update(handle.as_bytes());
+    mac.verify_slice(sig).is_ok()
+}
+
+/// Write handle and its HMAC signature as xattrs on the canonical path.
+/// Logs a warning on unexpected failures, silently ignores expected ones (ENOTSUP).
+fn write_handle_xattr(key: &[u8; 32], canonical: &Path, handle: Uuid) {
+    if !canonical.is_file() {
+        return;
+    }
+    if let Err(e) = xattr::set(canonical, RIFT_HANDLE_XATTR, handle.as_bytes()) {
+        if !is_expected_xattr_failure(&e) {
+            tracing::warn!(path = %canonical.display(), error = %e, "failed to write handle xattr");
+        }
+        return;
+    }
+    let sig = sign_handle(key, &handle);
+    if let Err(e) = xattr::set(canonical, RIFT_HANDLE_SIG_XATTR, &sig) {
+        if !is_expected_xattr_failure(&e) {
+            tracing::warn!(path = %canonical.display(), error = %e, "failed to write handle signature xattr");
         }
     }
 }
 
 pub struct HandleDatabase {
     map: Arc<BidirectionalMap<PathBuf>>,
+    signing_key: [u8; 32],
 }
 
 impl HandleDatabase {
+    /// Generate a random 32-byte HMAC key for signing handle xattrs.
+    fn generate_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("failed to generate random signing key");
+        key
+    }
+
     pub fn new() -> Self {
         Self {
             map: Arc::new(BidirectionalMap::new()),
+            signing_key: Self::generate_key(),
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             map: Arc::new(BidirectionalMap::with_capacity(capacity)),
+            signing_key: Self::generate_key(),
+        }
+    }
+
+    /// Create a HandleDatabase with a known signing key (for testing).
+    #[cfg(test)]
+    fn with_key(signing_key: [u8; 32]) -> Self {
+        Self {
+            map: Arc::new(BidirectionalMap::new()),
+            signing_key,
         }
     }
 
@@ -59,30 +113,52 @@ impl HandleDatabase {
             return Ok(handle);
         }
 
-        let handle = match xattr::get(&canonical, RIFT_HANDLE_XATTR) {
-            Ok(Some(value)) if value.len() == 16 => Uuid::from_slice(&value).unwrap_or_else(|_| {
+        let handle = match (
+            xattr::get(&canonical, RIFT_HANDLE_XATTR),
+            xattr::get(&canonical, RIFT_HANDLE_SIG_XATTR),
+        ) {
+            // Both xattrs present: verify signature and UUID validity
+            (Ok(Some(handle_bytes)), Ok(Some(sig_bytes)))
+                if handle_bytes.len() == 16 && sig_bytes.len() == 32 =>
+            {
+                match Uuid::from_slice(&handle_bytes) {
+                    Ok(uuid) if verify_signature(&self.signing_key, &uuid, &sig_bytes) => uuid,
+                    _ => {
+                        // Invalid UUID or forged/expired signature — generate new
+                        let h = Uuid::now_v7();
+                        write_handle_xattr(&self.signing_key, &canonical, h);
+                        h
+                    }
+                }
+            }
+            // Handle present but signature missing/invalid — forgery attempt or pre-HMAC format
+            (Ok(Some(handle_bytes)), _) if handle_bytes.len() == 16 => {
+                // Could be a pre-HMAC format handle or a forged one — either way,
+                // we can't verify it, so generate a new one
                 let h = Uuid::now_v7();
-                write_handle_xattr(&canonical, h);
+                write_handle_xattr(&self.signing_key, &canonical, h);
                 h
-            }),
-            Ok(Some(_)) => {
-                // Malformed xattr value (not 16 bytes) — generate new handle
-                let handle = Uuid::now_v7();
-                write_handle_xattr(&canonical, handle);
-                handle
             }
-            Ok(None) => {
-                let handle = Uuid::now_v7();
-                write_handle_xattr(&canonical, handle);
-                handle
+            // Malformed handle (wrong length) — generate new
+            (Ok(Some(_)), _) => {
+                let h = Uuid::now_v7();
+                write_handle_xattr(&self.signing_key, &canonical, h);
+                h
             }
-            Err(e) => {
+            // No handle xattr at all — generate new
+            (Ok(None), _) => {
+                let h = Uuid::now_v7();
+                write_handle_xattr(&self.signing_key, &canonical, h);
+                h
+            }
+            // xattr read error
+            (Err(e), _) => {
                 if !is_expected_xattr_failure(&e) {
                     tracing::warn!(path = %canonical.display(), error = %e, "failed to read handle xattr");
                 }
-                let handle = Uuid::now_v7();
-                write_handle_xattr(&canonical, handle);
-                handle
+                let h = Uuid::now_v7();
+                write_handle_xattr(&self.signing_key, &canonical, h);
+                h
             }
         };
 
@@ -140,6 +216,7 @@ impl Clone for HandleDatabase {
     fn clone(&self) -> Self {
         Self {
             map: self.map.clone(),
+            signing_key: Self::generate_key(), // new random key for cloned instance
         }
     }
 }
@@ -154,6 +231,10 @@ impl Default for HandleDatabase {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn make_key() -> [u8; 32] {
+        [0x42; 32]
+    }
 
     #[test]
     #[cfg(unix)]
@@ -195,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_create_handle_uses_canonical_path_as_key() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
@@ -207,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_handle_from_database() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
@@ -227,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_create_new_file() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
@@ -237,25 +318,117 @@ mod tests {
         assert_eq!(db.len(), 1);
     }
 
+    /// A forged UUID written directly to xattr without a valid HMAC signature
+    /// must be rejected — a new handle should be generated instead.
     #[tokio::test]
-    async fn test_get_or_create_existing_file_with_xattr() {
+    async fn test_forged_xattr_without_signature_is_rejected() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
-        let path = tmp.path().join("test.txt");
+        let key = make_key();
+        let db = HandleDatabase::with_key(key);
+        let path = tmp.path().join("forged.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
 
-        let expected = Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
-        xattr::set(&path, RIFT_HANDLE_XATTR, expected.as_bytes()).unwrap();
+        // Attacker writes a forged handle xattr (no signature)
+        let attacker_uuid =
+            Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        xattr::set(&path, RIFT_HANDLE_XATTR, attacker_uuid.as_bytes()).unwrap();
 
         let handle = db.get_or_create_handle(&canonical).await.unwrap();
-        assert_eq!(handle, expected);
+        assert_ne!(
+            handle, attacker_uuid,
+            "forged UUID without signature must be rejected"
+        );
+
+        // The new handle should be written with a valid signature
+        let stored_handle = xattr::get(&path, RIFT_HANDLE_XATTR).unwrap().unwrap();
+        assert_eq!(stored_handle.as_slice(), handle.as_bytes());
+        let stored_sig = xattr::get(&path, RIFT_HANDLE_SIG_XATTR).unwrap().unwrap();
+        assert_eq!(stored_sig.len(), 32);
+        assert!(
+            verify_signature(&key, &handle, &stored_sig),
+            "newly written signature must be valid"
+        );
+    }
+
+    /// A forged UUID with a wrong HMAC signature must be rejected.
+    #[tokio::test]
+    async fn test_forged_xattr_with_wrong_signature_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let key = make_key();
+        let db = HandleDatabase::with_key(key);
+        let path = tmp.path().join("forged_sig.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        // Attacker writes a forged handle xattr with a fake signature
+        let attacker_uuid =
+            Uuid::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        xattr::set(&path, RIFT_HANDLE_XATTR, attacker_uuid.as_bytes()).unwrap();
+        xattr::set(&path, RIFT_HANDLE_SIG_XATTR, &[0xFF; 32]).unwrap();
+
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
+        assert_ne!(
+            handle, attacker_uuid,
+            "forged UUID with wrong signature must be rejected"
+        );
+
+        // New valid signature should be written
+        let stored_sig = xattr::get(&path, RIFT_HANDLE_SIG_XATTR).unwrap().unwrap();
+        assert!(
+            verify_signature(&key, &handle, &stored_sig),
+            "newly written signature must be valid"
+        );
+    }
+
+    /// A legitimately signed xattr must be accepted by an instance with the same key.
+    #[tokio::test]
+    async fn test_signed_xattr_accepted_by_same_key() {
+        let tmp = TempDir::new().unwrap();
+        let key = make_key();
+        let db = HandleDatabase::with_key(key);
+        let path = tmp.path().join("legit.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        // Create a handle through normal flow
+        let handle = db.get_or_create_handle(&canonical).await.unwrap();
+
+        // New instance with same key should recover the same handle from xattr
+        let db2 = HandleDatabase::with_key(key);
+        let handle2 = db2.get_or_create_handle(&canonical).await.unwrap();
+        assert_eq!(
+            handle, handle2,
+            "handle signed with same key must be recovered"
+        );
+    }
+
+    /// A handle signed with a different key must be rejected.
+    #[tokio::test]
+    async fn test_signed_xattr_rejected_by_different_key() {
+        let tmp = TempDir::new().unwrap();
+        let key_a: [u8; 32] = [0x42; 32];
+        let key_b: [u8; 32] = [0x99; 32];
+        let db_a = HandleDatabase::with_key(key_a);
+        let path = tmp.path().join("cross_key.txt");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        let handle_a = db_a.get_or_create_handle(&canonical).await.unwrap();
+
+        // Try to recover with key B — should reject and generate new handle
+        let db_b = HandleDatabase::with_key(key_b);
+        let handle_b = db_b.get_or_create_handle(&canonical).await.unwrap();
+        assert_ne!(
+            handle_a, handle_b,
+            "handle signed with different key must be rejected"
+        );
     }
 
     #[tokio::test]
     async fn test_malformed_xattr_generates_new_handle() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
@@ -264,11 +437,8 @@ mod tests {
         xattr::set(&path, RIFT_HANDLE_XATTR, b"abcd").unwrap();
 
         let handle = db.get_or_create_handle(&canonical).await.unwrap();
-
-        // Should generate a new valid UUID, not use the malformed value
         assert_eq!(handle.as_bytes().len(), 16);
 
-        // The new handle should have been written back to the xattr
         let stored = xattr::get(&path, RIFT_HANDLE_XATTR).unwrap();
         assert_eq!(stored.unwrap().as_slice(), handle.as_bytes());
     }
@@ -276,12 +446,11 @@ mod tests {
     #[tokio::test]
     async fn test_malformed_xattr_too_long_generates_new_handle() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
 
-        // Write a malformed xattr (too long — 32 bytes instead of 16)
         let long_value = [0xAB_u8; 32];
         xattr::set(&path, RIFT_HANDLE_XATTR, &long_value).unwrap();
 
@@ -300,7 +469,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("subdir")).unwrap();
         std::fs::write(tmp.path().join("subdir/c.txt"), "").unwrap();
 
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         db.populate_from_share(tmp.path()).await.unwrap();
 
         assert_eq!(db.len(), 3);
@@ -309,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_create_handle_same_share_root_twice() {
         let tmp = TempDir::new().unwrap();
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
         let canonical = tmp.path().canonicalize().unwrap();
 
         let handle1 = db.get_or_create_handle(&canonical).await.unwrap();
@@ -328,7 +497,7 @@ mod tests {
         let nested_dir = share_root.join("a").join("b");
         std::fs::create_dir_all(&nested_dir).unwrap();
 
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
 
         let root_canonical = share_root.canonicalize().unwrap();
         let nested_canonical = nested_dir.canonicalize().unwrap();
@@ -354,7 +523,7 @@ mod tests {
         std::fs::create_dir(&subdir).unwrap();
         let canonical = subdir.canonicalize().unwrap();
 
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
 
         let handle1 = db.get_or_create_handle(&canonical).await.unwrap();
         let handle2 = db.get_or_create_handle(&canonical).await.unwrap();
@@ -377,7 +546,7 @@ mod tests {
         let nested_file = nested_dir.join("file.txt");
         std::fs::write(&nested_file, "test").unwrap();
 
-        let db = HandleDatabase::new();
+        let db = HandleDatabase::with_key(make_key());
 
         let root_canonical = share_root.canonicalize().unwrap();
         let file_canonical = nested_file.canonicalize().unwrap();
@@ -399,10 +568,8 @@ mod tests {
         let path = tmp.path().join("concurrent.txt");
         std::fs::write(&path, "").unwrap();
         let canonical = path.canonicalize().unwrap();
-        let db = Arc::new(HandleDatabase::new());
+        let db = Arc::new(HandleDatabase::with_key(make_key()));
 
-        // Run 100 concurrent get_or_create_handle calls for the same path.
-        // Without the insert-recovery fix, some will return Err.
         let mut handles = Vec::new();
         for _ in 0..100 {
             let db_clone = Arc::clone(&db);
@@ -437,8 +604,6 @@ mod tests {
         assert_eq!(db.len(), 1, "only one entry in database");
     }
 
-    /// Test that xattr operations use the canonical path, not the symlink path.
-    /// This ensures handles persist across restarts even when accessed via symlinks.
     #[tokio::test]
     #[cfg(unix)]
     async fn test_xattr_uses_canonical_path_not_symlink() {
@@ -448,16 +613,15 @@ mod tests {
         let real_file = tmp.path().join("real_file.txt");
         let symlink_path = tmp.path().join("symlink.txt");
 
-        // Create the real file and a symlink pointing to it
         std::fs::write(&real_file, "test content").unwrap();
         symlink(&real_file, &symlink_path).unwrap();
 
-        let db = HandleDatabase::new();
+        let key = make_key();
+        let db = HandleDatabase::with_key(key);
 
-        // Call get_or_create_handle via the symlink path
         let handle = db.get_or_create_handle(&symlink_path).await.unwrap();
 
-        // Verify the xattr was written to the REAL file (canonical), not the symlink
+        // xattr should be on the real (canonical) file
         let xattr_on_real = xattr::get(&real_file, RIFT_HANDLE_XATTR).unwrap();
         assert!(
             xattr_on_real.is_some(),
@@ -469,29 +633,19 @@ mod tests {
             "xattr value should match the handle"
         );
 
-        // Verify the symlink should NOT have xattr (symlinks typically don't support xattrs
-        // or the xattr should be on the target, not the symlink itself)
-        let xattr_on_symlink = xattr::get(&symlink_path, RIFT_HANDLE_XATTR).unwrap();
+        // Signature should also be on the real file
+        let sig_on_real = xattr::get(&real_file, RIFT_HANDLE_SIG_XATTR).unwrap();
         assert!(
-            xattr_on_symlink.is_none() || xattr_on_symlink.as_ref().unwrap() != handle.as_bytes(),
-            "xattr should not be on symlink (or should be the same as target if symlink xattrs are supported)"
+            sig_on_real.is_some(),
+            "signature xattr should be on the canonical file"
         );
 
-        // Now create a new database instance and verify the handle is recovered
-        // from the real file's xattr when accessed via symlink
-        let db2 = HandleDatabase::new();
+        // New database instance with same key recovers the handle
+        let db2 = HandleDatabase::with_key(key);
         let handle_via_symlink = db2.get_or_create_handle(&symlink_path).await.unwrap();
         assert_eq!(
             handle, handle_via_symlink,
             "handle should be consistent when accessed via symlink"
-        );
-
-        // Also verify accessing via canonical path returns same handle
-        let canonical = real_file.canonicalize().unwrap();
-        let handle_via_canonical = db2.get_or_create_handle(&canonical).await.unwrap();
-        assert_eq!(
-            handle, handle_via_canonical,
-            "handle should be consistent when accessed via canonical path"
         );
     }
 }

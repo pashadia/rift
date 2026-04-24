@@ -42,6 +42,8 @@ futures = "0.3"
 # Hashing and CDC
 blake3 = "1"
 fastcdc = "3"
+hmac = "0.12"
+sha2 = "0.10"
 
 # Configuration and serialization
 toml = "0.8"
@@ -71,6 +73,7 @@ scc = "3"
 
 # Extended attributes
 xattr = "1"
+getrandom = "0.3"
 
 # Low-level
 libc = "0.2"

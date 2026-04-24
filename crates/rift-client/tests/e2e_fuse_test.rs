@@ -123,12 +123,10 @@ async fn test_read_file_returns_expected_content() {
 
     // 4. Run cat
     let path = guard.path().join("hello.txt");
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new("cat").arg(path).output()
-    })
-    .await
-    .unwrap()
-    .expect("cat failed");
+    let output = tokio::task::spawn_blocking(move || Command::new("cat").arg(path).output())
+        .await
+        .unwrap()
+        .expect("cat failed");
 
     // 5. Assert (guard drops here, triggering unmount)
     assert!(
