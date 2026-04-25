@@ -312,8 +312,13 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                                     return Ok(data[start..end].to_vec());
                                 }
                             }
-                            Err(ref missing) => {
-                                tracing::debug!("cache miss for {} chunks", missing.len());
+                            Err(ref bad_hashes) => {
+                                tracing::warn!(
+                                    "cache data corrupted: {} chunks failed hash verification",
+                                    bad_hashes.len()
+                                );
+                                // Evict the corrupted manifest so subsequent reads re-fetch
+                                let _ = cache.remove_manifest(&handle).await;
                             }
                         }
                     } else {

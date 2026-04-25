@@ -226,6 +226,17 @@ impl FileCache {
         Ok(())
     }
 
+    /// Remove a file manifest and its chunk references from the cache.
+    pub async fn remove_manifest(&self, handle: &Uuid) -> SqliteResult<()> {
+        let handle_str = handle.to_string();
+        self.call(move |conn: &mut rusqlite::Connection| {
+            conn.execute("DELETE FROM chunk_refs WHERE handle = ?1", [&handle_str])?;
+            conn.execute("DELETE FROM manifests WHERE handle = ?1", [&handle_str])?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Get the cached manifest for a file handle.
     pub async fn get_manifest(&self, handle: &Uuid) -> SqliteResult<Option<Manifest>> {
         let handle_str = handle.to_string();
@@ -369,31 +380,51 @@ impl FileCache {
         Ok(missing)
     }
 
-    /// Reconstruct a file from cached chunks.
+    /// Reconstruct a file from cached chunks, verifying each chunk's hash.
     ///
-    /// Returns `Err` listing the hashes of missing chunks if any chunk data is unavailable.
+    /// Returns `Err` listing the hashes of missing or corrupted chunks.
     pub async fn reconstruct(&self, chunks: &[ChunkInfo]) -> Result<Vec<u8>, Vec<[u8; 32]>> {
         let mut result = Vec::new();
-        let mut missing = Vec::new();
+        let mut bad_chunks = Vec::new();
 
         let total_size: usize = chunks.iter().map(|c| c.length as usize).sum();
         result.reserve(total_size);
 
         for chunk in chunks {
             match self.get_chunk(&chunk.hash).await {
-                Ok(Some(data)) => result.extend_from_slice(&data),
-                Ok(None) => missing.push(chunk.hash),
+                Ok(Some(data)) => {
+                    // Verify the chunk's hash matches the stored data.
+                    let computed = Blake3Hash::new(&data);
+                    if *computed.as_bytes() != chunk.hash {
+                        tracing::warn!(
+                            "cached chunk hash mismatch: expected {:?}, got {:?}",
+                            &chunk.hash[..4],
+                            &computed.as_bytes()[..4]
+                        );
+                        bad_chunks.push(chunk.hash);
+                    } else if data.len() != chunk.length as usize {
+                        tracing::warn!(
+                            "cached chunk length mismatch: expected {}, got {}",
+                            chunk.length,
+                            data.len()
+                        );
+                        bad_chunks.push(chunk.hash);
+                    } else {
+                        result.extend_from_slice(&data);
+                    }
+                }
+                Ok(None) => bad_chunks.push(chunk.hash),
                 Err(e) => {
-                    missing.push(chunk.hash);
                     tracing::warn!("error reading chunk: {}", e);
+                    bad_chunks.push(chunk.hash);
                 }
             }
         }
 
-        if missing.is_empty() {
+        if bad_chunks.is_empty() {
             Ok(result)
         } else {
-            Err(missing)
+            Err(bad_chunks)
         }
     }
 }
@@ -537,21 +568,32 @@ mod tests {
     async fn reconstruct_all_cached() {
         let cache = FileCache::open_in_memory().await.unwrap();
 
-        cache.put_chunk(&[0x01u8; 32], b"hello ").await.unwrap();
-        cache.put_chunk(&[0x02u8; 32], b"world").await.unwrap();
+        let chunk0_data = b"hello ";
+        let chunk1_data = b"world";
+        let chunk0_hash = Blake3Hash::new(chunk0_data);
+        let chunk1_hash = Blake3Hash::new(chunk1_data);
+
+        cache
+            .put_chunk(chunk0_hash.as_bytes(), chunk0_data)
+            .await
+            .unwrap();
+        cache
+            .put_chunk(chunk1_hash.as_bytes(), chunk1_data)
+            .await
+            .unwrap();
 
         let chunks = vec![
             ChunkInfo {
                 index: 0,
                 offset: 0,
                 length: 6,
-                hash: [0x01u8; 32],
+                hash: *chunk0_hash.as_bytes(),
             },
             ChunkInfo {
                 index: 1,
                 offset: 6,
                 length: 5,
-                hash: [0x02u8; 32],
+                hash: *chunk1_hash.as_bytes(),
             },
         ];
 
@@ -563,20 +605,28 @@ mod tests {
     async fn reconstruct_partial_cache_returns_missing() {
         let cache = FileCache::open_in_memory().await.unwrap();
 
-        cache.put_chunk(&[0x01u8; 32], b"hello ").await.unwrap();
+        let chunk0_data = b"hello ";
+        let chunk1_data = b"world";
+        let chunk0_hash = Blake3Hash::new(chunk0_data);
+        let chunk1_hash = Blake3Hash::new(chunk1_data);
+
+        cache
+            .put_chunk(chunk0_hash.as_bytes(), chunk0_data)
+            .await
+            .unwrap();
 
         let chunks = vec![
             ChunkInfo {
                 index: 0,
                 offset: 0,
                 length: 6,
-                hash: [0x01u8; 32],
+                hash: *chunk0_hash.as_bytes(),
             },
             ChunkInfo {
                 index: 1,
                 offset: 6,
                 length: 5,
-                hash: [0x02u8; 32],
+                hash: *chunk1_hash.as_bytes(),
             },
         ];
 
@@ -584,7 +634,36 @@ mod tests {
         assert!(result.is_err());
         let missing = result.unwrap_err();
         assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0], [0x02u8; 32]);
+        assert_eq!(missing[0], *chunk1_hash.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn reconstruct_detects_corrupted_chunk() {
+        let cache = FileCache::open_in_memory().await.unwrap();
+
+        let chunk0_data = b"hello ";
+        let chunk0_hash = Blake3Hash::new(chunk0_data);
+
+        // Store WRONG data under the correct hash key
+        cache
+            .put_chunk(chunk0_hash.as_bytes(), b"CORRUPTED")
+            .await
+            .unwrap();
+
+        let chunks = vec![ChunkInfo {
+            index: 0,
+            offset: 0,
+            length: 6,
+            hash: *chunk0_hash.as_bytes(),
+        }];
+
+        let result = cache.reconstruct(&chunks).await;
+        assert!(result.is_err(), "corrupted chunk data must be rejected");
+        let bad_hashes = result.unwrap_err();
+        assert_eq!(bad_hashes.len(), 1);
+        // The returned hash should be the EXPECTED hash (chunk0_hash), not the
+        // hash of the corrupted data
+        assert_eq!(bad_hashes[0], *chunk0_hash.as_bytes());
     }
 
     #[tokio::test]
@@ -594,8 +673,8 @@ mod tests {
 
         let handle = make_handle(42);
         let root = Blake3Hash::new(b"persistent-root");
-        let chunk_hash = [0xABu8; 32];
         let chunk_data = b"persistent chunk data";
+        let chunk_hash = *Blake3Hash::new(chunk_data).as_bytes();
 
         {
             let cache = FileCache::open(&cache_dir).await.unwrap();
