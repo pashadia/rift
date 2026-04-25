@@ -428,14 +428,14 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                     .unwrap_or_else(|_| rift_common::crypto::Blake3Hash::from_array([0u8; 32]));
                 let manifest = crate::cache::db::Manifest {
                     root,
-                    chunks: read_result
-                        .chunks
+                    chunks: resolved
+                        .leaves
                         .iter()
-                        .map(|c| crate::cache::db::ChunkInfo {
-                            index: c.index,
-                            offset: chunk_starts.get(c.index as usize).copied().unwrap_or(0),
-                            length: c.length,
-                            hash: c.hash,
+                        .map(|leaf| crate::cache::db::ChunkInfo {
+                            index: leaf.chunk_index,
+                            offset: chunk_starts[leaf.chunk_index as usize],
+                            length: leaf.length,
+                            hash: *leaf.hash.as_bytes(),
                         })
                         .collect(),
                 };
@@ -1097,6 +1097,110 @@ mod tests {
         assert_eq!(
             manifest.chunks[2].offset, 300,
             "chunk 2 offset must be 300, not index×128KB"
+        );
+    }
+
+    /// A partial read (offset=120, length=50 within a 3-chunk file) only fetches
+    /// chunk 1 from the server, but the manifest must still contain ALL 3 leaves
+    /// from the resolved Merkle tree — not just the single fetched chunk.
+    /// This prevents cache corruption where a partial manifest replaces a complete one.
+    #[tokio::test]
+    async fn read_partial_range_stores_complete_manifest() {
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let chunk2_data = vec![0xCCu8; 150];
+        let (chunk_hashes, root_hash, _all_chunks) =
+            build_mock_chunks(vec![chunk0_data, chunk1_data.clone(), chunk2_data]);
+        let file_size: u64 = 100 + 200 + 150;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        // The Merkle drill must return ALL leaves so resolve_merkle_tree sees all 3 chunks.
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
+                        chunk_index: 1,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[2].to_vec(),
+                        length: 150,
+                        chunk_index: 2,
+                    },
+                ],
+            }))
+            .await;
+
+        // BUT read_chunks returns ONLY chunk 1 — simulating a partial read at offset 120.
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 1,
+                    length: 200,
+                    hash: chunk_hashes[1],
+                    data: chunk1_data,
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        // Read 50 bytes at offset 120 — entirely within chunk 1.
+        view.read(Path::new("file"), 120, 50, None)
+            .await
+            .expect("read should succeed");
+
+        // Inspect the manifest stored in cache.
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
+            .await
+            .expect("cache should open");
+        let manifest = cache
+            .get_manifest(&file_uuid)
+            .await
+            .expect("get_manifest ok")
+            .expect("manifest should exist");
+
+        // The manifest MUST contain ALL 3 leaves, not just the 1 fetched chunk.
+        assert_eq!(
+            manifest.chunks.len(),
+            3,
+            "manifest must contain all 3 leaves, got {} chunks",
+            manifest.chunks.len()
+        );
+        assert_eq!(
+            manifest.chunks.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0u32, 1, 2],
+            "manifest chunk indices must be [0, 1, 2]"
+        );
+        assert_eq!(
+            manifest.chunks.iter().map(|c| c.offset).collect::<Vec<_>>(),
+            vec![0u64, 100, 300],
+            "manifest chunk offsets must be [0, 100, 300]"
         );
     }
 
