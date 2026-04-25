@@ -68,6 +68,10 @@ pub struct RiftShareView<R: RemoteShare> {
     remote: Arc<R>,
     cache: Option<Arc<FileCache>>,
     handles: Arc<HandleCache>,
+    /// When true, skip all cache reads and writes — every chunk is fetched
+    /// fresh from the server. Useful for debugging data-integrity issues
+    /// (e.g. sporadic corruption in large files with deep Merkle trees).
+    no_cache: bool,
 }
 
 impl<R: RemoteShare> RiftShareView<R> {
@@ -77,6 +81,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             remote,
             cache: None,
             handles: Arc::new(handles),
+            no_cache: false,
         }
     }
 
@@ -91,7 +96,16 @@ impl<R: RemoteShare> RiftShareView<R> {
             remote,
             cache: Some(Arc::new(cache)),
             handles: Arc::new(handles),
+            no_cache: false,
         })
+    }
+
+    /// Enable no-cache mode: every read bypasses the local cache and fetches
+    /// fresh data from the server. Cached data is also not written back.
+    /// Intended for debugging data-integrity issues, NOT for production.
+    pub fn with_no_cache(mut self) -> Self {
+        self.no_cache = true;
+        self
     }
 
     fn resolve_path(&self, path: &Path) -> Result<Uuid, FsError> {
@@ -286,7 +300,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 }
                 (file_size, attrs.root_hash)
             }
-            Err(_) if self.cache.is_some() => {
+            Err(_) if !self.no_cache && self.cache.is_some() => {
                 if let Some(data) = self.try_read_from_cache(&handle, offset, length).await {
                     return Ok(data);
                 }
@@ -299,39 +313,45 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        if let Some(ref cache) = self.cache {
-            match cache.get_manifest(&handle).await {
-                Ok(Some(manifest)) => {
-                    if manifest.root.as_bytes() == merkle_root.as_slice() {
-                        match cache.reconstruct(&manifest.chunks).await {
-                            Ok(data) => {
-                                let start = offset as usize;
-                                let end = (offset + length).min(file_size) as usize;
-                                if end <= data.len() {
-                                    tracing::debug!("read {} bytes from cache", end - start);
-                                    return Ok(data[start..end].to_vec());
+        // When no_cache is enabled, skip the manifest cache look-up entirely
+        // so every read hits the server.
+        if !self.no_cache {
+            if let Some(ref cache) = self.cache {
+                match cache.get_manifest(&handle).await {
+                    Ok(Some(manifest)) => {
+                        if manifest.root.as_bytes() == merkle_root.as_slice() {
+                            match cache.reconstruct(&manifest.chunks).await {
+                                Ok(data) => {
+                                    let start = offset as usize;
+                                    let end = (offset + length).min(file_size) as usize;
+                                    if end <= data.len() {
+                                        tracing::debug!("read {} bytes from cache", end - start);
+                                        return Ok(data[start..end].to_vec());
+                                    }
+                                }
+                                Err(ref bad_hashes) => {
+                                    tracing::warn!(
+                                        "cache data corrupted: {} chunks failed hash verification",
+                                        bad_hashes.len()
+                                    );
+                                    // Evict the corrupted manifest so subsequent reads re-fetch
+                                    let _ = cache.remove_manifest(&handle).await;
                                 }
                             }
-                            Err(ref bad_hashes) => {
-                                tracing::warn!(
-                                    "cache data corrupted: {} chunks failed hash verification",
-                                    bad_hashes.len()
-                                );
-                                // Evict the corrupted manifest so subsequent reads re-fetch
-                                let _ = cache.remove_manifest(&handle).await;
-                            }
+                        } else {
+                            tracing::debug!("root hash changed, cache invalid");
                         }
-                    } else {
-                        tracing::debug!("root hash changed, cache invalid");
+                    }
+                    Ok(None) => {
+                        tracing::debug!("no cached manifest for handle");
+                    }
+                    Err(e) => {
+                        tracing::warn!("cache error: {}", e);
                     }
                 }
-                Ok(None) => {
-                    tracing::debug!("no cached manifest for handle");
-                }
-                Err(e) => {
-                    tracing::warn!("cache error: {}", e);
-                }
             }
+        } else {
+            tracing::debug!("no-cache mode: bypassing manifest cache");
         }
 
         let end = (offset + length).min(file_size);
@@ -397,26 +417,32 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Err(FsError::Io);
         }
 
-        if let Some(ref cache) = self.cache {
-            for chunk in &read_result.chunks {
-                let _ = cache.put_chunk(&chunk.hash, &chunk.data).await;
+        // When no_cache is enabled, also skip writing fetched data to cache
+        // so the next read will also go to the server.
+        if !self.no_cache {
+            if let Some(ref cache) = self.cache {
+                for chunk in &read_result.chunks {
+                    let _ = cache.put_chunk(&chunk.hash, &chunk.data).await;
+                }
+                let root = rift_common::crypto::Blake3Hash::from_slice(&merkle_root)
+                    .unwrap_or_else(|_| rift_common::crypto::Blake3Hash::from_array([0u8; 32]));
+                let manifest = crate::cache::db::Manifest {
+                    root,
+                    chunks: read_result
+                        .chunks
+                        .iter()
+                        .map(|c| crate::cache::db::ChunkInfo {
+                            index: c.index,
+                            offset: chunk_starts.get(c.index as usize).copied().unwrap_or(0),
+                            length: c.length,
+                            hash: c.hash,
+                        })
+                        .collect(),
+                };
+                let _ = cache.put_manifest(&handle, &manifest).await;
             }
-            let root = rift_common::crypto::Blake3Hash::from_slice(&merkle_root)
-                .unwrap_or_else(|_| rift_common::crypto::Blake3Hash::from_array([0u8; 32]));
-            let manifest = crate::cache::db::Manifest {
-                root,
-                chunks: read_result
-                    .chunks
-                    .iter()
-                    .map(|c| crate::cache::db::ChunkInfo {
-                        index: c.index,
-                        offset: chunk_starts.get(c.index as usize).copied().unwrap_or(0),
-                        length: c.length,
-                        hash: c.hash,
-                    })
-                    .collect(),
-            };
-            let _ = cache.put_manifest(&handle, &manifest).await;
+        } else {
+            tracing::debug!("no-cache mode: skipping cache write");
         }
 
         let mut all_data = Vec::new();
@@ -2080,6 +2106,186 @@ mod tests {
             matches!(result, Err(FsError::Io)),
             "wrong chunk length should return FsError::Io, got {:?}",
             result
+        );
+    }
+
+    // =======================================================================
+    // no_cache mode tests
+    // =======================================================================
+
+    /// When `with_no_cache()` is enabled, even if data was previously cached,
+    /// reads must always go to the server.
+    #[tokio::test]
+    async fn no_cache_mode_bypasses_manifest_cache() {
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed")
+            .with_no_cache();
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        let content = b"hello world";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: content.to_vec(),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // First read: should go to server, but NOT write to cache
+        let result = view
+            .read(Path::new("file"), 0, content.len() as u64, None)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), content);
+
+        // Verify that read_chunks was called (server was contacted)
+        assert_eq!(
+            remote.get_read_chunks_call_count().await,
+            1,
+            "first read should contact server"
+        );
+
+        // Verify that the cache does NOT contain the manifest
+        // (no_cache mode should have skipped the cache write)
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
+            .await
+            .expect("cache should open");
+        let manifest = cache
+            .get_manifest(&file_uuid)
+            .await
+            .expect("get_manifest ok");
+        assert!(
+            manifest.is_none(),
+            "no_cache mode should NOT have written manifest to cache"
+        );
+    }
+
+    /// Second read in no_cache mode should also hit the server,
+    /// not the cache.
+    #[tokio::test]
+    async fn no_cache_mode_always_fetches_from_server() {
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root_uuid).with_no_cache();
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        let content = b"data from server";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        // MockRemote uses .take() so we must re-set results before each read
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: content.to_vec(),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // First read
+        let result = view
+            .read(Path::new("file"), 0, content.len() as u64, None)
+            .await;
+        assert_eq!(result.unwrap(), content);
+
+        // Re-set mock results for second read (MockRemote consumes them)
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: content.to_vec(),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // Second read - should also go to server in no_cache mode
+        let result = view
+            .read(Path::new("file"), 0, content.len() as u64, None)
+            .await;
+        assert_eq!(result.unwrap(), content);
+
+        // Both reads should have called read_chunks (server was contacted)
+        let call_count = remote.get_read_chunks_call_count().await;
+        assert_eq!(
+            call_count, 2,
+            "no_cache mode: both reads should contact the server, got {call_count} calls"
         );
     }
 }

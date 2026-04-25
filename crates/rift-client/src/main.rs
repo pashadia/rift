@@ -36,6 +36,14 @@ enum Command {
         /// Config directory for persistent certificates (legacy, prefer --state-dir)
         #[arg(long, hide = true)]
         config_dir: Option<PathBuf>,
+
+        /// Disable client-side cache entirely (debugging only!).
+        ///
+        /// Every read will fetch chunks directly from the server, bypassing
+        /// any cached manifest or chunk data. Useful for tracking down
+        /// sporadic data corruption in large files with deep Merkle trees.
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -60,9 +68,10 @@ async fn main() -> Result<()> {
             path,
             state_dir,
             config_dir,
+            no_cache,
         } => {
             if !cfg!(target_os = "linux") {
-                let _ = (server, share, path, state_dir, config_dir);
+                let _ = (server, share, path, state_dir, config_dir, no_cache);
                 anyhow::bail!("mount is only supported on Linux");
             }
 
@@ -102,12 +111,19 @@ async fn main() -> Result<()> {
 
                 let reconnecting = rift_client::reconnect::ReconnectingClient::new(client);
 
-                let view = rift_client::view::RiftShareView::with_cache(
+                let mut view = rift_client::view::RiftShareView::with_cache(
                     std::sync::Arc::new(reconnecting),
                     root_handle,
                     paths.cache_dir(),
                 )
                 .await?;
+
+                if no_cache {
+                    view = view.with_no_cache();
+                    tracing::warn!(
+                        "no-cache mode enabled: every read will fetch fresh data from the server"
+                    );
+                }
 
                 println!("Connected — server fingerprint: {fingerprint}");
 
