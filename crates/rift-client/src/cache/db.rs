@@ -210,11 +210,9 @@ impl FileCache {
                 (&handle_str, &root_bytes, now),
             )?;
 
-            tx.execute("DELETE FROM chunk_refs WHERE handle = ?1", [&handle_str])?;
-
             for (index, offset, length, hash) in &chunks {
                 tx.execute(
-                    "INSERT INTO chunk_refs (handle, chunk_index, byte_offset, byte_length, chunk_hash)
+                    "INSERT OR REPLACE INTO chunk_refs (handle, chunk_index, byte_offset, byte_length, chunk_hash)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     (&handle_str, index, offset, length, hash),
                 )?;
@@ -664,6 +662,145 @@ mod tests {
         // The returned hash should be the EXPECTED hash (chunk0_hash), not the
         // hash of the corrupted data
         assert_eq!(bad_hashes[0], *chunk0_hash.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn put_manifest_accumulates_chunks() {
+        let cache = FileCache::open_in_memory().await.unwrap();
+        let handle = make_handle(1);
+
+        // First call: chunks 0 and 1
+        let manifest1 = Manifest {
+            root: Blake3Hash::new(b"test-root"),
+            chunks: vec![
+                ChunkInfo {
+                    index: 0,
+                    offset: 0,
+                    length: 100,
+                    hash: [0x01u8; 32],
+                },
+                ChunkInfo {
+                    index: 1,
+                    offset: 100,
+                    length: 200,
+                    hash: [0x02u8; 32],
+                },
+            ],
+        };
+        cache.put_manifest(&handle, &manifest1).await.unwrap();
+
+        // Second call: chunks 2 and 3
+        let manifest2 = Manifest {
+            root: Blake3Hash::new(b"test-root"),
+            chunks: vec![
+                ChunkInfo {
+                    index: 2,
+                    offset: 300,
+                    length: 300,
+                    hash: [0x03u8; 32],
+                },
+                ChunkInfo {
+                    index: 3,
+                    offset: 600,
+                    length: 400,
+                    hash: [0x04u8; 32],
+                },
+            ],
+        };
+        cache.put_manifest(&handle, &manifest2).await.unwrap();
+
+        // After both calls, the manifest should have ALL FOUR chunks
+        let result = cache.get_manifest(&handle).await.unwrap().unwrap();
+        assert_eq!(
+            result.chunks.len(),
+            4,
+            "expected 4 accumulated chunks, got {}",
+            result.chunks.len()
+        );
+        assert_eq!(result.chunks[0].index, 0);
+        assert_eq!(result.chunks[1].index, 1);
+        assert_eq!(result.chunks[2].index, 2);
+        assert_eq!(result.chunks[3].index, 3);
+    }
+
+    #[tokio::test]
+    async fn put_manifest_idempotent() {
+        let cache = FileCache::open_in_memory().await.unwrap();
+        let handle = make_handle(1);
+
+        let manifest = Manifest {
+            root: Blake3Hash::new(b"test-root"),
+            chunks: vec![
+                ChunkInfo {
+                    index: 0,
+                    offset: 0,
+                    length: 100,
+                    hash: [0xAAu8; 32],
+                },
+                ChunkInfo {
+                    index: 1,
+                    offset: 100,
+                    length: 200,
+                    hash: [0xBBu8; 32],
+                },
+            ],
+        };
+
+        // Call put_manifest twice with the same data
+        cache.put_manifest(&handle, &manifest).await.unwrap();
+        cache.put_manifest(&handle, &manifest).await.unwrap();
+
+        // Should return exactly the same chunks — no duplicates, no errors
+        let result = cache.get_manifest(&handle).await.unwrap().unwrap();
+        assert_eq!(
+            result.chunks.len(),
+            2,
+            "expected 2 chunks after idempotent put, got {}",
+            result.chunks.len()
+        );
+        assert_eq!(result.chunks[0].index, 0);
+        assert_eq!(result.chunks[0].hash, [0xAAu8; 32]);
+        assert_eq!(result.chunks[1].index, 1);
+        assert_eq!(result.chunks[1].hash, [0xBBu8; 32]);
+    }
+
+    #[tokio::test]
+    async fn put_manifest_updates_stale_chunk_refs() {
+        let cache = FileCache::open_in_memory().await.unwrap();
+        let handle = make_handle(1);
+
+        // First call: chunk 0 with hash A
+        let manifest1 = Manifest {
+            root: Blake3Hash::new(b"test-root"),
+            chunks: vec![ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [0xAAu8; 32],
+            }],
+        };
+        cache.put_manifest(&handle, &manifest1).await.unwrap();
+
+        // Second call: chunk 0 with hash B (updated)
+        let manifest2 = Manifest {
+            root: Blake3Hash::new(b"test-root"),
+            chunks: vec![ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [0xBBu8; 32],
+            }],
+        };
+        cache.put_manifest(&handle, &manifest2).await.unwrap();
+
+        // The newer value (hash B) should win
+        let result = cache.get_manifest(&handle).await.unwrap().unwrap();
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(result.chunks[0].index, 0);
+        assert_eq!(
+            result.chunks[0].hash, [0xBBu8; 32],
+            "expected updated hash B for chunk 0"
+        );
     }
 
     #[tokio::test]
