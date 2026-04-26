@@ -431,7 +431,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                     }
                 }
                 let root = rift_common::crypto::Blake3Hash::from_slice(&merkle_root)
-                    .unwrap_or_else(|_| rift_common::crypto::Blake3Hash::from_array([0u8; 32]));
+                    .map_err(|_| FsError::Io)?;
                 let manifest = crate::cache::db::Manifest {
                     root,
                     chunks: resolved
@@ -454,8 +454,23 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             tracing::debug!("no-cache mode: skipping cache write");
         }
 
+        // Validate that received chunks have the expected indices and
+        // assemble data in index order (not received order).
+        let mut sorted_chunks: Vec<_> = read_result.chunks.into_iter().collect();
+        sorted_chunks.sort_by_key(|c| c.index);
+        for (i, chunk) in sorted_chunks.iter().enumerate() {
+            if chunk.index != start_chunk + i as u32 {
+                tracing::error!(
+                    "chunk index mismatch: expected {}, got {}",
+                    start_chunk + i as u32,
+                    chunk.index
+                );
+                return Err(FsError::Io);
+            }
+        }
+
         let mut all_data = Vec::new();
-        for chunk in read_result.chunks {
+        for chunk in sorted_chunks {
             all_data.extend(chunk.data);
         }
 
@@ -482,24 +497,29 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 /// Returns `true` if coverage is sufficient, `false` if not (the cache-hit
 /// path should fall through to server fetch).
 fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_size: u64) -> bool {
-    // 1. No chunks at all — can't cover anything
+    // 1. Zero-length reads always succeed (POSIX: read(fd, buf, 0) returns 0)
+    if length == 0 {
+        return true;
+    }
+
+    // 2. No chunks at all — can't cover anything
     if chunks.is_empty() {
         return false;
     }
 
-    // 2. First chunk must have index 0
+    // 3. First chunk must have index 0
     if chunks[0].index != 0 {
         return false;
     }
 
-    // 3. Chunks must be contiguous (no gaps)
+    // 4. Chunks must be contiguous (no gaps)
     for i in 1..chunks.len() {
         if chunks[i].index != chunks[i - 1].index + 1 {
             return false;
         }
     }
 
-    // 3.5. Offsets must be monotonically increasing without gaps
+    // 5. Offsets must be monotonically increasing without gaps
     let mut expected_offset = 0u64;
     for chunk in chunks {
         if chunk.offset != expected_offset {
@@ -508,13 +528,13 @@ fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_si
         expected_offset += chunk.length;
     }
 
-    // 4. Sum of all chunk lengths must equal file_size
+    // 6. Sum of all chunk lengths must equal file_size
     let total_len: u64 = chunks.iter().map(|c| c.length).sum();
     if total_len != file_size {
         return false;
     }
 
-    // 5. Requested range must fall within the file
+    // 7. Requested range must fall within the file
     if offset >= file_size {
         return false;
     }
@@ -2799,5 +2819,258 @@ mod tests {
             },
         ];
         assert!(!manifest_covers_range(&chunks, 0, 50, 200));
+    }
+
+    // =======================================================================
+    // Issue #1: Chunk ordering validation in read()
+    // =======================================================================
+
+    /// When read_chunks returns chunks out of order (e.g., index 1 before index 0),
+    /// read() must validate indices and assemble data by chunk index, not received order.
+    /// Without this fix, a buggy or malicious server could cause incorrect data assembly.
+    #[tokio::test]
+    async fn read_assembles_chunks_by_index_not_received_order() {
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let (chunk_hashes, root_hash, _) =
+            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+        let file_size: u64 = 100 + 200;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
+                        chunk_index: 1,
+                    },
+                ],
+            }))
+            .await;
+        // Return chunks in REVERSE order: index 1 first, then index 0
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![
+                    ChunkData {
+                        index: 1,
+                        length: 200,
+                        hash: chunk_hashes[1],
+                        data: chunk1_data.clone(),
+                    },
+                    ChunkData {
+                        index: 0,
+                        length: 100,
+                        hash: chunk_hashes[0],
+                        data: chunk0_data.clone(),
+                    },
+                ],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("read should succeed even with out-of-order chunks");
+
+        // The assembled data must be chunk0 followed by chunk1, NOT reversed
+        let mut expected = chunk0_data;
+        expected.extend(chunk1_data);
+        assert_eq!(
+            result, expected,
+            "data must be assembled by chunk index, not received order"
+        );
+    }
+
+    // =======================================================================
+    // Issue #3: Zero-length read coverage
+    // =======================================================================
+
+    /// Zero-length reads must always succeed, even when offset >= file_size.
+    /// POSIX allows read(fd, buf, 0) to return 0 bytes at any offset.
+    #[test]
+    fn coverage_zero_length_returns_true() {
+        let chunks = vec![ChunkInfo {
+            index: 0,
+            offset: 0,
+            length: 100,
+            hash: [0u8; 32],
+        }];
+        // offset=100 is at/past the end of the data, but length=0 means it's valid
+        assert!(
+            manifest_covers_range(&chunks, 100, 0, 200),
+            "zero-length read should always succeed"
+        );
+    }
+
+    // =======================================================================
+    // Issue #5: Partial-read → full-read cache cycle integration test
+    // =======================================================================
+
+    /// Integration test: (1) partial read caches some chunks in manifest,
+    /// (2) second read needs missing chunks → cache miss with manifest eviction,
+    /// (3) third read → cache hit.
+    ///
+    /// Specifically:
+    /// - Read bytes 100-150 of a 3-chunk file (needs chunk 1 only)
+    /// - Read bytes 0-300 of the same file (needs all 3 chunks)
+    /// - Verify server is contacted for the full read
+    /// - Verify the data is correct
+    #[tokio::test]
+    async fn partial_read_then_full_read_refetches_correctly() {
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let chunk2_data = vec![0xCCu8; 150];
+        let (chunk_hashes, root_hash, all_chunks) = build_mock_chunks(vec![
+            chunk0_data.clone(),
+            chunk1_data.clone(),
+            chunk2_data.clone(),
+        ]);
+        let file_size: u64 = 100 + 200 + 150;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        // --- Step 1: Partial read (bytes 100-150, within chunk 1) ---
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
+                        chunk_index: 1,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[2].to_vec(),
+                        length: 150,
+                        chunk_index: 2,
+                    },
+                ],
+            }))
+            .await;
+        // Only chunk 1 is fetched for the partial read
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 1,
+                    length: 200,
+                    hash: chunk_hashes[1],
+                    data: chunk1_data.clone(),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        let result = view
+            .read(Path::new("file"), 100, 50, None)
+            .await
+            .expect("partial read should succeed");
+        // bytes 100-150 are the first 50 bytes of chunk 1
+        assert_eq!(
+            result,
+            vec![0xBBu8; 50],
+            "partial read data should be correct"
+        );
+        assert_eq!(
+            remote.get_read_chunks_call_count().await,
+            1,
+            "first read should contact the server once"
+        );
+
+        // --- Step 2: Full read (bytes 0-300, needs all 3 chunks) ---
+        // The manifest now has all 3 leaves but only chunk 1's data is cached.
+        // reconstruct_range will fail for the missing chunks → manifest evicted → server fetch.
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
+                        chunk_index: 1,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[2].to_vec(),
+                        length: 150,
+                        chunk_index: 2,
+                    },
+                ],
+            }))
+            .await;
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: all_chunks,
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("full read should succeed");
+        let mut expected_full = chunk0_data;
+        expected_full.extend(chunk1_data);
+        expected_full.extend(chunk2_data);
+        assert_eq!(
+            result, expected_full,
+            "full read data should be correct after partial read cache miss"
+        );
+        assert_eq!(
+            remote.get_read_chunks_call_count().await,
+            2,
+            "full read should contact the server (cache miss for missing chunks)"
+        );
     }
 }
