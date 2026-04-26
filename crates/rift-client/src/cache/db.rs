@@ -182,6 +182,11 @@ impl FileCache {
     }
 
     /// Store a file manifest (root hash + chunk list).
+    ///
+    /// Uses INSERT OR REPLACE for each chunk_ref so a complete manifest always
+    /// replaces a partial one. After inserting all chunk_refs, prunes any stale
+    /// entries with `chunk_index >= N` (where N = chunk count), which can occur
+    /// if the file shrank between versions.
     pub async fn put_manifest(&self, handle: &Uuid, manifest: &Manifest) -> SqliteResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -202,6 +207,7 @@ impl FileCache {
                 )
             })
             .collect();
+        let chunk_count = chunks.len() as i64;
 
         self.call(move |conn: &mut rusqlite::Connection| {
             let tx = conn.transaction()?;
@@ -217,6 +223,13 @@ impl FileCache {
                     (&handle_str, index, offset, length, hash),
                 )?;
             }
+
+            // Prune stale chunk_refs: any entry with chunk_index >= the count
+            // of the new manifest is from a previous version and should be removed.
+            tx.execute(
+                "DELETE FROM chunk_refs WHERE handle = ?1 AND chunk_index >= ?2",
+                (&handle_str, chunk_count),
+            )?;
 
             tx.commit()
         })
@@ -664,14 +677,17 @@ mod tests {
         assert_eq!(bad_hashes[0], *chunk0_hash.as_bytes());
     }
 
+    /// put_manifest prunes stale entries from a previous version.
+    /// When a file shrinks (e.g. from 4 chunks to 2), the old entries at
+    /// chunk_index >= 2 must be removed.
     #[tokio::test]
-    async fn put_manifest_accumulates_chunks() {
+    async fn put_manifest_prunes_stale_chunk_refs() {
         let cache = FileCache::open_in_memory().await.unwrap();
         let handle = make_handle(1);
 
-        // First call: chunks 0 and 1
+        // First: store a manifest with 3 chunks [0, 1, 2]
         let manifest1 = Manifest {
-            root: Blake3Hash::new(b"test-root"),
+            root: Blake3Hash::new(b"test-root-v1"),
             chunks: vec![
                 ChunkInfo {
                     index: 0,
@@ -685,42 +701,47 @@ mod tests {
                     length: 200,
                     hash: [0x02u8; 32],
                 },
-            ],
-        };
-        cache.put_manifest(&handle, &manifest1).await.unwrap();
-
-        // Second call: chunks 2 and 3
-        let manifest2 = Manifest {
-            root: Blake3Hash::new(b"test-root"),
-            chunks: vec![
                 ChunkInfo {
                     index: 2,
                     offset: 300,
                     length: 300,
                     hash: [0x03u8; 32],
                 },
+            ],
+        };
+        cache.put_manifest(&handle, &manifest1).await.unwrap();
+
+        // Second: file shrinks — store a manifest with only 2 chunks [0, 1]
+        let manifest2 = Manifest {
+            root: Blake3Hash::new(b"test-root-v2"),
+            chunks: vec![
                 ChunkInfo {
-                    index: 3,
-                    offset: 600,
-                    length: 400,
-                    hash: [0x04u8; 32],
+                    index: 0,
+                    offset: 0,
+                    length: 100,
+                    hash: [0x11u8; 32],
+                },
+                ChunkInfo {
+                    index: 1,
+                    offset: 100,
+                    length: 200,
+                    hash: [0x12u8; 32],
                 },
             ],
         };
         cache.put_manifest(&handle, &manifest2).await.unwrap();
 
-        // After both calls, the manifest should have ALL FOUR chunks
+        // get_manifest must return only 2 chunks, NOT 3
         let result = cache.get_manifest(&handle).await.unwrap().unwrap();
         assert_eq!(
             result.chunks.len(),
-            4,
-            "expected 4 accumulated chunks, got {}",
+            2,
+            "expected 2 chunks after shrink, got {}",
             result.chunks.len()
         );
         assert_eq!(result.chunks[0].index, 0);
         assert_eq!(result.chunks[1].index, 1);
-        assert_eq!(result.chunks[2].index, 2);
-        assert_eq!(result.chunks[3].index, 3);
+        // The stale chunk_index=2 entry must have been pruned
     }
 
     #[tokio::test]

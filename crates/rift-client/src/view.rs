@@ -1,4 +1,4 @@
-use crate::cache::db::FileCache;
+use crate::cache::db::{ChunkInfo, FileCache};
 use crate::handle::HandleCache;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
@@ -319,23 +319,30 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 match cache.get_manifest(&handle).await {
                     Ok(Some(manifest)) => {
                         if manifest.root.as_bytes() == merkle_root.as_slice() {
-                            match cache.reconstruct(&manifest.chunks).await {
-                                Ok(data) => {
-                                    let start = offset as usize;
-                                    let end = (offset + length).min(file_size) as usize;
-                                    if end <= data.len() {
-                                        tracing::debug!("read {} bytes from cache", end - start);
-                                        return Ok(data[start..end].to_vec());
+                            if manifest_covers_range(&manifest.chunks, offset, length, file_size) {
+                                match cache.reconstruct(&manifest.chunks).await {
+                                    Ok(data) => {
+                                        let start = offset as usize;
+                                        let end = (offset + length).min(file_size) as usize;
+                                        if end <= data.len() {
+                                            tracing::debug!(
+                                                "read {} bytes from cache",
+                                                end - start
+                                            );
+                                            return Ok(data[start..end].to_vec());
+                                        }
+                                    }
+                                    Err(ref bad_hashes) => {
+                                        tracing::warn!(
+                                            "cache data corrupted: {} chunks failed hash verification",
+                                            bad_hashes.len()
+                                        );
+                                        // Evict the corrupted manifest so subsequent reads re-fetch
+                                        let _ = cache.remove_manifest(&handle).await;
                                     }
                                 }
-                                Err(ref bad_hashes) => {
-                                    tracing::warn!(
-                                        "cache data corrupted: {} chunks failed hash verification",
-                                        bad_hashes.len()
-                                    );
-                                    // Evict the corrupted manifest so subsequent reads re-fetch
-                                    let _ = cache.remove_manifest(&handle).await;
-                                }
+                            } else {
+                                tracing::debug!("manifest does not cover requested range, falling through to server");
                             }
                         } else {
                             tracing::debug!("root hash changed, cache invalid");
@@ -467,6 +474,47 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
     }
 }
 
+/// Check whether the manifest's chunks form a contiguous range starting
+/// from chunk 0 that covers `[offset, offset+length)` bytes.
+///
+/// Returns `true` if coverage is sufficient, `false` if not (the cache-hit
+/// path should fall through to server fetch).
+fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_size: u64) -> bool {
+    // 1. No chunks at all — can't cover anything
+    if chunks.is_empty() {
+        return false;
+    }
+
+    // 2. First chunk must have index 0
+    if chunks[0].index != 0 {
+        return false;
+    }
+
+    // 3. Chunks must be contiguous (no gaps)
+    for i in 1..chunks.len() {
+        if chunks[i].index != chunks[i - 1].index + 1 {
+            return false;
+        }
+    }
+
+    // 4. Sum of all chunk lengths must equal file_size
+    let total_len: u64 = chunks.iter().map(|c| c.length).sum();
+    if total_len != file_size {
+        return false;
+    }
+
+    // 5. Requested range must fall within the file
+    if offset >= file_size {
+        return false;
+    }
+    let end = offset.saturating_add(length);
+    if end > file_size {
+        return false;
+    }
+
+    true
+}
+
 impl<R: RemoteShare> RiftShareView<R> {
     async fn try_read_from_cache(
         &self,
@@ -476,6 +524,14 @@ impl<R: RemoteShare> RiftShareView<R> {
     ) -> Option<Vec<u8>> {
         let cache = self.cache.as_ref()?;
         let manifest = cache.get_manifest(handle).await.ok()??;
+
+        // Determine file_size from the manifest chunks
+        let file_size: u64 = manifest.chunks.iter().map(|c| c.length).sum();
+        if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
+            tracing::debug!("offline read: manifest does not cover requested range");
+            return None;
+        }
+
         match cache.reconstruct(&manifest.chunks).await {
             Ok(data) => {
                 let start = offset as usize;
@@ -1013,22 +1069,18 @@ mod tests {
         );
     }
 
-    /// Manifest offsets must be computed from positional iteration, not from
-    /// `chunk_index`.  When `chunk_index` values are non-contiguous (e.g. [0, 2]
-    /// with a gap at 1), the old code `chunk_starts[leaf.chunk_index as usize]`
-    /// would index the wrong entry (or the sentinel). The fix uses `enumerate()`
-    /// so that `chunk_starts[i]` always refers to the i-th leaf's offset.
+    /// Manifest offsets must be computed from positional iteration, not
+    /// from any fixed chunk-size formula.
     ///
-    /// Two chunks with chunk_index [0, 2] and sizes [100, 200].
-    /// The stored offsets must be [0, 100] (position-based), NOT [0, 300]
-    /// (which the old chunk_index-based indexing would produce — chunk_starts[2]
-    /// is the sentinel = total file size).
+    /// With variable chunk sizes [100, 200], chunk 1's offset must be 100
+    /// (cumulative position), NOT 128*1024 or any other index-based formula.
+    /// After coverage validation, manifests must use contiguous indices [0, 1].
     #[tokio::test]
     async fn manifest_offsets_use_position_not_chunk_index() {
         let chunk0_data = vec![0xAAu8; 100];
-        let chunk2_data = vec![0xCCu8; 200];
+        let chunk1_data = vec![0xCCu8; 200];
         let (chunk_hashes, root_hash, _all_chunks) =
-            build_mock_chunks(vec![chunk0_data, chunk2_data.clone()]);
+            build_mock_chunks(vec![chunk0_data, chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1044,9 +1096,7 @@ mod tests {
         view.handles
             .insert(std::path::PathBuf::from("file"), file_uuid);
 
-        // Non-contiguous chunk_index: [0, 2] — gap at index 1.
-        // This would have caused the old code to index chunk_starts[2] (the sentinel)
-        // instead of chunk_starts[1] (the 2nd leaf's actual offset).
+        // Contiguous chunk_index: [0, 1] with variable sizes [100, 200].
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
             .await;
@@ -1064,7 +1114,7 @@ mod tests {
                         is_subtree: false,
                         hash: chunk_hashes[1].to_vec(),
                         length: 200,
-                        chunk_index: 2, // non-contiguous!
+                        chunk_index: 1,
                     },
                 ],
             }))
@@ -1079,10 +1129,10 @@ mod tests {
                         data: vec![0xAAu8; 100],
                     },
                     ChunkData {
-                        index: 2,
+                        index: 1,
                         length: 200,
                         hash: chunk_hashes[1],
-                        data: chunk2_data,
+                        data: chunk1_data,
                     },
                 ],
                 merkle_root: root_hash.to_vec(),
@@ -1104,14 +1154,13 @@ mod tests {
             .expect("manifest should exist");
 
         assert_eq!(manifest.chunks.len(), 2);
-        // chunk_index values are preserved as-is
         assert_eq!(manifest.chunks[0].index, 0);
-        assert_eq!(manifest.chunks[1].index, 2);
-        // Offsets must be position-based: [0, 100], NOT [0, 300]
+        assert_eq!(manifest.chunks[1].index, 1);
+        // Offsets must be position-based: [0, 100], NOT [0, 131072]
         assert_eq!(manifest.chunks[0].offset, 0, "1st leaf offset must be 0");
         assert_eq!(
             manifest.chunks[1].offset, 100,
-            "2nd leaf offset must be 100 (position-based), not 300 (chunk_index-based into sentinel)"
+            "2nd leaf offset must be 100 (position-based), not 131072 (chunk_index × 128KB)"
         );
     }
 
@@ -2492,6 +2541,204 @@ mod tests {
         assert_eq!(
             call_count, 2,
             "no_cache mode: both reads should contact the server, got {call_count} calls"
+        );
+    }
+
+    // =======================================================================
+    // manifest_covers_range tests
+    // =======================================================================
+
+    /// Missing chunk 0: chunks [1, 2] do not start from index 0.
+    #[test]
+    fn coverage_missing_chunk_0_returns_false() {
+        let chunks = vec![
+            ChunkInfo {
+                index: 1,
+                offset: 100,
+                length: 200,
+                hash: [0x01; 32],
+            },
+            ChunkInfo {
+                index: 2,
+                offset: 300,
+                length: 150,
+                hash: [0x02; 32],
+            },
+        ];
+        assert!(!manifest_covers_range(&chunks, 0, 100, 450));
+    }
+
+    /// Gap in the middle: chunks [0, 2] — missing index 1.
+    #[test]
+    fn coverage_gap_in_middle_returns_false() {
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [0x00; 32],
+            },
+            ChunkInfo {
+                index: 2,
+                offset: 300,
+                length: 150,
+                hash: [0x02; 32],
+            },
+        ];
+        assert!(!manifest_covers_range(&chunks, 0, 100, 450));
+    }
+
+    /// Complete contiguous chunks [0, 1, 2] — all checks pass.
+    #[test]
+    fn coverage_complete_returns_true() {
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [0x00; 32],
+            },
+            ChunkInfo {
+                index: 1,
+                offset: 100,
+                length: 200,
+                hash: [0x01; 32],
+            },
+            ChunkInfo {
+                index: 2,
+                offset: 300,
+                length: 150,
+                hash: [0x02; 32],
+            },
+        ];
+        let file_size = 100 + 200 + 150;
+        assert!(manifest_covers_range(&chunks, 0, 100, file_size));
+        assert!(manifest_covers_range(&chunks, 120, 50, file_size));
+        assert!(manifest_covers_range(&chunks, 400, 50, file_size));
+    }
+
+    /// All chunks present but the requested range is beyond the file.
+    #[test]
+    fn coverage_range_beyond_file_returns_false() {
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [0x00; 32],
+            },
+            ChunkInfo {
+                index: 1,
+                offset: 100,
+                length: 200,
+                hash: [0x01; 32],
+            },
+        ];
+        let file_size = 300;
+        // offset >= file_size
+        assert!(!manifest_covers_range(&chunks, 300, 10, file_size));
+        // offset + length > file_size
+        assert!(!manifest_covers_range(&chunks, 200, 200, file_size));
+    }
+
+    /// Integration test: A partial manifest in cache (missing chunk 0) must
+    /// cause a cache miss — the read falls through to the server and does NOT
+    /// return stale/wrong data.
+    #[tokio::test]
+    async fn partial_manifest_causes_cache_miss() {
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 200];
+        let (chunk_hashes, root_hash, all_chunks) =
+            build_mock_chunks(vec![chunk0_data, chunk1_data.clone()]);
+        let file_size: u64 = 100 + 200;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        // Store a partial manifest directly: only chunk 1 (missing chunk 0)
+        {
+            let cache = crate::cache::db::FileCache::open(&cache_dir)
+                .await
+                .expect("cache should open");
+            let partial_manifest = crate::cache::db::Manifest {
+                root: Blake3Hash::from_slice(&root_hash).unwrap(),
+                chunks: vec![crate::cache::db::ChunkInfo {
+                    index: 1,
+                    offset: 100,
+                    length: 200,
+                    hash: chunk_hashes[1],
+                }],
+            };
+            cache
+                .put_manifest(&file_uuid, &partial_manifest)
+                .await
+                .unwrap();
+            // Also store chunk 1 data so reconstruct would succeed if not for coverage check
+            cache
+                .put_chunk(&chunk_hashes[1], &chunk1_data)
+                .await
+                .unwrap();
+        }
+
+        // Set up mock for server fetch (which should happen because of the cache miss)
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
+                        chunk_index: 1,
+                    },
+                ],
+            }))
+            .await;
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: all_chunks,
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // Read at offset 0 — partial manifest should cause cache miss,
+        // falling through to server fetch
+        let result = view
+            .read(Path::new("file"), 0, 100, None)
+            .await
+            .expect("read should succeed");
+
+        // Must have gotten the correct data from the server, not wrong data from cache
+        assert_eq!(
+            result,
+            vec![0xAAu8; 100],
+            "must return correct data from server, not stale cache data"
+        );
+
+        // Server must have been contacted (cache missed)
+        let call_count = remote.get_read_chunks_call_count().await;
+        assert_eq!(
+            call_count, 1,
+            "server must be contacted since partial manifest should cause cache miss"
         );
     }
 }
