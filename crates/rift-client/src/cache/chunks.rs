@@ -44,7 +44,11 @@ impl ChunkStore {
 
         // Write to a temp file first, then rename (atomic on same filesystem)
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let tmp_name = format!(".tmp_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+        let tmp_name = format!(
+            ".tmp_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let tmp_path = parent.join(&tmp_name);
 
         if let Err(e) = tokio::fs::write(&tmp_path, data).await {
@@ -240,6 +244,31 @@ mod tests {
             "shard directory should exist: {:?}",
             shard_dir
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_write_chunk_no_collision() {
+        // Two ChunkStore instances sharing the same base dir should be able
+        // to write different chunks without colliding on temp files.
+        // The PID + counter in the temp name ensures uniqueness across processes.
+        let tmp = TempDir::new().unwrap();
+        let store1 = ChunkStore::open(tmp.path()).await.unwrap();
+        let store2 = ChunkStore::open(tmp.path()).await.unwrap();
+
+        let hash1 = make_hash(0x01);
+        let hash2 = make_hash(0x02);
+        let data1 = b"data from store 1";
+        let data2 = b"data from store 2";
+
+        // Write from both stores
+        store1.write_chunk(&hash1, data1).await.unwrap();
+        store2.write_chunk(&hash2, data2).await.unwrap();
+
+        // Both chunks should be readable and contain correct data
+        let result1 = store1.read_chunk(&hash1).await.unwrap();
+        let result2 = store2.read_chunk(&hash2).await.unwrap();
+        assert_eq!(result1, Some(data1.to_vec()));
+        assert_eq!(result2, Some(data2.to_vec()));
     }
 
     #[tokio::test]
