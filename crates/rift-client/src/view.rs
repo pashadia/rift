@@ -334,7 +334,9 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                                             bad_hashes.len()
                                         );
                                         // Evict the corrupted manifest so subsequent reads re-fetch
-                                        let _ = cache.remove_manifest(&handle).await;
+                                        if let Err(e) = cache.remove_manifest(&handle).await {
+                                            tracing::warn!("failed to remove manifest: {}", e);
+                                        }
                                     }
                                 }
                             } else {
@@ -356,7 +358,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             tracing::debug!("no-cache mode: bypassing manifest cache");
         }
 
-        let end = (offset + length).min(file_size);
+        let end = offset.saturating_add(length).min(file_size);
 
         // Step 4: Recursively resolve the full Merkle tree, verifying hashes.
         let root_hash = Blake3Hash::from_slice(&merkle_root).map_err(|_| FsError::Io)?;
@@ -424,7 +426,9 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         if !self.no_cache {
             if let Some(ref cache) = self.cache {
                 for chunk in &read_result.chunks {
-                    let _ = cache.put_chunk(&chunk.hash, &chunk.data).await;
+                    if let Err(e) = cache.put_chunk(&chunk.hash, &chunk.data).await {
+                        tracing::warn!("failed to cache chunk: {}", e);
+                    }
                 }
                 let root = rift_common::crypto::Blake3Hash::from_slice(&merkle_root)
                     .unwrap_or_else(|_| rift_common::crypto::Blake3Hash::from_array([0u8; 32]));
@@ -442,7 +446,9 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                         })
                         .collect(),
                 };
-                let _ = cache.put_manifest(&handle, &manifest).await;
+                if let Err(e) = cache.put_manifest(&handle, &manifest).await {
+                    tracing::warn!("failed to cache manifest: {}", e);
+                }
             }
         } else {
             tracing::debug!("no-cache mode: skipping cache write");
@@ -493,6 +499,15 @@ fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_si
         }
     }
 
+    // 3.5. Offsets must be monotonically increasing without gaps
+    let mut expected_offset = 0u64;
+    for chunk in chunks {
+        if chunk.offset != expected_offset {
+            return false;
+        }
+        expected_offset += chunk.length;
+    }
+
     // 4. Sum of all chunk lengths must equal file_size
     let total_len: u64 = chunks.iter().map(|c| c.length).sum();
     if total_len != file_size {
@@ -520,6 +535,10 @@ impl<R: RemoteShare> RiftShareView<R> {
     ) -> Option<Vec<u8>> {
         let cache = self.cache.as_ref()?;
         let manifest = cache.get_manifest(handle).await.ok()??;
+
+        // NOTE: In offline mode, we cannot verify the manifest's root hash against
+        // the server's current value. A stale manifest from a previous file version
+        // could serve incorrect data. This is an inherent limitation of offline reads.
 
         // Determine file_size from the manifest chunks
         let file_size: u64 = manifest.chunks.iter().map(|c| c.length).sum();
@@ -2735,5 +2754,50 @@ mod tests {
             call_count, 1,
             "server must be contacted since partial manifest should cause cache miss"
         );
+    }
+
+    // =======================================================================
+    // Issue #4: manifest_covers_range offset monotonicity tests
+    // =======================================================================
+
+    /// Chunks with a gap in offsets (offset jumps from 100 to 200, skipping 100-200)
+    /// must be rejected.
+    #[test]
+    fn coverage_non_monotonic_offsets_returns_false() {
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [1u8; 32],
+            },
+            ChunkInfo {
+                index: 1,
+                offset: 200,
+                length: 100,
+                hash: [2u8; 32],
+            },
+        ];
+        assert!(!manifest_covers_range(&chunks, 0, 50, 200));
+    }
+
+    /// Chunks with overlapping offsets (offset 50 when 100 expected) must be rejected.
+    #[test]
+    fn coverage_overlapping_offsets_returns_false() {
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 100,
+                hash: [1u8; 32],
+            },
+            ChunkInfo {
+                index: 1,
+                offset: 50,
+                length: 150,
+                hash: [2u8; 32],
+            },
+        ];
+        assert!(!manifest_covers_range(&chunks, 0, 50, 200));
     }
 }
