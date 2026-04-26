@@ -23,9 +23,9 @@ impl ChunkStore {
     /// Open/create a chunk store at the given base directory.
     ///
     /// Creates the directory structure (`base_dir/chunks/`) if it doesn't exist.
-    pub fn open(base_dir: &Path) -> io::Result<Self> {
+    pub async fn open(base_dir: &Path) -> io::Result<Self> {
         let chunks_dir = base_dir.join("chunks");
-        std::fs::create_dir_all(&chunks_dir)?;
+        tokio::fs::create_dir_all(&chunks_dir).await?;
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
         })
@@ -127,7 +127,7 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let store = ChunkStore::open(tmp.path()).unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
 
         let hash = make_hash(0xAB);
         let data = b"hello, chunk storage!";
@@ -140,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn read_missing_returns_none() {
         let tmp = TempDir::new().unwrap();
-        let store = ChunkStore::open(tmp.path()).unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
 
         let hash = make_hash(0x00);
         let result = store.read_chunk(&hash).await.unwrap();
@@ -150,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn chunk_exists_correct() {
         let tmp = TempDir::new().unwrap();
-        let store = ChunkStore::open(tmp.path()).unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
 
         let hash = make_hash(0x42);
         let data = b"exists test";
@@ -200,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn write_chunk_is_idempotent() {
         let tmp = TempDir::new().unwrap();
-        let store = ChunkStore::open(tmp.path()).unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
 
         let hash = make_hash(0x11);
         let data = b"idempotent data";
@@ -215,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn delete_nonexistent_is_ok() {
         let tmp = TempDir::new().unwrap();
-        let store = ChunkStore::open(tmp.path()).unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
 
         let hash = make_hash(0xFF);
         // Deleting a hash that was never written should return Ok
@@ -225,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn write_creates_directories() {
         let tmp = TempDir::new().unwrap();
-        let store = ChunkStore::open(tmp.path()).unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
 
         let mut hash = [0u8; 32];
         hash[0] = 0xDE;
@@ -249,7 +249,7 @@ mod tests {
 
         assert!(!new_dir.exists());
 
-        let _store = ChunkStore::open(&new_dir).unwrap();
+        let _store = ChunkStore::open(&new_dir).await.unwrap();
 
         let chunks_dir = new_dir.join("chunks");
         assert!(

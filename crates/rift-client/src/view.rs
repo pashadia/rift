@@ -45,7 +45,6 @@ pub trait ShareView: Send + Sync + 'static {
 }
 
 /// A fully-resolved leaf node with verified metadata.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct ResolvedLeaf {
     chunk_index: u32,
@@ -431,9 +430,10 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                     chunks: resolved
                         .leaves
                         .iter()
-                        .map(|leaf| crate::cache::db::ChunkInfo {
+                        .enumerate()
+                        .map(|(i, leaf)| crate::cache::db::ChunkInfo {
                             index: leaf.chunk_index,
-                            offset: chunk_starts[leaf.chunk_index as usize],
+                            offset: chunk_starts[i],
                             length: leaf.length,
                             hash: *leaf.hash.as_bytes(),
                         })
@@ -1010,6 +1010,108 @@ mod tests {
             args,
             (1, 1),
             "only chunk 1 needed for offset=250 in a [100,200] file"
+        );
+    }
+
+    /// Manifest offsets must be computed from positional iteration, not from
+    /// `chunk_index`.  When `chunk_index` values are non-contiguous (e.g. [0, 2]
+    /// with a gap at 1), the old code `chunk_starts[leaf.chunk_index as usize]`
+    /// would index the wrong entry (or the sentinel). The fix uses `enumerate()`
+    /// so that `chunk_starts[i]` always refers to the i-th leaf's offset.
+    ///
+    /// Two chunks with chunk_index [0, 2] and sizes [100, 200].
+    /// The stored offsets must be [0, 100] (position-based), NOT [0, 300]
+    /// (which the old chunk_index-based indexing would produce — chunk_starts[2]
+    /// is the sentinel = total file size).
+    #[tokio::test]
+    async fn manifest_offsets_use_position_not_chunk_index() {
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk2_data = vec![0xCCu8; 200];
+        let (chunk_hashes, root_hash, _all_chunks) =
+            build_mock_chunks(vec![chunk0_data, chunk2_data.clone()]);
+        let file_size: u64 = 100 + 200;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid);
+
+        // Non-contiguous chunk_index: [0, 2] — gap at index 1.
+        // This would have caused the old code to index chunk_starts[2] (the sentinel)
+        // instead of chunk_starts[1] (the 2nd leaf's actual offset).
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[0].to_vec(),
+                        length: 100,
+                        chunk_index: 0,
+                    },
+                    MerkleChildInfo {
+                        is_subtree: false,
+                        hash: chunk_hashes[1].to_vec(),
+                        length: 200,
+                        chunk_index: 2, // non-contiguous!
+                    },
+                ],
+            }))
+            .await;
+        remote
+            .set_read_chunks(Ok(ChunkReadResult {
+                chunks: vec![
+                    ChunkData {
+                        index: 0,
+                        length: 100,
+                        hash: chunk_hashes[0],
+                        data: vec![0xAAu8; 100],
+                    },
+                    ChunkData {
+                        index: 2,
+                        length: 200,
+                        hash: chunk_hashes[1],
+                        data: chunk2_data,
+                    },
+                ],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        view.read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("read should succeed");
+
+        // Inspect the manifest stored in cache.
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
+            .await
+            .expect("cache should open");
+        let manifest = cache
+            .get_manifest(&file_uuid)
+            .await
+            .expect("get_manifest ok")
+            .expect("manifest should exist");
+
+        assert_eq!(manifest.chunks.len(), 2);
+        // chunk_index values are preserved as-is
+        assert_eq!(manifest.chunks[0].index, 0);
+        assert_eq!(manifest.chunks[1].index, 2);
+        // Offsets must be position-based: [0, 100], NOT [0, 300]
+        assert_eq!(manifest.chunks[0].offset, 0, "1st leaf offset must be 0");
+        assert_eq!(
+            manifest.chunks[1].offset, 100,
+            "2nd leaf offset must be 100 (position-based), not 300 (chunk_index-based into sentinel)"
         );
     }
 
