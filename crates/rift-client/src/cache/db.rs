@@ -79,8 +79,7 @@ impl FileCache {
                      FOREIGN KEY (handle) REFERENCES manifests(handle) ON DELETE CASCADE
                  );
 
-                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_hash ON chunk_refs(chunk_hash);
-                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_handle ON chunk_refs(handle);",
+                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_hash ON chunk_refs(chunk_hash);",
             )
         })
         .await?;
@@ -123,8 +122,7 @@ impl FileCache {
                      FOREIGN KEY (handle) REFERENCES manifests(handle) ON DELETE CASCADE
                  );
 
-                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_hash ON chunk_refs(chunk_hash);
-                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_handle ON chunk_refs(handle);",
+                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_hash ON chunk_refs(chunk_hash);",
             )
         })
         .await?;
@@ -169,29 +167,19 @@ impl FileCache {
 
         let result = self
             .call(move |conn: &mut rusqlite::Connection| {
-                conn.query_row(
+                match conn.query_row(
                     "SELECT root_hash FROM manifests WHERE handle = ?1",
                     [&handle_str],
                     |row| row.get::<_, Vec<u8>>(0),
-                )
-            })
-            .await;
-
-        match result {
-            Ok(bytes) => Ok(Blake3Hash::from_slice(&bytes).ok()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("QueryReturnedNoRows")
-                    || err_str.contains("No such")
-                    || err_str.contains("returned no rows")
-                    || err_str.contains("not found")
-                {
-                    Ok(None)
-                } else {
-                    Err(e)
+                ) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e),
                 }
-            }
-        }
+            })
+            .await?;
+
+        Ok(result.and_then(|bytes| Blake3Hash::from_slice(&bytes).ok()))
     }
 
     /// Store a file manifest (root hash + chunk list).
@@ -277,18 +265,8 @@ impl FileCache {
                     |row| row.get::<_, Vec<u8>>(0),
                 ) {
                     Ok(r) => Ok(Some(r)),
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("QueryReturnedNoRows")
-                            || err_str.contains("No such")
-                            || err_str.contains("returned no rows")
-                            || err_str.contains("not found")
-                        {
-                            Ok(None)
-                        } else {
-                            Err(e)
-                        }
-                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e),
                 }
             })
             .await?;
@@ -340,10 +318,9 @@ impl FileCache {
             .chunk_store
             .as_ref()
             .expect("put_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()");
-        store
-            .write_chunk(hash, data)
-            .await
-            .map_err(|e| tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        store.write_chunk(hash, data).await.map_err(|e| {
+            rusqlite::Error::InvalidParameterName(format!("chunk I/O error: {}", e))
+        })?;
         Ok(())
     }
 
@@ -356,10 +333,9 @@ impl FileCache {
             .chunk_store
             .as_ref()
             .expect("get_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()");
-        Ok(store
-            .read_chunk(hash)
-            .await
-            .map_err(|e| tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?)
+        Ok(store.read_chunk(hash).await.map_err(|e| {
+            rusqlite::Error::InvalidParameterName(format!("chunk I/O error: {}", e))
+        })?)
     }
 
     /// Reconstruct only the byte range [offset, offset+length) from cached chunks.
@@ -378,10 +354,9 @@ impl FileCache {
             return Ok(vec![]);
         }
 
-        debug_assert!(
-            chunks.windows(2).all(|w| w[0].offset <= w[1].offset),
-            "chunks must be sorted by offset"
-        );
+        if !chunks.windows(2).all(|w| w[0].offset <= w[1].offset) {
+            tracing::warn!("reconstruct_range: chunks not sorted by offset");
+        }
 
         // Clamp the requested end to the file size (use saturating_add to prevent overflow)
         let end = offset.saturating_add(length).min(file_size);
@@ -398,31 +373,34 @@ impl FileCache {
             None => return Ok(vec![]),
         };
 
-        let mut result = Vec::new();
+        if first_idx > last_idx {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::with_capacity((end - offset) as usize);
         let mut bad_chunks = Vec::new();
 
         for chunk in &chunks[first_idx..=last_idx] {
             match self.get_chunk(&chunk.hash).await {
                 Ok(Some(data)) => {
-                    let computed = Blake3Hash::new(&data);
-                    if *computed.as_bytes() != chunk.hash {
-                        tracing::warn!(
-                            "cached chunk hash mismatch: expected {:?}, got {:?}",
-                            &chunk.hash[..4],
-                            &computed.as_bytes()[..4]
-                        );
-                        bad_chunks.push(chunk.hash);
-                    } else if data.len() != chunk.length as usize {
+                    if data.len() != chunk.length as usize {
                         tracing::warn!(
                             "cached chunk length mismatch: expected {}, got {}",
                             chunk.length,
                             data.len()
                         );
                         bad_chunks.push(chunk.hash);
+                    } else if *Blake3Hash::new(&data).as_bytes() != chunk.hash {
+                        tracing::warn!(
+                            "cached chunk hash mismatch: expected {:?}, got {:?}",
+                            &chunk.hash[..4],
+                            &Blake3Hash::new(&data).as_bytes()[..4]
+                        );
+                        bad_chunks.push(chunk.hash);
                     } else {
                         // Determine the slice of this chunk that falls within [offset, end)
                         let chunk_start = chunk.offset;
-                        let chunk_end = chunk_start + chunk.length;
+                        let chunk_end = chunk_start.saturating_add(chunk.length);
                         let slice_start = offset.saturating_sub(chunk_start) as usize;
                         let slice_end = (end.min(chunk_end) - chunk_start) as usize;
                         result.extend_from_slice(&data[slice_start..slice_end]);
@@ -805,6 +783,53 @@ mod tests {
             missing[0],
             *chunk1_hash.as_bytes(),
             "should report chunk 1's hash as missing"
+        );
+    }
+
+    /// Gappy chunks: chunks with a gap between them where the requested range falls
+    /// entirely in the gap. Should return Ok(vec![]) without panicking.
+    #[tokio::test]
+    async fn reconstruct_range_gappy_chunks_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let chunk0_data = b"AAAA";
+        let chunk1_data = b"BBBB";
+        let chunk0_hash = Blake3Hash::new(chunk0_data);
+        let chunk1_hash = Blake3Hash::new(chunk1_data);
+
+        cache
+            .put_chunk(chunk0_hash.as_bytes(), chunk0_data)
+            .await
+            .unwrap();
+        cache
+            .put_chunk(chunk1_hash.as_bytes(), chunk1_data)
+            .await
+            .unwrap();
+
+        // Chunks with a gap: chunk0 is [0,4), chunk1 is [200,204)
+        // Bytes 4..200 are not covered by any chunk.
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: 4,
+                hash: *chunk0_hash.as_bytes(),
+            },
+            ChunkInfo {
+                index: 1,
+                offset: 200,
+                length: 4,
+                hash: *chunk1_hash.as_bytes(),
+            },
+        ];
+
+        // Request bytes in the gap (e.g., bytes 10..20)
+        let result = cache.reconstruct_range(&chunks, 10, 10, 204).await.unwrap();
+        assert_eq!(
+            result,
+            Vec::<u8>::new(),
+            "bytes in a gap between chunks should return empty vec, not panic"
         );
     }
 
