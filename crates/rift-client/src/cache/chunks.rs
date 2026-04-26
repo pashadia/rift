@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// ```text
 /// base_dir/chunks/ab/cd/abcd...0123.bin
 /// ```
+#[derive(Debug)]
 pub struct ChunkStore {
     base_dir: PathBuf,
 }
@@ -26,6 +27,10 @@ impl ChunkStore {
     pub async fn open(base_dir: &Path) -> io::Result<Self> {
         let chunks_dir = base_dir.join("chunks");
         tokio::fs::create_dir_all(&chunks_dir).await?;
+
+        // Clean up temp files from previous crashes
+        cleanup_temp_files(&chunks_dir).await;
+
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
         })
@@ -37,6 +42,17 @@ impl ChunkStore {
     /// (the data is identical).
     pub async fn write_chunk(&self, hash: &[u8; 32], data: &[u8]) -> io::Result<()> {
         let path = hash_to_path(&self.base_dir, hash);
+
+        // Fast path: if chunk already exists with correct size, skip rewrite
+        if let Ok(metadata) = tokio::fs::metadata(&path).await {
+            if metadata.len() == data.len() as u64 {
+                // File exists with correct size — content hash is verified by path
+                return Ok(());
+            }
+            // File exists but wrong size — could be corruption or hash collision.
+            // Proceed with rewrite (size mismatch is suspicious).
+        }
+
         let parent = path.parent().expect("hash path always has a parent");
 
         // Create shard directories if needed
@@ -91,6 +107,51 @@ impl ChunkStore {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+}
+
+/// Clean up leftover temporary files (`.tmp_*`) from previous crashes.
+///
+/// Recursively walks the chunks directory, scanning each shard subdirectory
+/// for files starting with `.tmp_` and deleting them.
+async fn cleanup_temp_files(chunks_dir: &Path) {
+    let Ok(mut top_entries) = tokio::fs::read_dir(chunks_dir).await else {
+        return;
+    };
+    while let Ok(Some(top_entry)) = top_entries.next_entry().await {
+        if !top_entry
+            .file_type()
+            .await
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let shard_dir1 = top_entry.path();
+        let Ok(mut shard_entries) = tokio::fs::read_dir(&shard_dir1).await else {
+            continue;
+        };
+        while let Ok(Some(shard_entry)) = shard_entries.next_entry().await {
+            if !shard_entry
+                .file_type()
+                .await
+                .map(|t| t.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let shard_dir2 = shard_entry.path();
+            let Ok(mut file_entries) = tokio::fs::read_dir(&shard_dir2).await else {
+                continue;
+            };
+            while let Ok(Some(file_entry)) = file_entries.next_entry().await {
+                let file_name = file_entry.file_name();
+                let name = file_name.to_string_lossy();
+                if name.starts_with(".tmp_") {
+                    let _ = tokio::fs::remove_file(file_entry.path()).await;
+                }
+            }
         }
     }
 }
@@ -269,6 +330,103 @@ mod tests {
         let result2 = store2.read_chunk(&hash2).await.unwrap();
         assert_eq!(result1, Some(data1.to_vec()));
         assert_eq!(result2, Some(data2.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn cleanup_temp_files_on_open() {
+        // Test issue #1: ChunkStore::open should clean up leftover .tmp_* files
+        let tmp = TempDir::new().unwrap();
+        let base_dir = tmp.path();
+
+        // Create a ChunkStore and write a chunk to populate shard directories
+        let store = ChunkStore::open(base_dir).await.unwrap();
+        let hash = make_hash(0xAA);
+        store.write_chunk(&hash, b"some data").await.unwrap();
+        drop(store);
+
+        // Manually create a leftover .tmp_ file in the shard directory
+        // (simulating a crash between write and rename)
+        let shard_dir = base_dir.join("chunks").join("aa").join("aa");
+        let tmp_file = shard_dir.join(".tmp_test_crash_leftover");
+        tokio::fs::write(&tmp_file, b"stale temp data")
+            .await
+            .unwrap();
+        assert!(tmp_file.exists(), "temp file should exist before cleanup");
+
+        // Open a new ChunkStore — should clean up temp files
+        let _store2 = ChunkStore::open(base_dir).await.unwrap();
+
+        // The .tmp_ file should be gone
+        assert!(
+            !tmp_file.exists(),
+            "leftover temp file should be cleaned up on open"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_chunk_skips_identical_data() {
+        // Test issue #2: write_chunk should skip rewriting identical data
+        let tmp = TempDir::new().unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
+
+        let hash = make_hash(0xBB);
+        let data = b"hello";
+
+        // Write chunk once
+        store.write_chunk(&hash, data).await.unwrap();
+
+        // Count files in the shard directory before second write
+        let path = hash_to_path(tmp.path(), &hash);
+        let shard_dir = path.parent().unwrap();
+        let files_before: Vec<_> = std::fs::read_dir(shard_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        // Write same chunk again — should be a no-op (skip rewrite)
+        store.write_chunk(&hash, data).await.unwrap();
+
+        // Count files after second write
+        let files_after: Vec<_> = std::fs::read_dir(shard_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        // Should have exactly the same number of files (no temp files left)
+        assert_eq!(
+            files_before.len(),
+            files_after.len(),
+            "second write of identical data should not create additional files"
+        );
+
+        // Content should still be correct
+        let result = store.read_chunk(&hash).await.unwrap();
+        assert_eq!(result, Some(data.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn write_chunk_rewrites_on_size_mismatch() {
+        // Test issue #2: write_chunk should rewrite when file size doesn't match
+        let tmp = TempDir::new().unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
+
+        let hash = make_hash(0xCC);
+        let original_data = b"short";
+
+        // Write chunk
+        store.write_chunk(&hash, original_data).await.unwrap();
+
+        // Manually truncate the file to corrupt it (different size)
+        let path = hash_to_path(tmp.path(), &hash);
+        std::fs::write(&path, b"x").unwrap(); // wrong size + wrong content
+
+        // Write again with correct but different-length data — should rewrite
+        let new_data = b"longer replacement data";
+        store.write_chunk(&hash, new_data).await.unwrap();
+
+        // Verify file was rewritten with correct content
+        let result = store.read_chunk(&hash).await.unwrap();
+        assert_eq!(result, Some(new_data.to_vec()));
     }
 
     #[tokio::test]
