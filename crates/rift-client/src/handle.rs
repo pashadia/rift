@@ -136,4 +136,25 @@ mod tests {
             Some(PathBuf::from("hello.txt"))
         );
     }
+
+    #[test]
+    fn many_paths_one_uuid_second_path_not_dropped() {
+        // Simulates symlink: two paths resolve to same UUID on server
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let shared_uuid = Uuid::now_v7();
+
+        cache.insert(PathBuf::from("link/path/to/file.h"), shared_uuid);
+        cache.insert(PathBuf::from("canonical/path/to/file.h"), shared_uuid);
+
+        // Both paths MUST resolve to the same UUID
+        assert_eq!(
+            cache.get_by_path(Path::new("link/path/to/file.h")),
+            Some(shared_uuid)
+        );
+        assert_eq!(
+            cache.get_by_path(Path::new("canonical/path/to/file.h")),
+            Some(shared_uuid)
+        );
+    }
 }
