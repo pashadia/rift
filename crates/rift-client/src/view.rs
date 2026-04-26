@@ -219,7 +219,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         } else {
             parent_relative.join(name)
         };
-        self.handles.insert(child_path, child_uuid);
+        self.handles.insert(child_path, child_uuid).await;
 
         Ok(attrs)
     }
@@ -256,7 +256,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
 
         let dir_relative = path_to_relative(path);
-        let combined: Vec<DirEntry> = pairs
+        let combined: Vec<(DirEntry, std::path::PathBuf, Uuid)> = pairs
             .into_iter()
             .zip(attrs_results)
             .filter_map(|((entry, child_uuid), attrs_result)| {
@@ -266,16 +266,23 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 } else {
                     dir_relative.join(&entry.name)
                 };
-                self.handles.insert(child_path, child_uuid);
-                Some(DirEntry {
-                    name: entry.name,
-                    file_type: entry.file_type,
-                    attrs,
-                })
+                Some((
+                    DirEntry {
+                        name: entry.name,
+                        file_type: entry.file_type,
+                        attrs,
+                    },
+                    child_path,
+                    child_uuid,
+                ))
             })
             .collect();
 
-        Ok(combined)
+        for (_, child_path, child_uuid) in &combined {
+            self.handles.insert(child_path.clone(), *child_uuid).await;
+        }
+
+        Ok(combined.into_iter().map(|(entry, _, _)| entry).collect())
     }
 
     #[instrument(skip(self), fields(path = %path.display(), offset, length))]
@@ -773,7 +780,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(100, [0xAB; 32]))]))
@@ -871,7 +879,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
 
         let content = b"hello world";
         let chunk_hash = blake3_of(content);
@@ -942,7 +951,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -1008,7 +1018,8 @@ mod tests {
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
         view.handles
-            .insert(std::path::PathBuf::from("file"), Uuid::now_v7());
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7())
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -1047,7 +1058,8 @@ mod tests {
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
         view.handles
-            .insert(std::path::PathBuf::from("file"), Uuid::now_v7());
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7())
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -1128,7 +1140,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         // Contiguous chunk_index: [0, 1] with variable sizes [100, 200].
         remote
@@ -1222,7 +1235,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -1309,7 +1323,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         // The Merkle drill must return ALL leaves so resolve_merkle_tree sees all 3 chunks.
         remote
@@ -1403,7 +1418,8 @@ mod tests {
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
         view.handles
-            .insert(std::path::PathBuf::from("file"), Uuid::now_v7());
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7())
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -1474,7 +1490,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -1546,7 +1563,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("multi_chunk_file"), file_uuid);
+            .insert(std::path::PathBuf::from("multi_chunk_file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -2208,7 +2226,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("big_file"), file_uuid);
+            .insert(std::path::PathBuf::from("big_file"), file_uuid)
+            .await;
 
         // Read the entire file
         let result = view.read(Path::new("big_file"), 0, file_size, None).await;
@@ -2236,7 +2255,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(
@@ -2296,7 +2316,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(
@@ -2354,7 +2375,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("test_file"), file_uuid);
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(
@@ -2418,7 +2440,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         let content = b"hello world";
         let chunk_hash = blake3_of(content);
@@ -2492,7 +2515,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         let content = b"data from server";
         let chunk_hash = blake3_of(content);
@@ -2697,7 +2721,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         // Store a partial manifest directly: only chunk 1 (missing chunk 0)
         {
@@ -2842,7 +2867,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
@@ -2958,7 +2984,8 @@ mod tests {
 
         let file_uuid = Uuid::now_v7();
         view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid);
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
 
         // --- Step 1: Partial read (bytes 100-150, within chunk 1) ---
         remote

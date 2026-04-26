@@ -89,8 +89,8 @@ impl HandleCache {
         self.root
     }
 
-    pub fn insert(&self, path: PathBuf, uuid: Uuid) {
-        self.map.insert_sync(path, uuid);
+    pub async fn insert(&self, path: PathBuf, uuid: Uuid) {
+        self.map.insert(path, uuid).await;
     }
 
     pub fn get_by_path(&self, path: &Path) -> Option<Uuid> {
@@ -101,9 +101,9 @@ impl HandleCache {
         self.map.get_by_handle(uuid)
     }
 
-    pub fn clear(&mut self) {
+    pub async fn clear(&self) {
         self.map.clear();
-        self.map.insert_sync(PathBuf::from("."), self.root);
+        self.map.insert(PathBuf::from("."), self.root).await;
     }
 }
 
@@ -117,28 +117,28 @@ mod tests {
         Uuid::from_bytes(bytes)
     }
 
-    #[test]
-    fn test_root_is_cached_on_creation() {
+    #[tokio::test]
+    async fn test_root_is_cached_on_creation() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         assert_eq!(cache.root(), root);
         assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
     }
 
-    #[test]
-    fn test_root_path_resolves_bidirectionally() {
+    #[tokio::test]
+    async fn test_root_path_resolves_bidirectionally() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
         assert_eq!(cache.get_by_handle(&root), Some(PathBuf::from(".")));
     }
 
-    #[test]
-    fn test_insert_and_lookup_path() {
+    #[tokio::test]
+    async fn test_insert_and_lookup_path() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let child = make_uuid(1);
-        cache.insert(PathBuf::from("hello.txt"), child);
+        cache.insert(PathBuf::from("hello.txt"), child).await;
         assert_eq!(cache.get_by_path(Path::new("hello.txt")), Some(child));
         assert_eq!(
             cache.get_by_handle(&child),
@@ -146,27 +146,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_insert_nested_path() {
+    #[tokio::test]
+    async fn test_insert_nested_path() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let dir = make_uuid(1);
         let file = make_uuid(2);
-        cache.insert(PathBuf::from("subdir"), dir);
-        cache.insert(PathBuf::from("subdir/file.txt"), file);
+        cache.insert(PathBuf::from("subdir"), dir).await;
+        cache.insert(PathBuf::from("subdir/file.txt"), file).await;
         assert_eq!(cache.get_by_path(Path::new("subdir")), Some(dir));
         assert_eq!(cache.get_by_path(Path::new("subdir/file.txt")), Some(file));
     }
 
-    #[test]
-    fn test_clear_preserves_root() {
+    #[tokio::test]
+    async fn test_clear_preserves_root() {
         let root = Uuid::now_v7();
-        let mut cache = HandleCache::new(root);
+        let cache = HandleCache::new(root);
         let child = make_uuid(1);
-        cache.insert(PathBuf::from("hello.txt"), child);
+        cache.insert(PathBuf::from("hello.txt"), child).await;
 
         assert_eq!(cache.get_by_path(Path::new("hello.txt")), Some(child));
-        cache.clear();
+        cache.clear().await;
         assert_eq!(cache.root(), root);
         assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
         assert_eq!(cache.get_by_path(Path::new("hello.txt")), None);
@@ -188,13 +188,13 @@ mod tests {
         assert_eq!(cache.get_by_handle(&unknown), None);
     }
 
-    #[test]
-    fn test_duplicate_insert_same_values_is_idempotent() {
+    #[tokio::test]
+    async fn test_duplicate_insert_same_values_is_idempotent() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let child = make_uuid(1);
-        cache.insert(PathBuf::from("hello.txt"), child);
-        cache.insert(PathBuf::from("hello.txt"), child);
+        cache.insert(PathBuf::from("hello.txt"), child).await;
+        cache.insert(PathBuf::from("hello.txt"), child).await;
         assert_eq!(cache.get_by_path(Path::new("hello.txt")), Some(child));
         assert_eq!(
             cache.get_by_handle(&child),
@@ -206,15 +206,19 @@ mod tests {
     // Many-to-one tests (Chunks 1 & 4 from the implementation plan)
     // =======================================================================
 
-    #[test]
-    fn many_paths_one_uuid_second_path_not_dropped() {
+    #[tokio::test]
+    async fn many_paths_one_uuid_second_path_not_dropped() {
         // Simulates symlink: two paths resolve to same UUID on server
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let shared_uuid = Uuid::now_v7();
 
-        cache.insert(PathBuf::from("link/path/to/file.h"), shared_uuid);
-        cache.insert(PathBuf::from("canonical/path/to/file.h"), shared_uuid);
+        cache
+            .insert(PathBuf::from("link/path/to/file.h"), shared_uuid)
+            .await;
+        cache
+            .insert(PathBuf::from("canonical/path/to/file.h"), shared_uuid)
+            .await;
 
         // Both paths MUST resolve to the same UUID
         assert_eq!(
@@ -227,15 +231,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reverse_map_stores_last_path_inserted() {
+    #[tokio::test]
+    async fn reverse_map_stores_last_path_inserted() {
         // When two paths map to same UUID, reverse map stores the last one
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let shared_uuid = Uuid::now_v7();
 
-        cache.insert(PathBuf::from("path_a"), shared_uuid);
-        cache.insert(PathBuf::from("path_b"), shared_uuid);
+        cache.insert(PathBuf::from("path_a"), shared_uuid).await;
+        cache.insert(PathBuf::from("path_b"), shared_uuid).await;
 
         // Forward map: both paths resolve
         assert_eq!(cache.get_by_path(Path::new("path_a")), Some(shared_uuid));
@@ -248,31 +252,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reinsert_same_path_same_uuid_is_idempotent() {
+    #[tokio::test]
+    async fn reinsert_same_path_same_uuid_is_idempotent() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let uuid = Uuid::now_v7();
 
-        cache.insert(PathBuf::from("file.txt"), uuid);
-        cache.insert(PathBuf::from("file.txt"), uuid);
+        cache.insert(PathBuf::from("file.txt"), uuid).await;
+        cache.insert(PathBuf::from("file.txt"), uuid).await;
 
         assert_eq!(cache.get_by_path(Path::new("file.txt")), Some(uuid));
         assert_eq!(cache.get_by_handle(&uuid), Some(PathBuf::from("file.txt")));
     }
 
-    #[test]
-    fn reinsert_same_path_different_uuid_updates() {
+    #[tokio::test]
+    async fn reinsert_same_path_different_uuid_updates() {
         // If a path's UUID changes (e.g., file replaced), upsert replaces it
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
         let old_uuid = Uuid::now_v7();
         let new_uuid = Uuid::now_v7();
 
-        cache.insert(PathBuf::from("file.txt"), old_uuid);
+        cache.insert(PathBuf::from("file.txt"), old_uuid).await;
         assert_eq!(cache.get_by_path(Path::new("file.txt")), Some(old_uuid));
 
-        cache.insert(PathBuf::from("file.txt"), new_uuid);
+        cache.insert(PathBuf::from("file.txt"), new_uuid).await;
         assert_eq!(cache.get_by_path(Path::new("file.txt")), Some(new_uuid));
         assert_eq!(
             cache.get_by_handle(&new_uuid),
@@ -280,16 +284,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clear_resets_forward_and_reverse_maps() {
+    #[tokio::test]
+    async fn clear_resets_forward_and_reverse_maps() {
         let root = Uuid::now_v7();
-        let mut cache = HandleCache::new(root);
+        let cache = HandleCache::new(root);
         let child = Uuid::now_v7();
 
-        cache.insert(PathBuf::from("file.txt"), child);
+        cache.insert(PathBuf::from("file.txt"), child).await;
         assert_eq!(cache.get_by_path(Path::new("file.txt")), Some(child));
 
-        cache.clear();
+        cache.clear().await;
 
         assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
         assert_eq!(cache.get_by_path(Path::new("file.txt")), None);
