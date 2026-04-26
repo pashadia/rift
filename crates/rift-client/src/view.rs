@@ -320,17 +320,13 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                     Ok(Some(manifest)) => {
                         if manifest.root.as_bytes() == merkle_root.as_slice() {
                             if manifest_covers_range(&manifest.chunks, offset, length, file_size) {
-                                match cache.reconstruct(&manifest.chunks).await {
+                                match cache
+                                    .reconstruct_range(&manifest.chunks, offset, length, file_size)
+                                    .await
+                                {
                                     Ok(data) => {
-                                        let start = offset as usize;
-                                        let end = (offset + length).min(file_size) as usize;
-                                        if end <= data.len() {
-                                            tracing::debug!(
-                                                "read {} bytes from cache",
-                                                end - start
-                                            );
-                                            return Ok(data[start..end].to_vec());
-                                        }
+                                        tracing::debug!("read {} bytes from cache", data.len());
+                                        return Ok(data);
                                     }
                                     Err(ref bad_hashes) => {
                                         tracing::warn!(
@@ -532,14 +528,13 @@ impl<R: RemoteShare> RiftShareView<R> {
             return None;
         }
 
-        match cache.reconstruct(&manifest.chunks).await {
+        match cache
+            .reconstruct_range(&manifest.chunks, offset, length, file_size)
+            .await
+        {
             Ok(data) => {
-                let start = offset as usize;
-                let end = (offset + length).min(data.len() as u64) as usize;
-                if end <= data.len() {
-                    tracing::debug!("offline read: served {} bytes from cache", end - start);
-                    return Some(data[start..end].to_vec());
-                }
+                tracing::debug!("offline read: served {} bytes from cache", data.len());
+                return Some(data);
             }
             Err(_) => {
                 tracing::debug!("offline read: could not reconstruct from cache");

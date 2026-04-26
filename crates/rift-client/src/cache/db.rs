@@ -355,23 +355,42 @@ impl FileCache {
             .map_err(|e| tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?)
     }
 
-    /// Reconstruct a file from cached chunks, verifying each chunk's hash.
+    /// Reconstruct only the byte range [offset, offset+length) from cached chunks.
     ///
-    /// Returns `Err` listing the hashes of missing or corrupted chunks.
+    /// Reads only the chunk files needed for the requested range.
+    /// Returns the assembled bytes, or `Err` listing missing/corrupted chunk hashes.
     /// Panics if the cache was opened in-memory (no chunk storage available).
-    pub async fn reconstruct(&self, chunks: &[ChunkInfo]) -> Result<Vec<u8>, Vec<[u8; 32]>> {
-        let store = self.chunk_store.as_ref().expect(
-            "reconstruct requires a ChunkStore; use FileCache::open(), not open_in_memory()",
-        );
+    pub async fn reconstruct_range(
+        &self,
+        chunks: &[ChunkInfo],
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) -> Result<Vec<u8>, Vec<[u8; 32]>> {
+        if offset >= file_size || length == 0 {
+            return Ok(vec![]);
+        }
+
+        // Clamp the requested end to the file size
+        let end = (offset + length).min(file_size);
+
+        // Find the first chunk whose byte range overlaps [offset, end)
+        let first_idx = match chunks.iter().position(|c| c.offset + c.length > offset) {
+            Some(i) => i,
+            None => return Ok(vec![]),
+        };
+
+        // Find the last chunk whose byte range overlaps [offset, end)
+        let last_idx = match chunks.iter().rposition(|c| c.offset < end) {
+            Some(i) => i,
+            None => return Ok(vec![]),
+        };
 
         let mut result = Vec::new();
         let mut bad_chunks = Vec::new();
 
-        let total_size: usize = chunks.iter().map(|c| c.length as usize).sum();
-        result.reserve(total_size);
-
-        for chunk in chunks {
-            match store.read_chunk(&chunk.hash).await {
+        for chunk in &chunks[first_idx..=last_idx] {
+            match self.get_chunk(&chunk.hash).await {
                 Ok(Some(data)) => {
                     let computed = Blake3Hash::new(&data);
                     if *computed.as_bytes() != chunk.hash {
@@ -389,7 +408,12 @@ impl FileCache {
                         );
                         bad_chunks.push(chunk.hash);
                     } else {
-                        result.extend_from_slice(&data);
+                        // Determine the slice of this chunk that falls within [offset, end)
+                        let chunk_start = chunk.offset;
+                        let chunk_end = chunk_start + chunk.length;
+                        let slice_start = offset.saturating_sub(chunk_start) as usize;
+                        let slice_end = (end.min(chunk_end) - chunk_start) as usize;
+                        result.extend_from_slice(&data[slice_start..slice_end]);
                     }
                 }
                 Ok(None) => bad_chunks.push(chunk.hash),
@@ -470,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconstruct_all_cached() {
+    async fn reconstruct_range_all_cached() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = FileCache::open(tmp.path()).await.unwrap();
 
@@ -503,12 +527,13 @@ mod tests {
             },
         ];
 
-        let result = cache.reconstruct(&chunks).await.unwrap();
+        // Read the entire file via reconstruct_range
+        let result = cache.reconstruct_range(&chunks, 0, 11, 11).await.unwrap();
         assert_eq!(result, b"hello world");
     }
 
     #[tokio::test]
-    async fn reconstruct_partial_cache_returns_missing() {
+    async fn reconstruct_range_partial_cache_returns_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = FileCache::open(tmp.path()).await.unwrap();
 
@@ -537,7 +562,8 @@ mod tests {
             },
         ];
 
-        let result = cache.reconstruct(&chunks).await;
+        // Request range that requires the missing chunk 1
+        let result = cache.reconstruct_range(&chunks, 6, 5, 11).await;
         assert!(result.is_err());
         let missing = result.unwrap_err();
         assert_eq!(missing.len(), 1);
@@ -545,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconstruct_detects_corrupted_chunk() {
+    async fn reconstruct_range_detects_corrupted_chunk() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = FileCache::open(tmp.path()).await.unwrap();
 
@@ -586,13 +612,188 @@ mod tests {
             hash: *chunk0_hash.as_bytes(),
         }];
 
-        let result = cache.reconstruct(&chunks).await;
+        let result = cache.reconstruct_range(&chunks, 0, 6, 6).await;
         assert!(result.is_err(), "corrupted chunk data must be rejected");
         let bad_hashes = result.unwrap_err();
         assert_eq!(bad_hashes.len(), 1);
         // The returned hash should be the EXPECTED hash (chunk0_hash), not the
         // hash of the corrupted data
         assert_eq!(bad_hashes[0], *chunk0_hash.as_bytes());
+    }
+
+    /// File has 5 chunks of [100, 200, 150, 300, 250] bytes.
+    /// Request bytes 250-300, which falls entirely in chunk 1 [100, 300).
+    /// Chunk 1 offset=100, length=200, so bytes 250-300 are at chunk1[150..200]
+    /// Verify the correct 50 bytes are returned.
+    #[tokio::test]
+    async fn reconstruct_range_single_chunk_from_middle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let chunk_sizes: [u64; 5] = [100, 200, 150, 300, 250];
+        let file_size: u64 = chunk_sizes.iter().sum(); // 1000
+
+        // Build chunk data with distinct patterns per chunk
+        let chunk0_data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
+        let chunk1_data: Vec<u8> = (0..200).map(|i| ((i + 100) % 256) as u8).collect();
+        let chunk2_data: Vec<u8> = (0..150).map(|i| ((i + 200) % 256) as u8).collect();
+        let chunk3_data: Vec<u8> = (0..300).map(|i| ((i + 300) % 256) as u8).collect();
+        let chunk4_data: Vec<u8> = (0..250).map(|i| ((i + 400) % 256) as u8).collect();
+
+        let all_chunk_data = [
+            &chunk0_data,
+            &chunk1_data,
+            &chunk2_data,
+            &chunk3_data,
+            &chunk4_data,
+        ];
+
+        let mut chunks = Vec::new();
+        let mut offset = 0u64;
+        for (i, (data, &size)) in all_chunk_data.iter().zip(chunk_sizes.iter()).enumerate() {
+            let hash = *Blake3Hash::new(data).as_bytes();
+            cache.put_chunk(&hash, data).await.unwrap();
+            chunks.push(ChunkInfo {
+                index: i as u32,
+                offset,
+                length: size,
+                hash,
+            });
+            offset += size;
+        }
+
+        // Request bytes 250-300, which falls entirely in chunk 1 [100, 300)
+        let result = cache
+            .reconstruct_range(&chunks, 250, 50, file_size)
+            .await
+            .unwrap();
+
+        let expected: Vec<u8> = (150..200).map(|i| ((i + 100) % 256) as u8).collect();
+        assert_eq!(
+            result, expected,
+            "bytes at file offset 250..300 should match chunk1[150..200]"
+        );
+    }
+
+    /// File has 5 chunks of [100, 200, 150, 300, 250] bytes.
+    /// Request bytes 80-120, which spans chunk 0 [0,100) and chunk 1 [100,300).
+    /// Verify correct bytes from both chunks.
+    #[tokio::test]
+    async fn reconstruct_range_cross_chunk_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let chunk_sizes: [u64; 5] = [100, 200, 150, 300, 250];
+        let file_size: u64 = chunk_sizes.iter().sum(); // 1000
+
+        // Build chunk data with distinct patterns per chunk
+        let chunk0_data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
+        let chunk1_data: Vec<u8> = (0..200).map(|i| ((i + 100) % 256) as u8).collect();
+        let chunk2_data: Vec<u8> = (0..150).map(|i| ((i + 200) % 256) as u8).collect();
+        let chunk3_data: Vec<u8> = (0..300).map(|i| ((i + 300) % 256) as u8).collect();
+        let chunk4_data: Vec<u8> = (0..250).map(|i| ((i + 400) % 256) as u8).collect();
+
+        let all_chunk_data = [
+            &chunk0_data,
+            &chunk1_data,
+            &chunk2_data,
+            &chunk3_data,
+            &chunk4_data,
+        ];
+
+        let mut chunks = Vec::new();
+        let mut offset = 0u64;
+        for (i, (data, &size)) in all_chunk_data.iter().zip(chunk_sizes.iter()).enumerate() {
+            let hash = *Blake3Hash::new(data).as_bytes();
+            cache.put_chunk(&hash, data).await.unwrap();
+            chunks.push(ChunkInfo {
+                index: i as u32,
+                offset,
+                length: size,
+                hash,
+            });
+            offset += size;
+        }
+
+        // Request bytes 80-120: 20 bytes from chunk 0 [80..100) and 20 bytes from chunk 1 [0..20)
+        let result = cache
+            .reconstruct_range(&chunks, 80, 40, file_size)
+            .await
+            .unwrap();
+
+        let mut expected = Vec::new();
+        // chunk 0: bytes 80..100
+        expected.extend_from_slice(&chunk0_data[80..100]);
+        // chunk 1: bytes 0..20
+        expected.extend_from_slice(&chunk1_data[0..20]);
+
+        assert_eq!(
+            result, expected,
+            "cross-chunk boundary read should concatenate tail of chunk 0 and head of chunk 1"
+        );
+    }
+
+    /// File has 3 chunks but chunk 1 is not on disk.
+    /// Request bytes in chunk 1. Verify `Err` is returned with chunk 1's hash.
+    #[tokio::test]
+    async fn reconstruct_range_missing_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let chunk0_data = b"chunk0 data here";
+        let chunk1_data = b"chunk1 data missing";
+        let chunk2_data = b"chunk2 data present";
+
+        let chunk0_hash = Blake3Hash::new(chunk0_data);
+        let chunk1_hash = Blake3Hash::new(chunk1_data);
+        let chunk2_hash = Blake3Hash::new(chunk2_data);
+
+        // Only store chunks 0 and 2, NOT chunk 1
+        cache
+            .put_chunk(chunk0_hash.as_bytes(), chunk0_data)
+            .await
+            .unwrap();
+        cache
+            .put_chunk(chunk2_hash.as_bytes(), chunk2_data)
+            .await
+            .unwrap();
+
+        let chunks = vec![
+            ChunkInfo {
+                index: 0,
+                offset: 0,
+                length: chunk0_data.len() as u64,
+                hash: *chunk0_hash.as_bytes(),
+            },
+            ChunkInfo {
+                index: 1,
+                offset: chunk0_data.len() as u64,
+                length: chunk1_data.len() as u64,
+                hash: *chunk1_hash.as_bytes(),
+            },
+            ChunkInfo {
+                index: 2,
+                offset: (chunk0_data.len() + chunk1_data.len()) as u64,
+                length: chunk2_data.len() as u64,
+                hash: *chunk2_hash.as_bytes(),
+            },
+        ];
+
+        let file_size = chunks.iter().map(|c| c.length).sum();
+
+        // Request bytes in chunk 1's range
+        let result = cache
+            .reconstruct_range(&chunks, chunks[1].offset, chunks[1].length, file_size)
+            .await;
+
+        assert!(result.is_err(), "missing chunk should return Err");
+        let missing = result.unwrap_err();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0],
+            *chunk1_hash.as_bytes(),
+            "should report chunk 1's hash as missing"
+        );
     }
 
     /// put_manifest prunes stale entries from a previous version.
