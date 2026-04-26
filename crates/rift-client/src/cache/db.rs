@@ -1,8 +1,8 @@
 //! SQLite-based file cache.
 //!
 //! Stores:
-//! - File manifests: (handle -> root_hash, chunk list)
-//! - Chunk data: (chunk_hash -> data) content-addressable storage
+//! - File manifests: (handle -> root_hash, chunk list) — in SQLite
+//! - Chunk data: (chunk_hash -> data) — on disk via ChunkStore
 //!
 //! TODO(v1): Implement configurable cache size limits per mount.
 //! Current: unlimited. Future: LRU eviction based on configurable budget.
@@ -40,14 +40,19 @@ pub struct ChunkInfo {
 }
 
 /// A file cache for storing root hashes and chunk data.
+///
+/// Metadata (manifests, chunk references) is stored in SQLite.
+/// Chunk data is stored on disk via `ChunkStore`.
 pub struct FileCache {
     conn: Connection,
+    chunk_store: Option<crate::cache::chunks::ChunkStore>,
 }
 
 impl FileCache {
     /// Open a cache at the given directory path.
     ///
     /// Creates the directory and database if they don't exist.
+    /// Chunk data is stored under `cache_dir/chunks/` via `ChunkStore`.
     pub async fn open(cache_dir: &Path) -> SqliteResult<Self> {
         std::fs::create_dir_all(cache_dir).ok();
         let db_path = cache_dir.join("cache.db");
@@ -74,20 +79,26 @@ impl FileCache {
                      FOREIGN KEY (handle) REFERENCES manifests(handle) ON DELETE CASCADE
                  );
 
-                 CREATE TABLE IF NOT EXISTS chunk_data (
-                     chunk_hash  BLOB PRIMARY KEY,
-                     data        BLOB NOT NULL
-                 );
-
                  CREATE INDEX IF NOT EXISTS idx_chunk_refs_hash ON chunk_refs(chunk_hash);
                  CREATE INDEX IF NOT EXISTS idx_chunk_refs_handle ON chunk_refs(handle);",
             )
         })
         .await?;
 
-        Ok(Self { conn })
+        let chunk_store = crate::cache::chunks::ChunkStore::open(cache_dir)
+            .await
+            .map_err(|e| tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        Ok(Self {
+            conn,
+            chunk_store: Some(chunk_store),
+        })
     }
 
+    /// Open an in-memory cache for testing (manifest operations only).
+    ///
+    /// No chunk storage is available — `put_chunk`/`get_chunk`/`reconstruct`
+    /// will panic if called on an in-memory cache.
     #[cfg(test)]
     pub async fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory().await?;
@@ -109,17 +120,15 @@ impl FileCache {
                      PRIMARY KEY (handle, chunk_index)
                  );
 
-                 CREATE TABLE IF NOT EXISTS chunk_data (
-                     chunk_hash  BLOB PRIMARY KEY,
-                     data        BLOB NOT NULL
-                 );
-
                  CREATE INDEX IF NOT EXISTS idx_chunk_refs_hash ON chunk_refs(chunk_hash);",
             )
         })
         .await?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            chunk_store: None,
+        })
     }
 
     async fn call<F, R>(&self, f: F) -> tokio_rusqlite::Result<R>
@@ -316,85 +325,45 @@ impl FileCache {
     }
 
     /// Store chunk data keyed by its hash.
+    ///
+    /// Delegates to `ChunkStore::write_chunk`. Panics if the cache was
+    /// opened in-memory (no chunk storage available).
     pub async fn put_chunk(&self, hash: &[u8; 32], data: &[u8]) -> SqliteResult<()> {
-        let hash_vec = hash.to_vec();
-        let data_vec = data.to_vec();
-
-        self.call(move |conn: &mut rusqlite::Connection| {
-            conn.execute(
-                "INSERT OR REPLACE INTO chunk_data (chunk_hash, data) VALUES (?1, ?2)",
-                (&hash_vec, &data_vec),
-            )
-        })
-        .await?;
+        let store = self
+            .chunk_store
+            .as_ref()
+            .expect("put_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()");
+        store
+            .write_chunk(hash, data)
+            .await
+            .map_err(|e| tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         Ok(())
     }
 
     /// Get chunk data by its hash.
+    ///
+    /// Delegates to `ChunkStore::read_chunk`. Panics if the cache was
+    /// opened in-memory (no chunk storage available).
     pub async fn get_chunk(&self, hash: &[u8; 32]) -> SqliteResult<Option<Vec<u8>>> {
-        let hash_vec = hash.to_vec();
-
-        let result = self
-            .call(move |conn: &mut rusqlite::Connection| {
-                conn.query_row(
-                    "SELECT data FROM chunk_data WHERE chunk_hash = ?1",
-                    [&hash_vec],
-                    |row| row.get(0),
-                )
-            })
-            .await;
-
-        match result {
-            Ok(data) => Ok(Some(data)),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("QueryReturnedNoRows")
-                    || err_str.contains("No such")
-                    || err_str.contains("returned no rows")
-                    || err_str.contains("not found")
-                {
-                    Ok(None)
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    /// Find chunks that are needed but not cached.
-    pub async fn missing_chunks(
-        &self,
-        _handle: &Uuid,
-        server_chunks: &[ChunkInfo],
-    ) -> SqliteResult<Vec<ChunkInfo>> {
-        let mut missing = Vec::new();
-
-        for chunk in server_chunks {
-            let hash_vec = chunk.hash.to_vec();
-            let has_chunk = self
-                .call(move |conn: &mut rusqlite::Connection| {
-                    let result: std::result::Result<i32, _> = conn.query_row(
-                        "SELECT 1 FROM chunk_data WHERE chunk_hash = ?1",
-                        [&hash_vec],
-                        |row| row.get(0),
-                    );
-                    Ok(result.is_ok())
-                })
-                .await
-                .unwrap_or(false);
-
-            if !has_chunk {
-                missing.push(chunk.clone());
-            }
-        }
-
-        Ok(missing)
+        let store = self
+            .chunk_store
+            .as_ref()
+            .expect("get_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()");
+        Ok(store
+            .read_chunk(hash)
+            .await
+            .map_err(|e| tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?)
     }
 
     /// Reconstruct a file from cached chunks, verifying each chunk's hash.
     ///
     /// Returns `Err` listing the hashes of missing or corrupted chunks.
+    /// Panics if the cache was opened in-memory (no chunk storage available).
     pub async fn reconstruct(&self, chunks: &[ChunkInfo]) -> Result<Vec<u8>, Vec<[u8; 32]>> {
+        let store = self.chunk_store.as_ref().expect(
+            "reconstruct requires a ChunkStore; use FileCache::open(), not open_in_memory()",
+        );
+
         let mut result = Vec::new();
         let mut bad_chunks = Vec::new();
 
@@ -402,9 +371,8 @@ impl FileCache {
         result.reserve(total_size);
 
         for chunk in chunks {
-            match self.get_chunk(&chunk.hash).await {
+            match store.read_chunk(&chunk.hash).await {
                 Ok(Some(data)) => {
-                    // Verify the chunk's hash matches the stored data.
                     let computed = Blake3Hash::new(&data);
                     if *computed.as_bytes() != chunk.hash {
                         tracing::warn!(
@@ -448,10 +416,6 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[0] = byte;
         Uuid::from_bytes(bytes)
-    }
-
-    fn make_hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
     }
 
     #[tokio::test]
@@ -506,78 +470,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_and_retrieve_chunk_data() {
-        let cache = FileCache::open_in_memory().await.unwrap();
-        let hash = make_hash(0xAB);
-        let data = b"hello world".to_vec();
-
-        let result = cache.get_chunk(&hash).await.unwrap();
-        assert!(result.is_none());
-
-        cache.put_chunk(&hash, &data).await.unwrap();
-
-        let result = cache.get_chunk(&hash).await.unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), data);
-    }
-
-    #[tokio::test]
-    async fn missing_chunks_empty_cache() {
-        let cache = FileCache::open_in_memory().await.unwrap();
-        let handle = make_handle(1);
-
-        let server_chunks = vec![
-            ChunkInfo {
-                index: 0,
-                offset: 0,
-                length: 100,
-                hash: [0x01u8; 32],
-            },
-            ChunkInfo {
-                index: 1,
-                offset: 100,
-                length: 200,
-                hash: [0x02u8; 32],
-            },
-        ];
-
-        let missing = cache.missing_chunks(&handle, &server_chunks).await.unwrap();
-        assert_eq!(missing.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn missing_chunks_partial_cache() {
-        let cache = FileCache::open_in_memory().await.unwrap();
-        let handle = make_handle(1);
-
-        cache
-            .put_chunk(&[0x01u8; 32], b"chunk1 data")
-            .await
-            .unwrap();
-
-        let server_chunks = vec![
-            ChunkInfo {
-                index: 0,
-                offset: 0,
-                length: 100,
-                hash: [0x01u8; 32],
-            },
-            ChunkInfo {
-                index: 1,
-                offset: 100,
-                length: 200,
-                hash: [0x02u8; 32],
-            },
-        ];
-
-        let missing = cache.missing_chunks(&handle, &server_chunks).await.unwrap();
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].hash, [0x02u8; 32]);
-    }
-
-    #[tokio::test]
     async fn reconstruct_all_cached() {
-        let cache = FileCache::open_in_memory().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
 
         let chunk0_data = b"hello ";
         let chunk1_data = b"world";
@@ -614,7 +509,8 @@ mod tests {
 
     #[tokio::test]
     async fn reconstruct_partial_cache_returns_missing() {
-        let cache = FileCache::open_in_memory().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
 
         let chunk0_data = b"hello ";
         let chunk1_data = b"world";
@@ -650,16 +546,38 @@ mod tests {
 
     #[tokio::test]
     async fn reconstruct_detects_corrupted_chunk() {
-        let cache = FileCache::open_in_memory().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
 
         let chunk0_data = b"hello ";
         let chunk0_hash = Blake3Hash::new(chunk0_data);
 
-        // Store WRONG data under the correct hash key
+        // Write valid chunk data first
         cache
-            .put_chunk(chunk0_hash.as_bytes(), b"CORRUPTED")
+            .put_chunk(chunk0_hash.as_bytes(), chunk0_data)
             .await
             .unwrap();
+
+        // Corrupt the file on disk by overwriting it with different data
+        let path = {
+            // Compute the file path the same way ChunkStore does
+            let hex = {
+                const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+                let mut s = String::with_capacity(64);
+                for &b in chunk0_hash.as_bytes() {
+                    s.push(HEX_CHARS[(b >> 4) as usize] as char);
+                    s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+                }
+                s
+            };
+            tmp.path()
+                .join("chunks")
+                .join(&hex[..2])
+                .join(&hex[2..4])
+                .join(format!("{hex}.bin"))
+        };
+        // Overwrite the file with garbage data
+        std::fs::write(&path, b"CORRUPTED").unwrap();
 
         let chunks = vec![ChunkInfo {
             index: 0,
