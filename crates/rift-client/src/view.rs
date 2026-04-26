@@ -871,6 +871,56 @@ mod tests {
         );
     }
 
+    /// When a symlink and its canonical target both resolve to the same UUID
+    /// (as happens when the server returns the same handle for both), both
+    /// paths must be cached and resolvable. This was the bug that caused
+    /// EIO/SIGBUS in production: BidirectionalMap silently dropped the second
+    /// insert, making the second path invisible to get_by_path.
+    #[tokio::test]
+    async fn readdir_symlink_same_uuid_both_paths_resolvable() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        // Simulate symlink: both "link.h" and "target.h" resolve to same UUID
+        let shared_uuid = Uuid::now_v7();
+
+        remote
+            .set_readdir(Ok(vec![
+                ReaddirEntry {
+                    name: "link.h".to_string(),
+                    file_type: rift_protocol::messages::FileType::Regular as i32,
+                    handle: shared_uuid.as_bytes().to_vec(),
+                },
+                ReaddirEntry {
+                    name: "target.h".to_string(),
+                    file_type: rift_protocol::messages::FileType::Regular as i32,
+                    handle: shared_uuid.as_bytes().to_vec(),
+                },
+            ]))
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![
+                Ok(make_file_attrs(100, [0x01; 32])),
+                Ok(make_file_attrs(100, [0x01; 32])),
+            ]))
+            .await;
+
+        let entries = view.readdir(Path::new(".")).await.unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Both paths MUST resolve to the same UUID
+        assert_eq!(
+            view.handles.get_by_path(Path::new("link.h")),
+            Some(shared_uuid)
+        );
+        assert_eq!(
+            view.handles.get_by_path(Path::new("target.h")),
+            Some(shared_uuid)
+        );
+    }
+
     #[tokio::test]
     async fn non_cached_read_fetches_from_server() {
         let root = Uuid::now_v7();
