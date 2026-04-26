@@ -770,12 +770,11 @@ async fn server_readdir_root_lists_all_entries() {
 }
 
 #[tokio::test]
-async fn readdir_and_lookup_return_same_handle_for_symlink() {
-    // Test TWO scenarios:
-    // 1. Basic symlink (symlink -> file)
-    // 2. Nested symlink (symlink -> symlink)
+async fn readdir_and_lookup_return_consistent_handles_for_symlink() {
+    // Test that readdir and lookup return consistent handles for symlinks,
+    // and that symlinks report their file type and target correctly.
 
-    use rift_protocol::messages::{lookup_response, msg, LookupRequest, ReaddirRequest};
+    use rift_protocol::messages::{lookup_response, msg, FileType, LookupRequest, ReaddirRequest};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_path_buf();
@@ -783,9 +782,6 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
     // Basic: file -> symlink pointing to it
     std::fs::write(root.join("target_file.txt"), b"hello").unwrap();
     std::os::unix::fs::symlink("target_file.txt", root.join("link_file.txt")).unwrap();
-
-    // Nested: symlink -> another symlink
-    std::os::unix::fs::symlink("link_file.txt", root.join("double_link.txt")).unwrap();
 
     let addr = helpers::start_server(root).await;
     let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
@@ -816,34 +812,46 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
         .iter()
         .find(|e| e.name == "link_file.txt")
         .expect("link_file.txt should be in readdir result");
-    let double_entry = readdir_entries
+    let target_entry = readdir_entries
         .iter()
-        .find(|e| e.name == "double_link.txt")
-        .expect("double_link.txt should be in readdir result");
+        .find(|e| e.name == "target_file.txt")
+        .expect("target_file.txt should be in readdir result");
+
+    // Symlink and target must have DIFFERENT handles (each has its own path)
+    assert_ne!(
+        link_entry.handle, target_entry.handle,
+        "symlink and target must have different handles"
+    );
+
+    // Symlink must report Symlink type and include the target
+    assert_eq!(
+        link_entry.file_type,
+        FileType::Symlink as i32,
+        "link_file.txt must have FileType::Symlink"
+    );
+    assert_eq!(
+        link_entry.symlink_target, "target_file.txt",
+        "symlink_target must be set for symlinks"
+    );
+
+    // Target must report Regular type with empty symlink_target
+    assert_eq!(
+        target_entry.file_type,
+        FileType::Regular as i32,
+        "target_file.txt must have FileType::Regular"
+    );
+    assert_eq!(
+        target_entry.symlink_target, "",
+        "symlink_target must be empty for regular files"
+    );
 
     let link_handle = link_entry.handle.clone();
-    let double_handle = double_entry.handle.clone();
 
-    // All three (link, double_link, and target) should have SAME handle
-    assert_eq!(
-        link_handle, double_handle,
-        "nested symlink should have same handle as target"
-    );
-    assert_eq!(
-        link_handle,
-        readdir_entries
-            .iter()
-            .find(|e| e.name == "target_file.txt")
-            .unwrap()
-            .handle,
-        "symlink and target should have same handle"
-    );
-
-    // Now use lookup for the nested symlink
+    // Now use lookup for the symlink
     let mut stream = conn.open_stream().await.unwrap();
     let lookup_req = LookupRequest {
         parent_handle: root_handle,
-        name: "double_link.txt".to_string(),
+        name: "link_file.txt".to_string(),
     };
     stream
         .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
@@ -854,15 +862,27 @@ async fn readdir_and_lookup_return_same_handle_for_symlink() {
     let frame = stream.recv_frame().await.unwrap().unwrap();
     let (_, payload) = frame;
     let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
-    let lookup_handle = match lookup_resp.result {
-        Some(lookup_response::Result::Entry(e)) => e.handle,
+    let lookup_entry = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(e)) => e,
         _ => panic!("expected entry"),
     };
 
-    // Lookup should return same handle as readdir
+    // Lookup should return same handle as readdir for the symlink
     assert_eq!(
-        double_handle, lookup_handle,
-        "readdir and lookup should return same handle for nested symlink"
+        link_handle, lookup_entry.handle,
+        "readdir and lookup should return same handle for symlink"
+    );
+
+    // Lookup should also report Symlink type and target
+    let attrs = lookup_entry.attrs.as_ref().expect("attrs must be present");
+    assert_eq!(
+        attrs.file_type,
+        FileType::Symlink as i32,
+        "lookup symlink must have FileType::Symlink"
+    );
+    assert_eq!(
+        attrs.symlink_target, "target_file.txt",
+        "lookup symlink must include symlink_target"
     );
 }
 

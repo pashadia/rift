@@ -210,6 +210,7 @@ mod tests {
                     gid: 1000,
                     nlinks: 1,
                     root_hash: vec![],
+                    symlink_target: String::new(),
                 }),
             })),
         };
@@ -275,11 +276,13 @@ mod tests {
                         name: "foo.txt".to_string(),
                         file_type: FileType::Regular as i32,
                         handle: b"foo-handle".to_vec(),
+                        symlink_target: String::new(),
                     },
                     ReaddirEntry {
                         name: "bar".to_string(),
                         file_type: FileType::Directory as i32,
                         handle: b"bar-handle".to_vec(),
+                        symlink_target: String::new(),
                     },
                 ],
                 has_more: false,
@@ -524,6 +527,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
                 root_hash: vec![],
+                symlink_target: String::new(),
             }),
             changed_chunks: vec![ChunkInfo {
                 index: 3,
@@ -569,6 +573,7 @@ mod tests {
                     gid: 1000,
                     nlinks: 2,
                     root_hash: vec![],
+                    symlink_target: String::new(),
                 }),
             })),
         };
@@ -788,6 +793,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
                 root_hash: vec![],
+                symlink_target: String::new(),
             })),
         };
         let encoded = msg.encode_to_vec();
@@ -927,6 +933,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
                 root_hash: vec![],
+                symlink_target: String::new(),
             }),
             root_hash: vec![0xAA; 32],
             sequence: 7,
@@ -985,6 +992,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 2,
                 root_hash: vec![],
+                symlink_target: String::new(),
             }),
             sequence: 5,
         };
@@ -1025,6 +1033,42 @@ mod tests {
         assert_eq!(decoded.old_handle, b"old-dir-handle");
         assert_eq!(decoded.new_handle, b"new-dir-handle");
         assert_eq!(decoded.sequence, 34);
+    }
+
+    // --- Symlink support ---
+
+    #[test]
+    fn file_attrs_symlink_target_round_trip() {
+        let msg = FileAttrs {
+            file_type: FileType::Symlink as i32,
+            size: 0,
+            mtime: None,
+            mode: 0o777,
+            uid: 1000,
+            gid: 1000,
+            nlinks: 1,
+            root_hash: vec![],
+            symlink_target: "/usr/bin/python3".to_string(),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = FileAttrs::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.file_type, FileType::Symlink as i32);
+        assert_eq!(decoded.symlink_target, "/usr/bin/python3");
+    }
+
+    #[test]
+    fn readdir_entry_symlink_target_round_trip() {
+        let msg = ReaddirEntry {
+            name: "python".to_string(),
+            file_type: FileType::Symlink as i32,
+            handle: b"symlink-handle".to_vec(),
+            symlink_target: "/usr/bin/python3".to_string(),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = ReaddirEntry::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.name, "python");
+        assert_eq!(decoded.file_type, FileType::Symlink as i32);
+        assert_eq!(decoded.symlink_target, "/usr/bin/python3");
     }
 
     // --- Type ID constants sanity check ---

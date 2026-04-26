@@ -56,6 +56,7 @@ message ReaddirEntry {
   string   name      = 1;
   FileType file_type = 2;
   bytes    handle    = 3;
+  string   symlink_target = 4;  // Set when file_type == SYMLINK
 }
 
 // MKDIR (0x16 / 0x17)

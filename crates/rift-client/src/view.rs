@@ -4,7 +4,7 @@ use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use rift_common::crypto::Blake3Hash;
 use rift_common::FsError;
-use rift_protocol::messages::FileAttrs;
+use rift_protocol::messages::{FileAttrs, FileType};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::instrument;
@@ -42,6 +42,10 @@ pub trait ShareView: Send + Sync + 'static {
         length: u64,
         cached_root_hash: Option<&[u8]>,
     ) -> Result<Vec<u8>, FsError>;
+
+    /// Reads the target of a symbolic link by path.
+    /// Returns the symlink target as a String.
+    async fn readlink(&self, path: &Path) -> Result<String, FsError>;
 }
 
 /// A fully-resolved leaf node with verified metadata.
@@ -219,7 +223,14 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         } else {
             parent_relative.join(name)
         };
-        self.handles.insert(child_path, child_uuid).await;
+        self.handles.insert(child_path.clone(), child_uuid).await;
+
+        // Cache symlink target if this entry is a symlink with a non-empty target
+        if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
+            self.handles
+                .insert_symlink_target(child_path, attrs.symlink_target.clone())
+                .await;
+        }
 
         Ok(attrs)
     }
@@ -256,7 +267,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
 
         let dir_relative = path_to_relative(path);
-        let combined: Vec<(DirEntry, std::path::PathBuf, Uuid)> = pairs
+        let combined: Vec<(DirEntry, std::path::PathBuf, Uuid, Option<String>)> = pairs
             .into_iter()
             .zip(attrs_results)
             .filter_map(|((entry, child_uuid), attrs_result)| {
@@ -266,23 +277,44 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 } else {
                     dir_relative.join(&entry.name)
                 };
+
+                // Determine symlink target: prefer ReaddirEntry.symlink_target,
+                // fall back to FileAttrs.symlink_target if available.
+                let symlink_target = if entry.file_type == FileType::Symlink as i32 {
+                    if !entry.symlink_target.is_empty() {
+                        Some(entry.symlink_target.clone())
+                    } else if !attrs.symlink_target.is_empty() {
+                        Some(attrs.symlink_target.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 Some((
                     DirEntry {
-                        name: entry.name,
+                        name: entry.name.clone(),
                         file_type: entry.file_type,
                         attrs,
                     },
                     child_path,
                     child_uuid,
+                    symlink_target,
                 ))
             })
             .collect();
 
-        for (_, child_path, child_uuid) in &combined {
+        for (_entry, child_path, child_uuid, symlink_target) in &combined {
             self.handles.insert(child_path.clone(), *child_uuid).await;
+            if let Some(target) = symlink_target {
+                self.handles
+                    .insert_symlink_target(child_path.clone(), target.clone())
+                    .await;
+            }
         }
 
-        Ok(combined.into_iter().map(|(entry, _, _)| entry).collect())
+        Ok(combined.into_iter().map(|(entry, _, _, _)| entry).collect())
     }
 
     #[instrument(skip(self), fields(path = %path.display(), offset, length))]
@@ -496,6 +528,14 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         Ok(result)
     }
+
+    #[instrument(skip(self), fields(path = %path.display()))]
+    async fn readlink(&self, path: &Path) -> Result<String, FsError> {
+        let relative = path_to_relative(path);
+        self.handles
+            .get_symlink_target(Path::new(&relative))
+            .ok_or(FsError::NotFound)
+    }
 }
 
 /// Check whether the manifest's chunks form a contiguous range starting
@@ -596,7 +636,7 @@ mod tests {
     use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
     use async_trait::async_trait;
     use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
-    use rift_protocol::messages::ReaddirEntry;
+    use rift_protocol::messages::{FileType, ReaddirEntry};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -840,11 +880,13 @@ mod tests {
                     name: "file1.txt".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: file1_uuid.as_bytes().to_vec(),
+                    symlink_target: String::new(),
                 },
                 ReaddirEntry {
                     name: "file2.txt".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: file2_uuid.as_bytes().to_vec(),
+                    symlink_target: String::new(),
                 },
             ]))
             .await;
@@ -891,11 +933,13 @@ mod tests {
                     name: "link.h".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: shared_uuid.as_bytes().to_vec(),
+                    symlink_target: String::new(),
                 },
                 ReaddirEntry {
                     name: "target.h".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: shared_uuid.as_bytes().to_vec(),
+                    symlink_target: String::new(),
                 },
             ]))
             .await;
@@ -3149,5 +3193,170 @@ mod tests {
             2,
             "full read should contact the server (cache miss for missing chunks)"
         );
+    }
+
+    // =======================================================================
+    // readlink tests
+    // =======================================================================
+
+    /// readdir with a symlink entry should cache the symlink target,
+    /// and readlink should return it.
+    #[tokio::test]
+    async fn readdir_symlink_caches_and_readlink_returns_target() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+
+        remote
+            .set_readdir(Ok(vec![ReaddirEntry {
+                name: "my_link".to_string(),
+                file_type: FileType::Symlink as i32,
+                handle: link_uuid.as_bytes().to_vec(),
+                symlink_target: "../../foo".to_string(),
+            }]))
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(FileAttrs {
+                file_type: FileType::Symlink as i32,
+                symlink_target: "../../foo".to_string(),
+                ..make_file_attrs(10, [0x01; 32])
+            })]))
+            .await;
+
+        let entries = view.readdir(Path::new(".")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "my_link");
+
+        // readlink should return the cached symlink target
+        let target = view.readlink(Path::new("my_link")).await.unwrap();
+        assert_eq!(target, "../../foo");
+    }
+
+    /// When readdir provides symlink_target in the ReaddirEntry but NOT in FileAttrs,
+    /// the ReaddirEntry target should still be cached.
+    #[tokio::test]
+    async fn readdir_symlink_target_from_entry_not_attrs() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+
+        // ReaddirEntry has symlink_target, but stat attrs has empty symlink_target
+        remote
+            .set_readdir(Ok(vec![ReaddirEntry {
+                name: "shortcut".to_string(),
+                file_type: FileType::Symlink as i32,
+                handle: link_uuid.as_bytes().to_vec(),
+                symlink_target: "/usr/bin/python3".to_string(),
+            }]))
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(FileAttrs {
+                file_type: FileType::Symlink as i32,
+                symlink_target: String::new(), // empty in attrs
+                ..make_file_attrs(0, [0x01; 32])
+            })]))
+            .await;
+
+        let _entries = view.readdir(Path::new(".")).await.unwrap();
+
+        // readlink should return the target from ReaddirEntry
+        let target = view.readlink(Path::new("shortcut")).await.unwrap();
+        assert_eq!(target, "/usr/bin/python3");
+    }
+
+    /// When ReaddirEntry.symlink_target is empty but FileAttrs.symlink_target is set,
+    /// the attrs target should be used as fallback.
+    #[tokio::test]
+    async fn readdir_symlink_target_fallback_to_attrs() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+
+        // ReaddirEntry has empty symlink_target, but stat attrs has it
+        remote
+            .set_readdir(Ok(vec![ReaddirEntry {
+                name: "fallback_link".to_string(),
+                file_type: FileType::Symlink as i32,
+                handle: link_uuid.as_bytes().to_vec(),
+                symlink_target: String::new(), // empty in entry
+            }]))
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(FileAttrs {
+                file_type: FileType::Symlink as i32,
+                symlink_target: "/etc/alternatives/java".to_string(),
+                ..make_file_attrs(0, [0x01; 32])
+            })]))
+            .await;
+
+        let _entries = view.readdir(Path::new(".")).await.unwrap();
+
+        // readlink should return the target from FileAttrs (fallback)
+        let target = view.readlink(Path::new("fallback_link")).await.unwrap();
+        assert_eq!(target, "/etc/alternatives/java");
+    }
+
+    /// lookup with a symlink should cache the target from FileAttrs,
+    /// and readlink should return it.
+    #[tokio::test]
+    async fn lookup_symlink_caches_and_readlink_returns_target() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let child_uuid = Uuid::now_v7();
+        let link_attrs = FileAttrs {
+            file_type: FileType::Symlink as i32,
+            symlink_target: "/usr/bin/python3".to_string(),
+            ..make_file_attrs(0, [0x01; 32])
+        };
+
+        remote.set_lookup(Ok((child_uuid, link_attrs))).await;
+
+        let result = view.lookup(Path::new("."), "pylink").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().file_type, FileType::Symlink as i32);
+
+        // readlink should return the cached symlink target
+        let target = view.readlink(Path::new("pylink")).await.unwrap();
+        assert_eq!(target, "/usr/bin/python3");
+    }
+
+    /// readlink for a non-symlink path should return NotFound.
+    #[tokio::test]
+    async fn readlink_non_symlink_returns_not_found() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        remote
+            .set_lookup(Ok((file_uuid, make_file_attrs(100, [0x01; 32]))))
+            .await;
+
+        let _ = view.lookup(Path::new("."), "regular.txt").await;
+
+        let result = view.readlink(Path::new("regular.txt")).await;
+        assert!(matches!(result, Err(FsError::NotFound)));
+    }
+
+    /// readlink for a path that was never seen should return NotFound.
+    #[tokio::test]
+    async fn readlink_unknown_path_returns_not_found() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote, root);
+
+        let result = view.readlink(Path::new("never_heard_of")).await;
+        assert!(matches!(result, Err(FsError::NotFound)));
     }
 }

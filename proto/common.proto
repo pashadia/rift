@@ -37,6 +37,7 @@ message FileAttrs {
   // For regular files: root of content Merkle tree.
   // For directories/symlinks: constant sentinel hash.
   bytes                     root_hash = 8;
+  string                    symlink_target = 9;  // Set when file_type == SYMLINK
 }
 
 message ChunkInfo {

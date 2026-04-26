@@ -7,6 +7,19 @@ use rift_protocol::messages::{FileAttrs, FileType};
 /// a constant hash is used since they don't have content.
 /// This is used by the delta sync protocol to identify file versions.
 pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs {
+    build_attrs_with_symlink_target(meta, root_hash, String::new())
+}
+
+/// Build `FileAttrs` from filesystem metadata, Merkle root hash, and an optional
+/// symlink target string.
+///
+/// When the entry is a symlink, `symlink_target` should contain the link target;
+/// for all other file types it should be empty.
+pub fn build_attrs_with_symlink_target(
+    meta: &std::fs::Metadata,
+    root_hash: Blake3Hash,
+    symlink_target: String,
+) -> FileAttrs {
     use std::os::unix::fs::MetadataExt as _;
 
     let file_type = if meta.is_dir() {
@@ -34,6 +47,7 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
         gid: meta.gid(),
         nlinks: meta.nlink() as u32,
         root_hash: root_hash.as_bytes().to_vec(),
+        symlink_target,
     }
 }
 

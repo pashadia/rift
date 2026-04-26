@@ -195,6 +195,15 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     }
 
     #[instrument(skip(self), fields(path = ?path), level = "debug")]
+    async fn readlink(&self, _req: Request, path: &OsStr) -> Fuse3Result<ReplyData> {
+        let rust_path = std::path::Path::new(path);
+        let target = self.view.readlink(rust_path).await.map_err(to_errno)?;
+        Ok(ReplyData {
+            data: Bytes::from(target.into_bytes()),
+        })
+    }
+
+    #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn releasedir(
         &self,
         _req: Request,
@@ -237,6 +246,10 @@ mod tests {
             _length: u64,
             _cached_root_hash: Option<&[u8]>,
         ) -> Result<Vec<u8>, FsError> {
+            Err(FsError::NotFound)
+        }
+
+        async fn readlink(&self, _path: &Path) -> Result<String, FsError> {
             Err(FsError::NotFound)
         }
     }

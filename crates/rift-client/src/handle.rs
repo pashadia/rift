@@ -15,6 +15,9 @@ use uuid::Uuid;
 pub struct HandleMap {
     path_to_uuid: TreeIndex<PathBuf, Uuid>,
     uuid_to_path: TreeIndex<Uuid, PathBuf>,
+    /// Maps symlink paths to their target paths.
+    /// Only populated for entries where `file_type == SYMLINK`.
+    symlink_targets: TreeIndex<PathBuf, String>,
 }
 
 impl Default for HandleMap {
@@ -29,6 +32,7 @@ impl HandleMap {
         Self {
             path_to_uuid: TreeIndex::new(),
             uuid_to_path: TreeIndex::new(),
+            symlink_targets: TreeIndex::new(),
         }
     }
 
@@ -37,6 +41,17 @@ impl HandleMap {
     fn insert_sync(&self, path: PathBuf, uuid: Uuid) {
         self.path_to_uuid.upsert_sync(path.clone(), uuid);
         self.uuid_to_path.upsert_sync(uuid, path);
+    }
+
+    /// Insert a symlink path → target mapping (async variant for use in async contexts).
+    pub async fn insert_symlink_target(&self, path: PathBuf, target: String) {
+        self.symlink_targets.upsert_async(path, target).await;
+    }
+
+    /// Look up the symlink target for a path. Lock-free, O(log n).
+    /// Returns `None` if the path is not a known symlink.
+    pub fn get_symlink_target(&self, path: &Path) -> Option<String> {
+        self.symlink_targets.peek_with(path, |_, v| v.clone())
     }
 
     /// Insert a path → UUID mapping (async variant for use in async contexts).
@@ -62,6 +77,7 @@ impl HandleMap {
     pub fn clear(&self) {
         self.path_to_uuid.clear();
         self.uuid_to_path.clear();
+        self.symlink_targets.clear();
     }
 }
 
@@ -99,6 +115,16 @@ impl HandleCache {
 
     pub fn get_by_handle(&self, uuid: &Uuid) -> Option<PathBuf> {
         self.map.get_by_handle(uuid)
+    }
+
+    /// Insert a symlink path → target mapping (async).
+    pub async fn insert_symlink_target(&self, path: PathBuf, target: String) {
+        self.map.insert_symlink_target(path, target).await;
+    }
+
+    /// Look up the symlink target for a path. Lock-free, O(log n).
+    pub fn get_symlink_target(&self, path: &Path) -> Option<String> {
+        self.map.get_symlink_target(path)
     }
 
     pub async fn clear(&self) {
@@ -298,5 +324,86 @@ mod tests {
         assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
         assert_eq!(cache.get_by_path(Path::new("file.txt")), None);
         assert_eq!(cache.get_by_handle(&child), None);
+    }
+
+    // =======================================================================
+    // Symlink target caching tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn insert_symlink_target_and_get_it_back() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+
+        cache
+            .insert_symlink_target(PathBuf::from("link_to_foo"), "../../foo".to_string())
+            .await;
+
+        assert_eq!(
+            cache.get_symlink_target(Path::new("link_to_foo")),
+            Some("../../foo".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn symlink_target_overwritten_on_reinsert() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+
+        cache
+            .insert_symlink_target(PathBuf::from("link"), "old_target".to_string())
+            .await;
+        assert_eq!(
+            cache.get_symlink_target(Path::new("link")),
+            Some("old_target".to_string())
+        );
+
+        // Reinsert with the same path should update the target
+        cache
+            .insert_symlink_target(PathBuf::from("link"), "new_target".to_string())
+            .await;
+        assert_eq!(
+            cache.get_symlink_target(Path::new("link")),
+            Some("new_target".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_also_clears_symlink_targets() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+
+        cache
+            .insert_symlink_target(PathBuf::from("link"), "target".to_string())
+            .await;
+        assert_eq!(
+            cache.get_symlink_target(Path::new("link")),
+            Some("target".to_string())
+        );
+
+        cache.clear().await;
+
+        assert_eq!(
+            cache.get_symlink_target(Path::new("link")),
+            None,
+            "clear() must remove symlink targets"
+        );
+        // Root entry should still be present
+        assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
+    }
+
+    #[test]
+    fn non_symlink_path_returns_none() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let child = make_uuid(1);
+        // Only insert a path→UUID mapping, no symlink target
+        cache.map.insert_sync(PathBuf::from("regular_file"), child);
+
+        assert_eq!(
+            cache.get_symlink_target(Path::new("regular_file")),
+            None,
+            "non-symlink path should return None"
+        );
     }
 }

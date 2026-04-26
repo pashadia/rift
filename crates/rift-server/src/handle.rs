@@ -203,6 +203,44 @@ impl HandleDatabase {
         Ok(())
     }
 
+    /// Create or retrieve a handle for a path **without** canonicalizing it.
+    ///
+    /// This is intended for symlink entries in readdir, where the handle must
+    /// refer to the symlink's own path (not its resolved target). For regular
+    /// files and directories, prefer [`get_or_create_handle`] which canonicalizes
+    /// the path and stores xattrs for persistence.
+    ///
+    /// If a handle for this exact path already exists in the map, it is returned;
+    /// otherwise a new UUID is generated, inserted, and returned.
+    pub async fn get_or_create_handle_non_canonical(&self, path: &Path) -> std::io::Result<Uuid> {
+        // Check if we already have a handle for this exact path.
+        if let Some(handle) = self.map.get_handle(&path.to_path_buf()) {
+            return Ok(handle);
+        }
+
+        let handle = Uuid::now_v7();
+
+        match self.map.insert(handle, path.to_path_buf()) {
+            Ok(()) => Ok(handle),
+            Err(_) => {
+                // Concurrent insert — re-lookup
+                let existing = self.map.get_handle(&path.to_path_buf()).ok_or_else(|| {
+                    std::io::Error::other("insert failed and re-lookup found nothing")
+                })?;
+                Ok(existing)
+            }
+        }
+    }
+
+    /// Insert a handle with a pre-determined path, bypassing canonicalization.
+    /// Used in tests to register symlink paths (which must not be canonicalized).
+    #[cfg(test)]
+    pub fn insert_direct(&self, handle: Uuid, path: PathBuf) {
+        self.map
+            .insert(handle, path)
+            .expect("insert_direct should not conflict");
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

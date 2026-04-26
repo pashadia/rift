@@ -11,7 +11,7 @@ use rift_protocol::messages::{stat_result, ErrorCode, StatRequest, StatResponse,
 use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
-use crate::handler::attrs::build_attrs;
+use crate::handler::attrs::{build_attrs, build_attrs_with_symlink_target};
 use crate::handler::merkle_cache::get_or_compute_merkle_root;
 use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::{error_detail, io_err_kind_to_code, resolve};
@@ -66,8 +66,8 @@ fn async_stat<'a, M: MerkleCache>(
     chunker: Chunker,
 ) -> BoxFuture<'a, StatResult> {
     Box::pin(async move {
-        let canonical = match resolve(share, &uuid, handle_db).await {
-            Ok(r) => r.canonical,
+        let resolved = match resolve(share, &uuid, handle_db).await {
+            Ok(r) => r,
             Err(e) => {
                 let code = e
                     .root_cause()
@@ -78,17 +78,36 @@ fn async_stat<'a, M: MerkleCache>(
             }
         };
 
-        let meta = match tokio::fs::metadata(&canonical).await {
+        // Use symlink_metadata instead of metadata so that symlinks return
+        // their own metadata (not the target's).
+        let meta = match tokio::fs::symlink_metadata(&resolved.canonical).await {
             Ok(m) => m,
             Err(e) => {
                 return stat_error(io_err_kind_to_code(e.kind()));
             }
         };
 
-        let root_hash = get_or_compute_merkle_root(&canonical, &meta, db, chunker).await;
+        // For symlinks, include the target path.
+        let symlink_target = if meta.is_symlink() {
+            tokio::fs::read_link(&resolved.canonical)
+                .await
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        let root_hash = get_or_compute_merkle_root(&resolved.canonical, &meta, db, chunker).await;
+
+        let attrs = if let Some(target) = symlink_target {
+            build_attrs_with_symlink_target(&meta, root_hash, target)
+        } else {
+            build_attrs(&meta, root_hash)
+        };
+
         StatResult {
             handle: handle_bytes,
-            result: Some(stat_result::Result::Attrs(build_attrs(&meta, root_hash))),
+            result: Some(stat_result::Result::Attrs(attrs)),
         }
     })
 }
@@ -148,5 +167,53 @@ mod tests {
             0,
             "malformed payload must yield empty results"
         );
+    }
+
+    /// Statting a symlink should return symlink metadata (FileType::Symlink)
+    /// and include the symlink target, not the target's metadata.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stat_response_symlink_returns_symlink_type_and_target() {
+        use std::os::unix::fs::symlink;
+        use uuid::Uuid;
+
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let target = share.join("target.txt");
+        let link = share.join("link.txt");
+        // Create symlink with a relative target (as is typical for in-share symlinks)
+        std::fs::write(&target, b"hello").unwrap();
+        symlink("target.txt", &link).unwrap();
+
+        // We must register the symlink's own path (not canonical)
+        // so that resolve returns the symlink, not the target.
+        let handle_db = HandleDatabase::new();
+        let uuid = Uuid::now_v7();
+        handle_db.insert_direct(uuid, link.clone());
+
+        let req = StatRequest {
+            handles: vec![uuid.as_bytes().to_vec()],
+        };
+        let payload = req.encode_to_vec();
+
+        let resp =
+            stat_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
+
+        assert_eq!(resp.results.len(), 1);
+        match &resp.results[0].result {
+            Some(stat_result::Result::Attrs(attrs)) => {
+                assert_eq!(
+                    attrs.file_type,
+                    FileType::Symlink as i32,
+                    "symlink should report as Symlink, got {:?}",
+                    attrs.file_type
+                );
+                assert_eq!(
+                    attrs.symlink_target, "target.txt",
+                    "symlink target should be 'target.txt'"
+                );
+            }
+            other => panic!("expected Attrs, got: {:?}", other),
+        }
     }
 }

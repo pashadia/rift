@@ -66,22 +66,47 @@ pub async fn readdir_response(
                     let name = entry.file_name().to_string_lossy().into_owned();
                     let entry_path = entry.path();
 
-                    let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
-                        Ok(p) => p,
-                        Err(_) => return None,
+                    // For symlinks: use the symlink's own path (not canonical) for the handle
+                    // and read the symlink target. For everything else: canonicalize as before.
+                    // Then check that the canonical path is within the share root.
+                    let (handle, symlink_target) = if file_type.is_symlink() {
+                        let target = tokio::fs::read_link(&entry_path).await.ok()?;
+                        // Validate that the symlink target, when resolved, is within the share.
+                        // This filters out symlinks pointing outside the share and broken symlinks.
+                        let canonical = match tokio::fs::canonicalize(&entry_path).await {
+                            Ok(p) => p,
+                            Err(_) => return None, // broken symlink or inaccessible
+                        };
+                        let share_canonical = tokio::fs::canonicalize(share).await.ok()?;
+                        if !canonical.starts_with(&share_canonical) {
+                            return None; // symlink target outside share
+                        }
+                        // Use the symlink's own path for the handle, not the canonical target.
+                        let uuid = handle_db
+                            .get_or_create_handle_non_canonical(&entry_path)
+                            .await
+                            .ok()?;
+                        let handle = uuid.as_bytes().to_vec();
+                        (handle, Some(target.to_string_lossy().into_owned()))
+                    } else {
+                        let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
+                            Ok(p) => p,
+                            Err(_) => return None,
+                        };
+                        let handle = handle_db
+                            .get_or_create_handle(&entry_canonical)
+                            .await
+                            .ok()?
+                            .as_bytes()
+                            .to_vec();
+                        (handle, None)
                     };
-
-                    let handle = handle_db
-                        .get_or_create_handle(&entry_canonical)
-                        .await
-                        .ok()?
-                        .as_bytes()
-                        .to_vec();
 
                     Some(ReaddirEntry {
                         name,
                         file_type: proto_type,
                         handle,
+                        symlink_target: symlink_target.unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -194,5 +219,111 @@ mod tests {
             Some(readdir_response::Result::Error(_)) => {}
             other => panic!("expected Error for garbage payload, got: {:?}", other),
         }
+    }
+
+    /// Symlinks within the share must:
+    ///   1. Report `FileType::Symlink`.
+    ///   2. Include the symlink target in `symlink_target`.
+    ///   3. Use the symlink's OWN path (not the canonical target) for the handle.
+    #[tokio::test]
+    async fn readdir_response_symlink_uses_own_path_and_includes_target() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create a regular file and a symlink pointing to it.
+        std::fs::write(share.join("target.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("target.txt", share.join("link.txt")).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+
+        let link_entry = success
+            .entries
+            .iter()
+            .find(|e| e.name == "link.txt")
+            .expect("must list link.txt");
+
+        // 1. File type must be Symlink
+        assert_eq!(
+            link_entry.file_type,
+            FileType::Symlink as i32,
+            "link.txt must have FileType::Symlink"
+        );
+
+        // 2. symlink_target must be set and match the expected target
+        assert_eq!(
+            link_entry.symlink_target, "target.txt",
+            "symlink_target must match the link target"
+        );
+
+        // 3. The handle must have been created from the symlink's own path,
+        //    not from the canonical target path. Look up the handle in the
+        //    database and verify it resolves back to the symlink's own path
+        //    (not the resolved target).
+        let link_path = share.join("link.txt");
+        let handle_uuid =
+            Uuid::from_slice(&link_entry.handle).expect("handle must be a valid UUID");
+        let stored_path = handle_db
+            .get_path(&handle_uuid)
+            .expect("handle must exist in database");
+        assert_eq!(
+            stored_path, link_path,
+            "symlink handle must map to the symlink's own path, not the canonical target"
+        );
+    }
+
+    /// Symlinks whose canonical target is outside the share must be filtered out.
+    #[tokio::test]
+    async fn readdir_response_filters_symlink_pointing_outside_share() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create a symlink pointing to an absolute path outside the share.
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), share.join("outside_link")).unwrap();
+
+        // Also create a regular file so the directory isn't empty.
+        std::fs::write(share.join("regular.txt"), b"data").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+
+        let names: Vec<&str> = success.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names.contains(&"outside_link"),
+            "symlink pointing outside the share must be filtered out"
+        );
+        assert!(
+            names.contains(&"regular.txt"),
+            "regular files must still be listed"
+        );
     }
 }

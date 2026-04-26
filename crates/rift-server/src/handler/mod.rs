@@ -26,7 +26,7 @@ pub mod read;
 pub mod readdir;
 pub mod stat;
 
-pub use attrs::build_attrs;
+pub use attrs::{build_attrs, build_attrs_with_symlink_target};
 pub use drill::merkle_drill_response;
 pub use lookup::lookup_response;
 pub use merkle_cache_trait::{MerkleCache, NoopCache};
@@ -35,8 +35,12 @@ pub use readdir::readdir_response;
 pub use stat::stat_response;
 
 /// A path resolved through the HandleDatabase and verified to be within
-/// the share root.  The canonical path is re-verified immediately after
-/// resolution to narrow the TOCTOU window for symlink races.
+/// the share root.
+///
+/// For regular files and directories, `canonical` contains the canonical
+/// (symlink-resolved, absolute) path. For symlinks, `canonical` contains
+/// the symlink's own path (not the target), so that callers can stat the
+/// symlink itself rather than the target.
 ///
 /// Callers should use this resolved path for all subsequent filesystem
 /// operations.  If the path references a regular file, callers should
@@ -44,12 +48,13 @@ pub use stat::stat_response;
 /// to eliminate the remaining TOCTOU window entirely.
 #[derive(Debug, PartialEq)]
 pub struct ResolvedPath {
-    /// The canonical (symlink-resolved, absolute) path.
+    /// For regular files and directories, this is the canonical (symlink-resolved,
+    /// absolute) path. For symlinks, this is the symlink's own path (not the target).
     pub canonical: PathBuf,
 }
 
 /// Resolve an opaque `handle` (UUID from the client) to a
-/// canonical filesystem path within `share` using the HandleDatabase.
+/// filesystem path within `share` using the HandleDatabase.
 ///
 /// # Security invariants
 ///
@@ -58,9 +63,11 @@ pub struct ResolvedPath {
 ///   all `..` components and follows symlinks.
 /// - Verifies that the canonical result is prefixed by the canonical share root,
 ///   rejecting symlinks pointing outside the share.
-/// - Re-opens the file and re-canonicalises via the fd to narrow the TOCTOU window:
-///   the path is verified to still be within the share after opening, preventing
-///   a symlink-swap attack between the initial canonicalize and the file operation.
+/// - For regular files: re-opens the file and re-canonicalises via the fd to narrow
+///   the TOCTOU window, preventing a symlink-swap attack.
+/// - For symlinks: returns the symlink's own path (not the canonical target),
+///   so that `stat` can return symlink metadata and `read` can return ENOENT/EINVAL.
+///   The canonical target is still checked to ensure it stays within the share root.
 ///
 /// # TOCTOU mitigation
 ///
@@ -68,6 +75,8 @@ pub struct ResolvedPath {
 /// this function opens the file and re-canonicalizes via `/proc/self/fd/N`
 /// (on Linux) to confirm the opened fd still resolves to a path within the share.
 /// This eliminates the race window between path resolution and file access.
+/// For symlinks, the TOCTOU fd check is skipped since symlink targets can
+/// change, which is expected behavior.
 #[instrument(skip(share, handle_db), fields(share = %share.display(), handle = ?handle), level = "debug")]
 pub async fn resolve(
     share: &Path,
@@ -86,15 +95,42 @@ pub async fn resolve(
         .await
         .context("share root does not exist or is inaccessible")?;
 
-    // Step 1: Canonicalize the stored path to resolve symlinks and `..`
-    let canonical = match tokio::fs::canonicalize(&stored_path).await {
-        Ok(p) => p,
+    // Step 0: Check if the stored path is a symlink.
+    // We need this before canonicalizing because symlinks should resolve to
+    // their own path, not the target. We still canonicalize for the security
+    // check (ensuring the symlink target is within the share), but we return
+    // the stored symlink path rather than the canonical target.
+    let stored_meta = match tokio::fs::symlink_metadata(&stored_path).await {
+        Ok(m) => m,
         Err(e) => {
             if let Some(_removed) = handle_db.remove(handle) {
                 tracing::info!(handle = %handle, "evicted stale handle");
             }
             return Err(e)
                 .with_context(|| format!("path does not exist: {}", stored_path.display()));
+        }
+    };
+    let is_symlink = stored_meta.is_symlink();
+
+    // Step 1: Canonicalize the stored path to resolve symlinks and `..`
+    let canonical = match tokio::fs::canonicalize(&stored_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            // For broken symlinks, canonicalize will fail (target doesn't exist)
+            // but the symlink itself exists. Only evict if it's not a symlink.
+            if !is_symlink {
+                if let Some(_removed) = handle_db.remove(handle) {
+                    tracing::info!(handle = %handle, "evicted stale handle");
+                }
+                return Err(e)
+                    .with_context(|| format!("path does not exist: {}", stored_path.display()));
+            }
+            // For symlinks with non-existent targets, canonicalize fails.
+            // The symlink itself exists. Allow the resolve but skip the
+            // share-check (canonical is unavailable).
+            return Ok(ResolvedPath {
+                canonical: stored_path,
+            });
         }
     };
 
@@ -111,16 +147,21 @@ pub async fn resolve(
     // the symlink target hasn't been swapped between Step 1 and the open.
     // On non-Linux, this is a no-op — the race window still exists but is
     // extremely narrow (microseconds).
+    //
+    // For symlinks, we skip the fd-based TOCTOU check entirely. A symlink's
+    // target can change between resolve and open, which is expected behavior.
     let mut fd_resolved: Option<PathBuf> = None;
 
     #[cfg(target_os = "linux")]
     {
-        // Only verify for files, not directories (directories can't be swapped
-        // with a symlink to outside the share via rename).
-        if tokio::fs::symlink_metadata(&canonical)
-            .await
-            .map(|m| !m.is_dir())
-            .unwrap_or(false)
+        // Only verify for non-symlink files (not directories, not symlinks).
+        // Directories can't be swapped with a symlink to outside the share via rename.
+        // Symlinks can change their target, which is expected.
+        if !is_symlink
+            && tokio::fs::symlink_metadata(&canonical)
+                .await
+                .map(|m| !m.is_dir())
+                .unwrap_or(false)
         {
             if let Ok(file) = tokio::fs::File::open(&canonical).await {
                 use std::os::unix::io::AsRawFd;
@@ -154,8 +195,16 @@ pub async fn resolve(
         }
     }
 
+    // For symlinks: return the stored path, not the canonical target.
+    // The canonical path was used for security validation only.
+    let resolved_path = if is_symlink {
+        stored_path
+    } else {
+        effective_path(canonical, fd_resolved)
+    };
+
     Ok(ResolvedPath {
-        canonical: effective_path(canonical, fd_resolved),
+        canonical: resolved_path,
     })
 }
 
@@ -295,5 +344,68 @@ mod tests {
         let resolved = resolve(&share, &uuid, &handle_db).await.unwrap();
 
         assert_eq!(resolved.canonical, file.canonicalize().unwrap());
+    }
+
+    /// When a handle is registered for a symlink path, resolve() must return
+    /// the symlink path itself — NOT the canonical target.  This is critical
+    /// for the stat handler to return symlink metadata (not the target's).
+    #[tokio::test]
+    async fn resolve_symlink_returns_symlink_path_not_target() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let target = share.join("target.txt");
+        let link = share.join("link.txt");
+
+        std::fs::write(&target, b"hello").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::hard_link(&target, &link).unwrap(); // fallback
+
+        // Register the symlink's own path (not canonical) in the handle database.
+        // In production, the lookup handler would do this.
+        let handle_db = HandleDatabase::new();
+        let handle = Uuid::now_v7();
+        handle_db.insert_direct(handle, link.clone());
+
+        let resolved = resolve(&share, &handle, &handle_db).await.unwrap();
+
+        // The resolved path should be the symlink itself, NOT the target.
+        assert_eq!(
+            resolved.canonical, link,
+            "resolve() for a symlink handle must return the symlink path, not the canonical target"
+        );
+    }
+
+    /// A broken symlink (target doesn't exist) should still resolve to the
+    /// symlink path itself, not fail.  The symlink exists even if its target
+    /// doesn't.
+    #[tokio::test]
+    async fn resolve_broken_symlink_returns_symlink_path() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let dangling = share.join("dangling.txt");
+        let link = share.join("broken_link.txt");
+
+        // Create a symlink pointing to a file that doesn't exist.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dangling, &link).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Can't create broken symlinks on non-Unix; skip.
+            return;
+        }
+
+        let handle_db = HandleDatabase::new();
+        let handle = Uuid::now_v7();
+        handle_db.insert_direct(handle, link.clone());
+
+        let resolved = resolve(&share, &handle, &handle_db).await.unwrap();
+
+        // The resolved path should be the symlink itself.
+        assert_eq!(
+            resolved.canonical, link,
+            "resolve() for a broken symlink must return the symlink path, not fail"
+        );
     }
 }
