@@ -62,20 +62,17 @@ pub async fn readdir_response(
                     async move {
                         let entry = entry_result.ok()?;
                         let file_type = entry.file_type().await.ok()?;
-                        let proto_type = if file_type.is_dir() {
-                            FileType::Directory as i32
-                        } else if file_type.is_symlink() {
-                            FileType::Symlink as i32
-                        } else {
-                            FileType::Regular as i32
-                        };
                         let name = entry.file_name().to_string_lossy().into_owned();
                         let entry_path = entry.path();
 
-                        // For symlinks: use the symlink's own path (not canonical) for the handle
-                        // and read the symlink target. For everything else: canonicalize as before.
-                        // Then check that the canonical path is within the share root.
-                        let (handle, symlink_target) = if file_type.is_symlink() {
+                        let initial_is_symlink = file_type.is_symlink();
+
+                        // For symlinks: read the target and canonicalize for
+                        // the security containment check, then re-verify
+                        // is_symlink to close the TOCTOU window.
+                        // For everything else: canonicalize as before, then
+                        // re-verify to catch file→symlink races.
+                        let (handle, symlink_target, final_is_symlink) = if initial_is_symlink {
                             let target = tokio::fs::read_link(&entry_path).await.ok()?;
                             // Validate that the symlink target, when resolved, is within the share.
                             // This filters out symlinks pointing outside the share and broken symlinks.
@@ -86,25 +83,114 @@ pub async fn readdir_response(
                             if !canonical.starts_with(&share_canonical) {
                                 return None; // symlink target outside share
                             }
-                            // Use the symlink's own path for the handle, not the canonical target.
-                            let uuid = handle_db
-                                .get_or_create_handle_non_canonical(&entry_path)
-                                .await
-                                .ok()?;
-                            let handle = uuid.as_bytes().to_vec();
-                            (handle, Some(target.to_string_lossy().into_owned()))
+
+                            // TOCTOU hardening: re-verify is_symlink after canonicalize.
+                            // Between the initial file_type check and canonicalize,
+                            // the filesystem could change (symlink replaced by
+                            // regular file or vice versa).
+                            let current_meta = match tokio::fs::symlink_metadata(&entry_path).await {
+                                Ok(m) => m,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        path = %entry_path.display(),
+                                        "TOCTOU: path disappeared between metadata checks"
+                                    );
+                                    return None;
+                                }
+                            };
+
+                            if current_meta.is_symlink() {
+                                // Still a symlink — proceed as intended.
+                                // Use the symlink's own path for the handle, not the canonical target.
+                                let uuid = handle_db
+                                    .get_or_create_handle_non_canonical(&entry_path)
+                                    .await
+                                    .ok()?;
+                                let handle = uuid.as_bytes().to_vec();
+                                (handle, Some(target.to_string_lossy().into_owned()), true)
+                            } else {
+                                // Was a symlink, replaced by a regular file/directory.
+                                // Treat it as a regular file — re-canonicalize and get
+                                // a regular file handle.
+                                tracing::warn!(
+                                    path = %entry_path.display(),
+                                    "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
+                                );
+                                let canonical = match tokio::fs::canonicalize(&entry_path).await {
+                                    Ok(p) => p,
+                                    Err(_) => return None,
+                                };
+                                if !canonical.starts_with(&share_canonical) {
+                                    return None;
+                                }
+                                let uuid = handle_db
+                                    .get_or_create_handle(&canonical)
+                                    .await
+                                    .ok()?;
+                                (uuid.as_bytes().to_vec(), None, false)
+                            }
                         } else {
+                            // Non-symlink path: canonicalize for containment check.
                             let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
                                 Ok(p) => p,
                                 Err(_) => return None,
                             };
-                            let handle = handle_db
-                                .get_or_create_handle(&entry_canonical)
-                                .await
-                                .ok()?
-                                .as_bytes()
-                                .to_vec();
-                            (handle, None)
+
+                            // TOCTOU hardening: re-verify is_symlink after canonicalize.
+                            // A regular file could have been replaced by a symlink.
+                            let current_meta = match tokio::fs::symlink_metadata(&entry_path).await {
+                                Ok(m) => m,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        path = %entry_path.display(),
+                                        "TOCTOU: path disappeared between metadata checks"
+                                    );
+                                    return None;
+                                }
+                            };
+
+                            if current_meta.is_symlink() {
+                                // Was a regular file, replaced by a symlink.
+                                // Treat it as a symlink now.
+                                tracing::warn!(
+                                    path = %entry_path.display(),
+                                    "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink"
+                                );
+                                let target = tokio::fs::read_link(&entry_path).await.ok()?;
+                                let canonical = match tokio::fs::canonicalize(&entry_path).await {
+                                    Ok(p) => p,
+                                    Err(_) => return None,
+                                };
+                                if !canonical.starts_with(&share_canonical) {
+                                    return None;
+                                }
+                                let uuid = handle_db
+                                    .get_or_create_handle_non_canonical(&entry_path)
+                                    .await
+                                    .ok()?;
+                                (uuid.as_bytes().to_vec(), Some(target.to_string_lossy().into_owned()), true)
+                            } else {
+                                // Still not a symlink — proceed as regular file/directory.
+                                if !entry_canonical.starts_with(&share_canonical) {
+                                    return None;
+                                }
+                                let uuid = handle_db
+                                    .get_or_create_handle(&entry_canonical)
+                                    .await
+                                    .ok()?
+                                    .as_bytes()
+                                    .to_vec();
+                                (uuid, None, false)
+                            }
+                        };
+
+                        // Use the re-verified file type, not the initial one.
+                        let proto_type = if final_is_symlink {
+                            FileType::Symlink as i32
+                        } else if file_type.is_dir() {
+                            FileType::Directory as i32
+                        } else {
+                            FileType::Regular as i32
                         };
 
                         Some(ReaddirEntry {
@@ -391,6 +477,147 @@ mod tests {
         assert!(
             names.contains(&"regular.txt"),
             "regular files must still be listed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TOCTOU re-verification tests
+    //
+    // These tests verify that readdir_response correctly handles type
+    // changes that could occur in a TOCTOU race. While we can't reproduce
+    // the exact timing of a race, we verify the observable behavior:
+    // if a symlink is replaced by a regular file (or vice versa) between
+    // readdir calls, the reported file type is updated correctly.
+    // -----------------------------------------------------------------------
+
+    /// When a symlink in a directory is replaced by a regular file between
+    /// two readdir calls, the second readdir must report FileType::Regular.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn readdir_symlink_replaced_by_file_shows_regular_type() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create a target file and a symlink pointing to it.
+        std::fs::write(share.join("target.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("target.txt", share.join("entry")).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        // First readdir: should see a symlink.
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+        let entry = success
+            .entries
+            .iter()
+            .find(|e| e.name == "entry")
+            .expect("must list entry");
+        assert_eq!(
+            entry.file_type,
+            FileType::Symlink as i32,
+            "initial readdir must report FileType::Symlink"
+        );
+
+        // Replace the symlink with a regular file.
+        std::fs::remove_file(share.join("entry")).unwrap();
+        std::fs::write(share.join("entry"), b"replaced").unwrap();
+
+        // Second readdir: must report FileType::Regular.
+        let resp2 = readdir_response(&payload, &share, &handle_db).await;
+        let success2 = match resp2.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+        let entry2 = success2
+            .entries
+            .iter()
+            .find(|e| e.name == "entry")
+            .expect("must list entry after swap");
+        assert_eq!(
+            entry2.file_type,
+            FileType::Regular as i32,
+            "after symlink→file swap, readdir must report FileType::Regular"
+        );
+        assert!(
+            entry2.symlink_target.is_empty(),
+            "regular file must not have symlink_target"
+        );
+    }
+
+    /// When a regular file in a directory is replaced by a symlink between
+    /// two readdir calls, the second readdir must report FileType::Symlink
+    /// with the correct symlink_target.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn readdir_file_replaced_by_symlink_shows_symlink_type() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Start with a target file and a regular file named "entry".
+        std::fs::write(share.join("target.txt"), b"hello").unwrap();
+        std::fs::write(share.join("entry"), b"data").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        // First readdir: should see a regular file.
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+        let entry = success
+            .entries
+            .iter()
+            .find(|e| e.name == "entry")
+            .expect("must list entry");
+        assert_eq!(
+            entry.file_type,
+            FileType::Regular as i32,
+            "initial readdir must report FileType::Regular"
+        );
+
+        // Replace the regular file with a symlink.
+        std::fs::remove_file(share.join("entry")).unwrap();
+        std::os::unix::fs::symlink("target.txt", share.join("entry")).unwrap();
+
+        // Second readdir: must report FileType::Symlink with symlink_target.
+        let resp2 = readdir_response(&payload, &share, &handle_db).await;
+        let success2 = match resp2.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+        let entry2 = success2
+            .entries
+            .iter()
+            .find(|e| e.name == "entry")
+            .expect("must list entry after swap");
+        assert_eq!(
+            entry2.file_type,
+            FileType::Symlink as i32,
+            "after file→symlink swap, readdir must report FileType::Symlink"
+        );
+        assert_eq!(
+            entry2.symlink_target, "target.txt",
+            "symlink_target must match the link target"
         );
     }
 }
