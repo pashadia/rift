@@ -1,6 +1,10 @@
 use std::path::Path;
 
 use prost::Message as _;
+use tokio::fs;
+use tokio::fs::DirEntry;
+use tokio_stream::wrappers::ReadDirStream;
+use tokio_stream::StreamExt;
 use tracing::instrument;
 
 use rift_protocol::messages::{
@@ -46,81 +50,23 @@ pub async fn readdir_response(
         }
     };
 
-    use tokio_stream::wrappers::ReadDirStream;
-    use tokio_stream::StreamExt;
-
-    let entries: Vec<ReaddirEntry> = match tokio::fs::read_dir(&dir_canonical).await {
+    let entries = match fs::read_dir(&dir_canonical).await {
         Ok(read_dir) => {
             let stream = ReadDirStream::new(read_dir);
-            let share_canonical = tokio::fs::canonicalize(share)
-                .await
-                .ok()
-                .unwrap_or_else(|| share.to_path_buf());
+            let share_canonical = match fs::canonicalize(share).await {
+                Ok(p) => p,
+                Err(_) => share.to_path_buf(),
+            };
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
                 .then(|entry_result| {
                     let share_canonical = share_canonical.clone();
                     async move {
-                        let entry = entry_result.ok()?;
-                        let file_type = entry.file_type().await.ok()?;
-                        let proto_type = if file_type.is_dir() {
-                            FileType::Directory as i32
-                        } else if file_type.is_symlink() {
-                            FileType::Symlink as i32
-                        } else {
-                            FileType::Regular as i32
-                        };
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        let entry_path = entry.path();
-
-                        // For symlinks: use the symlink's own path (not canonical) for the handle
-                        // and read the symlink target. For everything else: canonicalize as before.
-                        // Then check that the canonical path is within the share root.
-                        let (handle, symlink_target) = if file_type.is_symlink() {
-                            let target = tokio::fs::read_link(&entry_path).await.ok()?;
-                            // Validate that the symlink target, when resolved, is within the share.
-                            // This filters out symlinks pointing outside the share and broken symlinks.
-                            //
-                            // NOTE: The containment check uses `canonicalize()` which resolves `..`
-                            // and symlinks via the filesystem. For non-broken symlinks, this is safe
-                            // because `canonicalize` returns the fully-resolved absolute path.
-                            // For broken symlinks, `canonicalize` fails, so they are filtered out
-                            // entirely by the `Err(_)` branch above.
-                            //
-                            // The raw `target` from `read_link` is NOT checked for `..` components
-                            // here because it is only used as the `symlink_target` field in the
-                            // response (informational). The actual containment decision is based on
-                            // `canonical`, which is filesystem-resolved. Broken symlinks that
-                            // escape via `..` are handled by the `resolve()` function in mod.rs,
-                            // which normalizes `..` in symlink targets before checking containment.
-                            let _canonical =
-                                verify_symlink_containment(&entry_path, &share_canonical).await?;
-                            // Use the symlink's own path for the handle, not the canonical target.
-                            let uuid = handle_db
-                                .get_or_create_handle_non_canonical(&entry_path)
-                                .await
-                                .ok()?;
-                            let handle = uuid.as_bytes().to_vec();
-                            (handle, Some(target.to_string_lossy().into_owned()))
-                        } else {
-                            let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
-                                Ok(p) => p,
-                                Err(_) => return None,
-                            };
-                            let handle = handle_db
-                                .get_or_create_handle(&entry_canonical)
-                                .await
-                                .ok()?
-                                .as_bytes()
-                                .to_vec();
-                            (handle, None)
-                        };
-
-                        Some(ReaddirEntry {
-                            name,
-                            file_type: proto_type,
-                            handle,
-                            symlink_target: symlink_target.unwrap_or_default(),
-                        })
+                        match entry_result {
+                            Ok(entry) => {
+                                process_dir_entry(entry, &share_canonical, handle_db).await
+                            }
+                            Err(_) => None,
+                        }
                     }
                 })
                 .collect()
@@ -130,18 +76,7 @@ pub async fn readdir_response(
         Err(e) => return readdir_error(io_err_kind_to_code(e.kind())),
     };
 
-    let mut entries = entries;
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let offset = req.offset as usize;
-    let entries: Vec<ReaddirEntry> = entries.into_iter().skip(offset).collect();
-
-    let (entries, has_more) = if req.limit > 0 && entries.len() > req.limit as usize {
-        let limited: Vec<_> = entries.into_iter().take(req.limit as usize).collect();
-        (limited, true)
-    } else {
-        (entries, false)
-    };
+    let (entries, has_more) = paginate_entries(entries, req.offset, req.limit);
 
     ReaddirResponse {
         result: Some(readdir_response::Result::Entries(ReaddirSuccess {
@@ -151,11 +86,121 @@ pub async fn readdir_response(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Process a single directory entry: detect type, canonicalize, verify
+/// containment (for symlinks), and create/fetch a handle.
+///
+/// Returns `None` if the entry should be skipped (e.g., broken symlink,
+/// permission error, escaped containment).
+async fn process_dir_entry(
+    entry: DirEntry,
+    share_canonical: &Path,
+    handle_db: &HandleDatabase,
+) -> Option<ReaddirEntry> {
+    let file_type = entry.file_type().await.ok()?;
+
+    let proto_type = if file_type.is_dir() {
+        FileType::Directory as i32
+    } else if file_type.is_symlink() {
+        FileType::Symlink as i32
+    } else {
+        FileType::Regular as i32
+    };
+
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let entry_path = entry.path();
+
+    if file_type.is_symlink() {
+        process_symlink_dir_entry(&entry_path, &name, share_canonical, handle_db).await
+    } else {
+        process_regular_dir_entry(&entry_path, &name, proto_type, handle_db).await
+    }
+}
+
+/// Process a symlink entry: verify containment and record the symlink target.
+async fn process_symlink_dir_entry(
+    entry_path: &Path,
+    name: &str,
+    share_canonical: &Path,
+    handle_db: &HandleDatabase,
+) -> Option<ReaddirEntry> {
+    let target = fs::read_link(entry_path).await.ok()?;
+    verify_symlink_containment(entry_path, share_canonical).await?;
+
+    let uuid = handle_db
+        .get_or_create_handle_non_canonical(entry_path)
+        .await
+        .ok()?;
+    let handle = uuid.as_bytes().to_vec();
+
+    Some(ReaddirEntry {
+        name: name.to_owned(),
+        file_type: FileType::Symlink as i32,
+        handle,
+        symlink_target: target.to_string_lossy().into_owned(),
+    })
+}
+
+/// Process a regular (non-symlink) entry: canonicalize and create a handle.
+async fn process_regular_dir_entry(
+    entry_path: &Path,
+    name: &str,
+    proto_type: i32,
+    handle_db: &HandleDatabase,
+) -> Option<ReaddirEntry> {
+    let entry_canonical = fs::canonicalize(entry_path).await.ok()?;
+    let uuid = handle_db
+        .get_or_create_handle(&entry_canonical)
+        .await
+        .ok()?;
+    let handle = uuid.as_bytes().to_vec();
+
+    Some(ReaddirEntry {
+        name: name.to_owned(),
+        file_type: proto_type,
+        handle,
+        symlink_target: String::new(),
+    })
+}
+
+/// Sort entries alphabetically, then apply offset and limit.
+///
+/// Returns the paginated entries along with a `has_more` flag indicating
+/// whether additional entries exist beyond the requested page.
+fn paginate_entries(
+    mut entries: Vec<ReaddirEntry>,
+    offset: u32,
+    limit: u32,
+) -> (Vec<ReaddirEntry>, bool) {
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let offset = offset as usize;
+    let entries: Vec<ReaddirEntry> = entries.into_iter().skip(offset).collect();
+
+    if limit > 0 && entries.len() > limit as usize {
+        let limited: Vec<_> = entries.into_iter().take(limit as usize).collect();
+        (limited, true)
+    } else {
+        (entries, false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error helper
+// ---------------------------------------------------------------------------
+
 fn readdir_error(code: ErrorCode) -> ReaddirResponse {
     ReaddirResponse {
         result: Some(readdir_response::Result::Error(error_detail(code))),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
