@@ -90,106 +90,40 @@ pub async fn resolve(
     handle: &Uuid,
     handle_db: &HandleDatabase,
 ) -> anyhow::Result<ResolvedPath> {
-    let stored_path = match handle_db.get_path(handle) {
-        Some(path) => path,
-        None => {
-            tracing::warn!("handle not found in database");
-            anyhow::bail!("invalid handle: not found");
-        }
-    };
+    // Step 0: look up the stored path from the handle DB
+    let stored_path = lookup_stored_path(handle, handle_db)?;
 
-    let share_canonical = tokio::fs::canonicalize(share)
-        .await
-        .context("share root does not exist or is inaccessible")?;
+    // Step 1: canonicalize the share root
+    let share_canonical = canonicalize_share_root(share).await?;
 
-    // Step 0: Check if the stored path is a symlink.
-    // We need this before canonicalizing because symlinks should resolve to
-    // their own path, not the target. We still canonicalize for the security
-    // check (ensuring the symlink target is within the share), but we return
-    // the stored symlink path rather than the canonical target.
-    let stored_meta = match tokio::fs::symlink_metadata(&stored_path).await {
-        Ok(m) => m,
-        Err(e) => {
-            if let Some(_removed) = handle_db.remove(handle) {
-                tracing::info!(handle = %handle, "evicted stale handle");
-            }
-            return Err(e)
-                .with_context(|| format!("path does not exist: {}", stored_path.display()));
-        }
-    };
-    let is_symlink = stored_meta.is_symlink();
+    // Step 2: check path metadata (symlink or regular file?) and handle missing path eviction
+    let is_symlink = check_path_metadata(&stored_path, handle, handle_db).await?;
 
-    // Step 1: Canonicalize the stored path to resolve symlinks and `..`
+    // Step 3: canonicalize the stored path; handle broken symlinks specially
     let canonical = match tokio::fs::canonicalize(&stored_path).await {
         Ok(p) => p,
         Err(e) => {
-            // For broken symlinks, canonicalize will fail (target doesn't exist)
-            // but the symlink itself exists. Only evict if it's not a symlink.
             if !is_symlink {
+                // Non-symlink: path doesn't exist — evict and bail
                 if let Some(_removed) = handle_db.remove(handle) {
                     tracing::info!(handle = %handle, "evicted stale handle");
                 }
                 return Err(e)
                     .with_context(|| format!("path does not exist: {}", stored_path.display()));
             }
-            // For symlinks with non-existent targets, canonicalize fails.
-            // The symlink itself exists. We still must verify containment:
-            //   1. The stored (symlink) path must be within the share root.
-            //   2. If we can read the symlink target, and it's absolute,
-            //      it must also be within the share root.
-            // Relative targets are accepted (the link is within the share
-            // and the target simply doesn't exist yet, which is fine).
-            if !is_within_share(&stored_path, &share_canonical) {
-                return Err(evict_and_bail(
-                    handle_db,
-                    handle,
-                    &stored_path,
-                    "broken symlink path escapes share root",
-                ));
-            }
-
-            // Best-effort check: normalize the symlink target to resolve any
-            // ".." components, then verify it stays within the share root.
-            // Path::starts_with() is component-based and does NOT resolve "..",
-            // so we must normalize first to prevent e.g. "/share/../../etc/passwd"
-            // from passing the containment check.
-            if let Ok(target) = tokio::fs::read_link(&stored_path).await {
-                let normalized_target = if target.is_absolute() {
-                    normalize_path(&target)
-                } else {
-                    // Relative target: resolve against the symlink's parent directory,
-                    // then normalize to resolve any ".." components.
-                    let parent = stored_path.parent().unwrap_or(Path::new("/"));
-                    normalize_path(&parent.join(&target))
-                };
-
-                if !is_within_share(&normalized_target, &share_canonical) {
-                    tracing::warn!(
-                        path = %stored_path.display(),
-                        target = %target.display(),
-                        normalized = %normalized_target.display(),
-                        "broken symlink target escapes share root"
-                    );
-                    if let Some(_removed) = handle_db.remove(handle) {
-                        tracing::info!(handle = %handle, "evicted handle: broken symlink target escapes share");
-                    }
-                    anyhow::bail!(
-                        "broken symlink target escapes share root: {}",
-                        target.display()
-                    );
-                }
-            }
-
-            return Ok(ResolvedPath {
-                canonical: stored_path,
-            });
+            // Broken symlink: verify containment of stored path and normalized target
+            let result = handle_broken_symlink_containment(
+                &stored_path,
+                &share_canonical,
+                handle,
+                handle_db,
+            )
+            .await?;
+            return Ok(ResolvedPath { canonical: result });
         }
     };
 
-    // TOCTOU hardening: re-verify is_symlink after canonicalize.
-    // Between the initial symlink_metadata (Step 0) and canonicalize (Step 1),
-    // the filesystem could change (symlink replaced by file or vice versa).
-    // Re-check to ensure we take the correct branch.
+    // Step 4: TOCTOU hardening — re-verify is_symlink after canonicalize
     let is_symlink = match reverify_file_type(&stored_path, is_symlink).await {
         Some(b) => b,
         None => {
@@ -202,6 +136,7 @@ pub async fn resolve(
         }
     };
 
+    // Step 5: verify the canonical path is within the share root
     if !is_within_share(&canonical, &share_canonical) {
         return Err(evict_and_bail(
             handle_db,
@@ -211,64 +146,12 @@ pub async fn resolve(
         ));
     }
 
-    // Step 2: Re-canonicalize via opened fd to narrow TOCTOU window.
-    // On Linux, we open the file and re-resolve via /proc/self/fd/N to confirm
-    // the symlink target hasn't been swapped between Step 1 and the open.
-    // On non-Linux, this is a no-op — the race window still exists but is
-    // extremely narrow (microseconds).
-    //
-    // For symlinks, we skip the fd-based TOCTOU check entirely. A symlink's
-    // target can change between resolve and open, which is expected behavior.
-    let mut fd_resolved: Option<PathBuf> = None;
-
-    #[cfg(target_os = "linux")]
-    {
-        // Only verify for non-symlink files (not directories, not symlinks).
-        // Directories can't be swapped with a symlink to outside the share via rename.
-        // Symlinks can change their target, which is expected.
-        if !is_symlink
-            && tokio::fs::symlink_metadata(&canonical)
-                .await
-                .map(|m| !m.is_dir())
-                .unwrap_or(false)
-        {
-            if let Ok(file) = tokio::fs::File::open(&canonical).await {
-                use std::os::unix::io::AsRawFd;
-                let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-                if let Ok(fd_canonical) = tokio::fs::canonicalize(&fd_path).await {
-                    if !is_within_share(&fd_canonical, &share_canonical) {
-                        return Err(evict_and_bail(
-                            handle_db,
-                            handle,
-                            &fd_canonical,
-                            "TOCTOU: path escaped share root between resolution and open",
-                        ));
-                    }
-                    // If the fd resolves to a different path than our initial
-                    // canonicalization, the file was replaced between our checks.
-                    // Use the fd-canonical path which is guaranteed stable.
-                    if fd_canonical != canonical {
-                        tracing::warn!(
-                            original = %canonical.display(),
-                            resolved = %fd_canonical.display(),
-                            "TOCTOU: file path changed between resolution and open, using fd-resolved path"
-                        );
-                        fd_resolved = Some(fd_canonical);
-                    }
-                }
-                // Drop file — we just needed it for verification.
-                drop(file);
-            }
-        }
-    }
+    // Step 6: on Linux, re-canonicalize via opened fd to narrow TOCTOU window
+    let fd_resolved =
+        fd_recanonicalize_linux(&canonical, &share_canonical, handle, handle_db).await;
 
     // For symlinks: return the stored path, not the canonical target.
     // The canonical path was used for security validation only.
-    // Note: fd_resolved is intentionally discarded here — for symlinks, the
-    // fd-based TOCTOU check is skipped (see the #[cfg(target_os = "linux")] block
-    // above), so fd_resolved is always None when is_symlink is true. Even if it
-    // were Some, we would discard it because a symlink's resolved path must be
-    // the symlink itself, not any fd-resolved target.
     let resolved_path = if is_symlink {
         stored_path
     } else {
@@ -390,6 +273,170 @@ pub(crate) fn error_detail(
         code: code as i32,
         message: code.as_str_name().to_string(),
         metadata: None,
+    }
+}
+
+/// Look up the stored path for a handle in the HandleDatabase.
+/// Returns the path or bail with "invalid handle: not found".
+fn lookup_stored_path(handle: &Uuid, handle_db: &HandleDatabase) -> anyhow::Result<PathBuf> {
+    match handle_db.get_path(handle) {
+        Some(path) => Ok(path),
+        None => {
+            tracing::warn!("handle not found in database");
+            anyhow::bail!("invalid handle: not found");
+        }
+    }
+}
+
+/// Canonicalize the share root path.
+/// Returns the canonical path or bail with a context error.
+async fn canonicalize_share_root(share: &Path) -> anyhow::Result<PathBuf> {
+    tokio::fs::canonicalize(share)
+        .await
+        .context("share root does not exist or is inaccessible")
+}
+
+/// Check path metadata: get symlink_metadata, detect if path is a symlink,
+/// and handle missing-path eviction.
+/// Returns (is_symlink, stored_path) or errors on missing path.
+async fn check_path_metadata(
+    stored_path: &Path,
+    handle: &Uuid,
+    handle_db: &HandleDatabase,
+) -> anyhow::Result<bool> {
+    let stored_meta = match tokio::fs::symlink_metadata(stored_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            if let Some(_removed) = handle_db.remove(handle) {
+                tracing::info!(handle = %handle, "evicted stale handle");
+            }
+            return Err(e)
+                .with_context(|| format!("path does not exist: {}", stored_path.display()));
+        }
+    };
+    Ok(stored_meta.is_symlink())
+}
+
+/// Handle a broken symlink (canonicalize failed because target doesn't exist).
+/// Verifies the stored path and normalized target are within the share.
+/// Returns the stored (symlink) path on success or an error.
+async fn handle_broken_symlink_containment(
+    stored_path: &Path,
+    share_canonical: &Path,
+    handle: &Uuid,
+    handle_db: &HandleDatabase,
+) -> anyhow::Result<PathBuf> {
+    // The symlink itself exists, but canonicalize fails because target doesn't.
+    // We must still verify containment:
+    //   1. The stored (symlink) path must be within the share root.
+    //   2. If we can read the symlink target, and it's absolute,
+    //      it must also be within the share root.
+    // Relative targets are accepted (the link is within the share
+    // and the target simply doesn't exist yet, which is fine).
+    if !is_within_share(stored_path, share_canonical) {
+        return Err(evict_and_bail(
+            handle_db,
+            handle,
+            stored_path,
+            "broken symlink path escapes share root",
+        ));
+    }
+
+    // Best-effort check: normalize the symlink target to resolve any
+    // ".." components, then verify it stays within the share root.
+    // Path::starts_with() is component-based and does NOT resolve "..",
+    // so we must normalize first to prevent e.g. "/share/../../etc/passwd"
+    // from passing the containment check.
+    if let Ok(target) = tokio::fs::read_link(stored_path).await {
+        let normalized_target = if target.is_absolute() {
+            normalize_path(&target)
+        } else {
+            // Relative target: resolve against the symlink's parent directory,
+            // then normalize to resolve any ".." components.
+            let parent = stored_path.parent().unwrap_or(Path::new("/"));
+            normalize_path(&parent.join(&target))
+        };
+
+        if !is_within_share(&normalized_target, share_canonical) {
+            tracing::warn!(
+                path = %stored_path.display(),
+                target = %target.display(),
+                normalized = %normalized_target.display(),
+                "broken symlink target escapes share root"
+            );
+            if let Some(_removed) = handle_db.remove(handle) {
+                tracing::info!(handle = %handle, "evicted handle: broken symlink target escapes share");
+            }
+            anyhow::bail!(
+                "broken symlink target escapes share root: {}",
+                target.display()
+            );
+        }
+    }
+
+    Ok(stored_path.to_path_buf())
+}
+
+/// Linux-only: open file, re-canonicalize via /proc/self/fd/N, verify containment.
+/// Returns Some(fd_resolved_path) if the fd resolves to a different path (TOCTOU race detected),
+/// or None if the path is stable (no race) or the check was skipped.
+/// On non-Linux, returns None (no-op).
+async fn fd_recanonicalize_linux(
+    canonical: &Path,
+    share_canonical: &Path,
+    handle: &Uuid,
+    handle_db: &HandleDatabase,
+) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        // Only verify for non-symlink files (not directories, not symlinks).
+        // Directories can't be swapped with a symlink to outside the share via rename.
+        // Symlinks can change their target, which is expected.
+        if !tokio::fs::symlink_metadata(canonical)
+            .await
+            .map(|m| !m.is_symlink() && !m.is_dir())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        if let Ok(file) = tokio::fs::File::open(canonical).await {
+            use std::os::unix::io::AsRawFd;
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            if let Ok(fd_canonical) = tokio::fs::canonicalize(&fd_path).await {
+                if !is_within_share(&fd_canonical, share_canonical) {
+                    return Err(evict_and_bail(
+                        handle_db,
+                        handle,
+                        &fd_canonical,
+                        "TOCTOU: path escaped share root between resolution and open",
+                    ))
+                    .ok();
+                }
+                // If the fd resolves to a different path than our initial
+                // canonicalization, the file was replaced between our checks.
+                // Use the fd-canonical path which is guaranteed stable.
+                if fd_canonical != *canonical {
+                    tracing::warn!(
+                        original = %canonical.display(),
+                        resolved = %fd_canonical.display(),
+                        "TOCTOU: file path changed between resolution and open, using fd-resolved path"
+                    );
+                    return Some(fd_canonical);
+                }
+            }
+            // Drop file — we just needed it for verification.
+            drop(file);
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _: &Path = canonical;
+        let _: &Path = share_canonical;
+        let _: &Uuid = handle;
+        let _: &HandleDatabase = handle_db;
+        None
     }
 }
 
