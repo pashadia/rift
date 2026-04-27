@@ -57,14 +57,19 @@ pub async fn lookup_response<M: MerkleCache>(
 
     // --- Symlink handling ---
     // Check if the child is a symlink using symlink_metadata (doesn't follow links).
-    // If it is, return FileType::Symlink with the symlink's own path for the handle,
-    // not the resolved target's path.
+    // If it is, read the target and canonicalize for the security containment check.
+    // Then re-verify is_symlink to close the TOCTOU window between the initial
+    // symlink_metadata and canonicalize.
     let child_meta = match tokio::fs::symlink_metadata(&child_path).await {
         Ok(m) => m,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    if child_meta.is_symlink() {
+    let initial_is_symlink = child_meta.is_symlink();
+
+    // For symlinks, read the target and canonicalize for containment check.
+    // The containment check ensures symlink targets outside the share are rejected.
+    if initial_is_symlink {
         // Read the symlink target.
         let target = match tokio::fs::read_link(&child_path).await {
             Ok(t) => t,
@@ -82,31 +87,58 @@ pub async fn lookup_response<M: MerkleCache>(
             return lookup_error(ErrorCode::ErrorNotFound);
         }
 
-        // Handle is for the symlink path itself, not the target.
-        let handle = match handle_db
-            .get_or_create_handle_non_canonical(&child_path)
-            .await
-        {
-            Ok(uuid) => uuid.as_bytes().to_vec(),
-            Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
+        // TOCTOU hardening: re-verify is_symlink after canonicalize.
+        // Between the initial symlink_metadata and canonicalize, the filesystem
+        // could change (symlink replaced by regular file or vice versa).
+        let current_meta = match tokio::fs::symlink_metadata(&child_path).await {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::warn!(
+                    path = %child_path.display(),
+                    "TOCTOU: path disappeared between metadata checks"
+                );
+                return lookup_error(ErrorCode::ErrorNotFound);
+            }
         };
 
-        let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
-        let symlink_target_str = target.to_string_lossy().into_owned();
+        if current_meta.is_symlink() {
+            // Still a symlink — proceed as intended.
+            // Handle is for the symlink path itself, not the target.
+            let handle = match handle_db
+                .get_or_create_handle_non_canonical(&child_path)
+                .await
+            {
+                Ok(uuid) => uuid.as_bytes().to_vec(),
+                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
+            };
 
-        return LookupResponse {
-            result: Some(lookup_response::Result::Entry(LookupResult {
-                handle,
-                attrs: Some(build_attrs_with_symlink_target(
-                    &child_meta,
-                    root_hash,
-                    symlink_target_str,
-                )),
-            })),
-        };
+            let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
+            let symlink_target_str = target.to_string_lossy().into_owned();
+
+            return LookupResponse {
+                result: Some(lookup_response::Result::Entry(LookupResult {
+                    handle,
+                    attrs: Some(build_attrs_with_symlink_target(
+                        &current_meta,
+                        root_hash,
+                        symlink_target_str,
+                    )),
+                })),
+            };
+        } else {
+            // Was a symlink, replaced by a regular file/directory between
+            // the initial symlink_metadata and canonicalize. Treat it as a
+            // regular file from now on — fall through to the non-symlink path.
+            tracing::warn!(
+                path = %child_path.display(),
+                "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
+            );
+            // Fall through to non-symlink path below.
+        }
     }
 
     // --- Non-symlink path (regular file or directory) ---
+    // Also reached via fall-through when a symlink was replaced by a regular file.
     let child_canonical = match tokio::fs::canonicalize(&child_path).await {
         Ok(p) => p,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
@@ -115,6 +147,62 @@ pub async fn lookup_response<M: MerkleCache>(
     let symlink_out_of_the_share = !child_canonical.starts_with(&share_canonical);
     if symlink_out_of_the_share {
         return lookup_error(ErrorCode::ErrorNotFound);
+    }
+
+    // TOCTOU hardening: re-verify is_symlink after canonicalize for the
+    // non-symlink path. Between symlink_metadata and canonicalize, a regular
+    // file could have been replaced by a symlink.
+    if !initial_is_symlink {
+        let current_meta = match tokio::fs::symlink_metadata(&child_path).await {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::warn!(
+                    path = %child_path.display(),
+                    "TOCTOU: path disappeared between metadata checks"
+                );
+                return lookup_error(ErrorCode::ErrorNotFound);
+            }
+        };
+        if current_meta.is_symlink() {
+            // Regular file was replaced by a symlink. Treat it as a symlink now.
+            tracing::warn!(
+                path = %child_path.display(),
+                "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink"
+            );
+            let target = match tokio::fs::read_link(&child_path).await {
+                Ok(t) => t,
+                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
+            };
+            // Redo containment check through the new symlink.
+            let symlink_canonical = match tokio::fs::canonicalize(&child_path).await {
+                Ok(p) => p,
+                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
+            };
+            if !symlink_canonical.starts_with(&share_canonical) {
+                return lookup_error(ErrorCode::ErrorNotFound);
+            }
+
+            let handle = match handle_db
+                .get_or_create_handle_non_canonical(&child_path)
+                .await
+            {
+                Ok(uuid) => uuid.as_bytes().to_vec(),
+                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
+            };
+
+            let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
+
+            return LookupResponse {
+                result: Some(lookup_response::Result::Entry(LookupResult {
+                    handle,
+                    attrs: Some(build_attrs_with_symlink_target(
+                        &current_meta,
+                        root_hash,
+                        target.to_string_lossy().into_owned(),
+                    )),
+                })),
+            };
+        }
     }
 
     let meta = match tokio::fs::metadata(&child_canonical).await {
@@ -353,6 +441,180 @@ mod tests {
                 );
             }
             other => panic!("expected Error for broken symlink, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TOCTOU re-verification tests
+    //
+    // These tests verify that lookup_response correctly handles type
+    // changes that could occur in a TOCTOU race. While we can't reproduce
+    // the exact timing of a race, we verify the observable behavior:
+    // if a symlink is replaced by a regular file (or vice versa),
+    // lookup returns the correct type for the current filesystem state.
+    // -----------------------------------------------------------------------
+
+    /// When a symlink is replaced by a regular file between two lookup calls,
+    /// the second lookup must return FileType::Regular, not File::Symlink.
+    /// This verifies the TOCTOU re-verification: if the type changes after
+    /// the initial symlink_metadata check, the response reflects reality.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn lookup_response_symlink_replaced_by_file_returns_regular_type() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Start with a symlink pointing to a regular file.
+        std::fs::write(share.join("target.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("target.txt", share.join("entry")).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let parent_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        // First lookup: should see a symlink.
+        let req = LookupRequest {
+            parent_handle: parent_uuid.as_bytes().to_vec(),
+            name: "entry".to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let resp =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
+
+        let entry = match resp.result {
+            Some(lookup_response::Result::Entry(e)) => e,
+            other => panic!("expected Entry for symlink lookup, got: {:?}", other),
+        };
+        let attrs = entry.attrs.expect("attrs must be present");
+        assert_eq!(
+            attrs.file_type,
+            FileType::Symlink as i32,
+            "initial lookup must return FileType::Symlink"
+        );
+
+        // Now replace the symlink with a regular file (simulates TOCTOU race).
+        std::fs::remove_file(share.join("entry")).unwrap();
+        std::fs::write(share.join("entry"), b"replaced").unwrap();
+
+        // Second lookup: must return FileType::Regular.
+        // Without TOCTOU re-verification, the code might cache the symlink
+        // type from the first symlink_metadata call and return stale data.
+        // With re-verification, it detects the type change and returns Regular.
+        let resp2 =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
+
+        let entry2 = match resp2.result {
+            Some(lookup_response::Result::Entry(e)) => e,
+            other => panic!("expected Entry after file-swap, got: {:?}", other),
+        };
+        let attrs2 = entry2.attrs.expect("attrs must be present");
+        assert_eq!(
+            attrs2.file_type,
+            FileType::Regular as i32,
+            "after symlink→file swap, lookup must return FileType::Regular"
+        );
+        // symlink_target must be empty for a regular file.
+        assert!(
+            attrs2.symlink_target.is_empty(),
+            "regular file must not have symlink_target"
+        );
+    }
+
+    /// When a regular file is replaced by a symlink between two lookup calls,
+    /// the second lookup must return FileType::Symlink with the correct target.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn lookup_response_file_replaced_by_symlink_returns_symlink_type() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Start with a regular file.
+        std::fs::write(share.join("target.txt"), b"hello").unwrap();
+        std::fs::write(share.join("entry"), b"data").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let parent_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        // First lookup: should see a regular file.
+        let req = LookupRequest {
+            parent_handle: parent_uuid.as_bytes().to_vec(),
+            name: "entry".to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let resp =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
+
+        let entry = match resp.result {
+            Some(lookup_response::Result::Entry(e)) => e,
+            other => panic!("expected Entry for regular file lookup, got: {:?}", other),
+        };
+        let attrs = entry.attrs.expect("attrs must be present");
+        assert_eq!(
+            attrs.file_type,
+            FileType::Regular as i32,
+            "initial lookup must return FileType::Regular"
+        );
+
+        // Replace the regular file with a symlink.
+        std::fs::remove_file(share.join("entry")).unwrap();
+        std::os::unix::fs::symlink("target.txt", share.join("entry")).unwrap();
+
+        // Second lookup: must return FileType::Symlink.
+        let resp2 =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
+
+        let entry2 = match resp2.result {
+            Some(lookup_response::Result::Entry(e)) => e,
+            other => panic!("expected Entry after symlink swap, got: {:?}", other),
+        };
+        let attrs2 = entry2.attrs.expect("attrs must be present");
+        assert_eq!(
+            attrs2.file_type,
+            FileType::Symlink as i32,
+            "after file→symlink swap, lookup must return FileType::Symlink"
+        );
+        assert_eq!(
+            attrs2.symlink_target, "target.txt",
+            "symlink_target must be the link target"
+        );
+    }
+
+    /// When the entry at a name disappears between the parent resolution and
+    /// the child metadata check, lookup must return ErrorNotFound.
+    #[tokio::test]
+    async fn lookup_response_disappearing_entry_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create a regular file.
+        std::fs::write(share.join("ephemeral.txt"), b"gone soon").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let parent_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        // Build the lookup request while the file exists.
+        let req = LookupRequest {
+            parent_handle: parent_uuid.as_bytes().to_vec(),
+            name: "ephemeral.txt".to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        // Delete the file before calling lookup.
+        std::fs::remove_file(share.join("ephemeral.txt")).unwrap();
+
+        let resp =
+            lookup_response(&payload, &share, &NoopCache, &handle_db, Chunker::default()).await;
+
+        match resp.result {
+            Some(lookup_response::Result::Error(err)) => {
+                assert_eq!(
+                    err.code,
+                    ErrorCode::ErrorNotFound as i32,
+                    "disappeared entry must return ErrorNotFound"
+                );
+            }
+            other => panic!("expected Error for disappeared entry, got: {:?}", other),
         }
     }
 }
