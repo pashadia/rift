@@ -33,6 +33,111 @@ async fn send_read_error<S: RiftStream>(stream: &mut S, code: ErrorCode) -> anyh
     Ok(())
 }
 
+/// Decode the request payload and extract the handle.
+/// On decode failure sends an error response and returns Err.
+async fn decode_read_request<S: RiftStream>(
+    stream: &mut S,
+    payload: &[u8],
+) -> anyhow::Result<ReadRequest> {
+    let req = match ReadRequest::decode(payload) {
+        Ok(r) => r,
+        Err(_) => {
+            send_read_error(stream, ErrorCode::ErrorUnsupported).await?;
+            anyhow::bail!("failed to decode ReadRequest");
+        }
+    };
+    Ok(req)
+}
+
+/// Validate the handle UUID in the request.
+/// On failure sends an error response and returns Err.
+async fn validate_handle<S: RiftStream>(stream: &mut S, req: &ReadRequest) -> anyhow::Result<Uuid> {
+    let handle = match Uuid::from_slice(&req.handle) {
+        Ok(u) => u,
+        Err(_) => {
+            send_read_error(stream, ErrorCode::ErrorNotFound).await?;
+            anyhow::bail!("invalid handle UUID");
+        }
+    };
+    Ok(handle)
+}
+
+/// Compute a Blake3 hash for each chunk defined by the given boundaries.
+fn compute_leaf_hashes(chunk_boundaries: &[(usize, usize)], content: &[u8]) -> Vec<Blake3Hash> {
+    chunk_boundaries
+        .iter()
+        .map(|(offset, length)| {
+            let chunk_data = &content[*offset..*offset + length];
+            Blake3Hash::new(chunk_data)
+        })
+        .collect()
+}
+
+/// Select a contiguous slice of chunks from `start` with up to `count` items.
+/// If `count` is 0, all chunks from `start` to the end are selected.
+fn derive_chunks_to_read(
+    chunk_boundaries: &[(usize, usize)],
+    leaf_hashes: &[Blake3Hash],
+    start: usize,
+    count: usize,
+) -> Vec<(usize, usize, usize, Blake3Hash)> {
+    chunk_boundaries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(count)
+        .map(|(i, (offset, length))| {
+            let hash = leaf_hashes[i].clone();
+            (i, *offset, *length, hash)
+        })
+        .collect()
+}
+
+/// Stream BlockHeader + BlockData frames for each chunk in `chunks_to_read`.
+async fn stream_block_frames<S: RiftStream>(
+    stream: &mut S,
+    content: &[u8],
+    chunks_to_read: &[(usize, usize, usize, Blake3Hash)],
+) -> anyhow::Result<()> {
+    for (idx, offset, length, hash) in chunks_to_read {
+        let index = *idx as u32;
+        let chunk_data = &content[*offset..*offset + length];
+        let block_header = BlockHeader {
+            chunk: Some(ChunkInfo {
+                index,
+                length: *length as u64,
+                hash: hash.as_bytes().to_vec(),
+            }),
+        };
+        stream
+            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+            .await?;
+        stream.send_frame(msg::BLOCK_DATA, chunk_data).await?;
+    }
+    Ok(())
+}
+
+/// Update the Merkle cache with the computed root and leaf hashes.
+async fn update_merkle_cache<M: MerkleCache>(
+    db: &M,
+    canonical: &Path,
+    root: &Blake3Hash,
+    leaf_hashes: &[Blake3Hash],
+) -> anyhow::Result<()> {
+    let file_meta = tokio::fs::metadata(canonical).await?;
+    let mtime_ns = match file_meta.modified() {
+        Ok(t) => t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+    let file_size = file_meta.len();
+    db.put_merkle(canonical, mtime_ns, file_size, root, leaf_hashes)
+        .await?;
+    Ok(())
+}
+
 /// `start_chunk >= chunk_boundaries.len()` is always a protocol error (`ErrorNotFound`),
 /// even for empty files. The client should know the chunk count from stat; requesting
 /// a nonexistent chunk index indicates a bug or desync.
@@ -45,25 +150,14 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> anyhow::Result<()> {
-    let req = match ReadRequest::decode(payload) {
-        Ok(r) => r,
-        Err(_) => {
-            return send_read_error(stream, ErrorCode::ErrorUnsupported).await;
-        }
-    };
+    let req = decode_read_request(stream, payload).await?;
 
     // Validate chunk_count before any filesystem access to prevent DoS.
     if req.chunk_count > MAX_CHUNK_COUNT {
         return send_read_error(stream, ErrorCode::ErrorUnsupported).await;
     }
 
-    let handle = match Uuid::from_slice(&req.handle) {
-        Ok(u) => u,
-        Err(_) => {
-            return send_read_error(stream, ErrorCode::ErrorNotFound).await;
-        }
-    };
-
+    let handle = validate_handle(stream, &req).await?;
     let canonical = match resolve(share, &handle, handle_db).await {
         Ok(r) => r.canonical,
         Err(_) => {
@@ -93,16 +187,11 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     };
 
-    // TODO: Cache chunk boundaries in the DB so that subsequent reads
-    // can seek to individual chunks instead of loading the entire file.
-    // This requires extending the MerkleCache schema to store boundaries.
-
     let chunk_boundaries = chunker.chunk(&content);
 
     if req.start_chunk as usize >= chunk_boundaries.len() {
         return send_read_error(stream, ErrorCode::ErrorNotFound).await;
     }
-
     let start = req.start_chunk as usize;
     let count = if req.chunk_count == 0 {
         chunk_boundaries.len().saturating_sub(start)
@@ -110,27 +199,8 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         req.chunk_count as usize
     };
 
-    // Compute ALL leaf hashes once.
-    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
-        .iter()
-        .map(|(offset, length)| {
-            let chunk_data = &content[*offset..*offset + length];
-            Blake3Hash::new(chunk_data)
-        })
-        .collect();
-
-    // Derive chunks_to_read from pre-computed hashes.
-    let chunks_to_read: Vec<_> = chunk_boundaries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(count)
-        .map(|(i, (offset, length))| {
-            let hash = leaf_hashes[i].clone();
-            (i, *offset, *length, hash)
-        })
-        .collect();
-
+    let leaf_hashes = compute_leaf_hashes(&chunk_boundaries, &content);
+    let chunks_to_read = derive_chunks_to_read(&chunk_boundaries, &leaf_hashes, start, count);
     let chunk_count = chunks_to_read.len() as u32;
 
     let response = ReadResponse {
@@ -139,45 +209,13 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     stream
         .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
         .await?;
-
-    for (idx, offset, length, hash) in chunks_to_read {
-        let index = idx as u32;
-        let chunk_data = &content[offset..offset + length];
-
-        let block_header = BlockHeader {
-            chunk: Some(ChunkInfo {
-                index,
-                length: length as u64,
-                hash: hash.as_bytes().to_vec(),
-            }),
-        };
-        stream
-            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
-            .await?;
-
-        stream.send_frame(msg::BLOCK_DATA, chunk_data).await?;
-    }
+    stream_block_frames(stream, &content, &chunks_to_read).await?;
 
     let merkle = MerkleTree::default();
     let root = merkle.build(&leaf_hashes);
-
-    if let Ok(file_meta) = tokio::fs::metadata(&canonical).await {
-        let mtime_ns = match file_meta.modified() {
-            Ok(t) => t
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-        let file_size = file_meta.len();
-        if let Err(e) = db
-            .put_merkle(&canonical, mtime_ns, file_size, &root, &leaf_hashes)
-            .await
-        {
-            tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle root");
-        }
+    if let Err(e) = update_merkle_cache(db, &canonical, &root, &leaf_hashes).await {
+        tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle root");
     }
-
     let transfer_complete = TransferComplete {
         merkle_root: root.as_bytes().to_vec(),
     };
