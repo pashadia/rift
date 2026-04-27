@@ -339,7 +339,10 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             let (entry, child_uuid) = &pairs[pair_idx];
             let attrs = match stat_attrs.get(stat_idx) {
                 Some(Ok(a)) => a.clone(),
-                Some(Err(_)) => continue, // skip entries that failed stat
+                Some(Err(e)) => {
+                    tracing::warn!(error = ?e, "readdir: stat_batch failed for entry, skipping");
+                    continue;
+                }
                 None => continue,
             };
 

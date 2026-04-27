@@ -59,9 +59,22 @@ pub async fn readdir_response(
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
                 .then(|entry_result| {
                     let share_canonical = share_canonical.clone();
+                    let dir_display = dir_canonical.display().to_string();
                     async move {
-                        let entry = entry_result.ok()?;
-                        let file_type = entry.file_type().await.ok()?;
+                        let entry = match entry_result {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(path = %dir_display, error = %e, "readdir: failed to read directory entry");
+                                return None;
+                            }
+                        };
+                        let file_type = match entry.file_type().await {
+                            Ok(ft) => ft,
+                            Err(e) => {
+                                tracing::warn!(path = %entry.path().display(), error = %e, "readdir: failed to get file type");
+                                return None;
+                            }
+                        };
                         let proto_type = if file_type.is_dir() {
                             FileType::Directory as i32
                         } else if file_type.is_symlink() {
@@ -76,15 +89,23 @@ pub async fn readdir_response(
                         // and read the symlink target. For everything else: canonicalize as before.
                         // Then check that the canonical path is within the share root.
                         let (handle, symlink_target) = if file_type.is_symlink() {
-                            let target = tokio::fs::read_link(&entry_path).await.ok()?;
+                            let target = match tokio::fs::read_link(&entry_path).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to read symlink target");
+                                    return None;
+                                }
+                            };
                             // Validate that the symlink target, when resolved, is within the share.
                             // This filters out symlinks pointing outside the share and broken symlinks.
+                            // Note: broken symlink canonicalization failure is kept silent — it's
+                            // expected filtering, not an error condition.
                             let canonical = match tokio::fs::canonicalize(&entry_path).await {
                                 Ok(p) => p,
-                                Err(_) => return None, // broken symlink or inaccessible
+                                Err(_) => return None, // broken symlink or inaccessible — kept silent per design
                             };
                             if !canonical.starts_with(&share_canonical) {
-                                return None; // symlink target outside share
+                                return None; // symlink target outside share — intentional security filtering, kept silent
                             }
                             // Use the symlink's own path for the handle, not the canonical target.
                             let uuid = handle_db
@@ -96,7 +117,10 @@ pub async fn readdir_response(
                         } else {
                             let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
                                 Ok(p) => p,
-                                Err(_) => return None,
+                                Err(e) => {
+                                    tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to canonicalize entry");
+                                    return None;
+                                }
                             };
                             let handle = handle_db
                                 .get_or_create_handle(&entry_canonical)
@@ -392,5 +416,63 @@ mod tests {
             names.contains(&"regular.txt"),
             "regular files must still be listed"
         );
+    }
+
+    /// When a directory entry fails `canonicalize` due to a permission error,
+    /// the readdir must still succeed with the remaining entries (not fail
+    /// entirely). The permission-denied entry is skipped — the readdir protocol
+    /// has no per-entry error mechanism — but `tracing::warn` should be emitted.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn readdir_response_succeeds_with_remaining_entries_on_permission_denied() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create 3 files
+        std::fs::write(share.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(share.join("beta.txt"), b"b").unwrap();
+        std::fs::write(share.join("gamma.txt"), b"c").unwrap();
+
+        // Make beta.txt unreadable — canonicalize will fail with PermissionDenied
+        std::fs::set_permissions(
+            share.join("beta.txt"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = prost::Message::encode_to_vec(&req);
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+
+        let names: Vec<&str> = success.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"alpha.txt"),
+            "alpha.txt must be listed, got {names:?}"
+        );
+        assert!(
+            names.contains(&"gamma.txt"),
+            "gamma.txt must be listed, got {names:?}"
+        );
+        // beta.txt is skipped because canonicalize fails — that's correct
+
+        // Restore permissions so TempDir cleanup can succeed
+        std::fs::set_permissions(
+            share.join("beta.txt"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
     }
 }
