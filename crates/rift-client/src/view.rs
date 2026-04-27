@@ -261,8 +261,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        // Pair each entry with its parsed UUID before calling stat_batch so
-        // the two lists stay aligned even if some handles fail to parse.
+        // Pair each entry with its parsed UUID.
         let pairs: Vec<(_, Uuid)> = entries
             .into_iter()
             .filter_map(|e| {
@@ -271,54 +270,114 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             })
             .collect();
 
-        let handles: Vec<Uuid> = pairs.iter().map(|(_, u)| *u).collect();
+        // Split entries into symlinks with known targets (can skip stat_batch)
+        // and non-symlink / unknown-target entries (need stat_batch).
+        let mut symlink_indices: Vec<usize> = Vec::new();
+        let mut needs_stat_indices: Vec<usize> = Vec::new();
+        let mut needs_stat_handles: Vec<Uuid> = Vec::new();
 
-        let attrs_results = self
-            .remote
-            .stat_batch(handles)
-            .await
-            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+        for (i, (entry, uuid)) in pairs.iter().enumerate() {
+            if entry.file_type == FileType::Symlink as i32 && !entry.symlink_target.is_empty() {
+                symlink_indices.push(i);
+            } else {
+                needs_stat_indices.push(i);
+                needs_stat_handles.push(*uuid);
+            }
+        }
+
+        // Fetch attrs only for entries that need stat_batch.
+        let stat_attrs: Vec<Result<FileAttrs, FsError>> = if needs_stat_handles.is_empty() {
+            vec![]
+        } else {
+            self.remote
+                .stat_batch(needs_stat_handles)
+                .await
+                .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?
+        };
 
         let dir_relative = path_to_relative(path);
-        let combined: Vec<(DirEntry, std::path::PathBuf, Uuid, Option<String>)> = pairs
-            .into_iter()
-            .zip(attrs_results)
-            .filter_map(|((entry, child_uuid), attrs_result)| {
-                let attrs = attrs_result.ok()?;
-                let child_path = if dir_relative.as_os_str() == "." {
-                    std::path::PathBuf::from(&entry.name)
-                } else {
-                    dir_relative.join(&entry.name)
-                };
 
-                // Determine symlink target: prefer ReaddirEntry.symlink_target,
-                // fall back to FileAttrs.symlink_target if available.
-                let symlink_target = if entry.file_type == FileType::Symlink as i32 {
-                    if !entry.symlink_target.is_empty() {
-                        Some(entry.symlink_target.clone())
-                    } else if !attrs.symlink_target.is_empty() {
-                        Some(attrs.symlink_target.clone())
-                    } else {
-                        None
-                    }
+        // Build DirEntry for each entry by combining data from the appropriate source.
+        let mut results: Vec<(DirEntry, std::path::PathBuf, Uuid, Option<String>)> =
+            Vec::with_capacity(pairs.len());
+
+        // Process symlink entries (no stat_batch needed — constructed from ReaddirEntry).
+        for &idx in &symlink_indices {
+            let (entry, child_uuid) = &pairs[idx];
+            let child_path = if dir_relative.as_os_str() == "." {
+                std::path::PathBuf::from(&entry.name)
+            } else {
+                dir_relative.join(&entry.name)
+            };
+
+            // Construct minimal FileAttrs from ReaddirEntry data for symlinks.
+            // Symlinks don't have meaningful size/mode from the directory listing,
+            // so we use sensible defaults. The symlink_target length is used as size.
+            let target_len = entry.symlink_target.len() as u64;
+            let attrs = FileAttrs {
+                file_type: entry.file_type,
+                symlink_target: entry.symlink_target.clone(),
+                size: target_len,
+                mode: 0o777, // symlinks typically have mode 0o777
+                ..Default::default()
+            };
+
+            results.push((
+                DirEntry {
+                    name: entry.name.clone(),
+                    file_type: entry.file_type,
+                    attrs,
+                },
+                child_path,
+                *child_uuid,
+                Some(entry.symlink_target.clone()),
+            ));
+        }
+
+        // Process non-symlink entries (using stat_batch results).
+        for (stat_idx, &pair_idx) in needs_stat_indices.iter().enumerate() {
+            let (entry, child_uuid) = &pairs[pair_idx];
+            let attrs = match stat_attrs.get(stat_idx) {
+                Some(Ok(a)) => a.clone(),
+                Some(Err(_)) => continue, // skip entries that failed stat
+                None => continue,
+            };
+
+            let child_path = if dir_relative.as_os_str() == "." {
+                std::path::PathBuf::from(&entry.name)
+            } else {
+                dir_relative.join(&entry.name)
+            };
+
+            // Determine symlink target: for non-symlink entries that are
+            // actually symlinks but didn't have target in ReaddirEntry,
+            // fall back to FileAttrs.symlink_target.
+            let symlink_target = if entry.file_type == FileType::Symlink as i32 {
+                if !entry.symlink_target.is_empty() {
+                    Some(entry.symlink_target.clone())
+                } else if !attrs.symlink_target.is_empty() {
+                    Some(attrs.symlink_target.clone())
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
-                Some((
-                    DirEntry {
-                        name: entry.name.clone(),
-                        file_type: entry.file_type,
-                        attrs,
-                    },
-                    child_path,
-                    child_uuid,
-                    symlink_target,
-                ))
-            })
-            .collect();
+            results.push((
+                DirEntry {
+                    name: entry.name.clone(),
+                    file_type: entry.file_type,
+                    attrs,
+                },
+                child_path,
+                *child_uuid,
+                symlink_target,
+            ));
+        }
 
-        for (_entry, child_path, child_uuid, symlink_target) in &combined {
+        // Cache handles and symlink targets.
+        for (_entry, child_path, child_uuid, symlink_target) in &results {
             self.handles.insert(child_path.clone(), *child_uuid).await;
             if let Some(target) = symlink_target {
                 self.handles
@@ -327,7 +386,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             }
         }
 
-        Ok(combined.into_iter().map(|(entry, _, _, _)| entry).collect())
+        Ok(results.into_iter().map(|(entry, _, _, _)| entry).collect())
     }
 
     #[instrument(skip(self), fields(path = %path.display(), offset, length))]
@@ -665,6 +724,10 @@ mod tests {
         read_chunks_called: Mutex<u32>,
         /// (start_chunk, chunk_count) from the most recent read_chunks call
         last_read_chunks_args: Mutex<Option<(u32, u32)>>,
+        /// Number of times stat_batch was called
+        stat_batch_called: Mutex<u32>,
+        /// Handles passed to the most recent stat_batch call
+        last_stat_batch_args: Mutex<Option<Vec<Uuid>>>,
     }
 
     #[allow(dead_code)]
@@ -678,6 +741,8 @@ mod tests {
                 merkle_drill_results: Mutex::new(HashMap::new()),
                 read_chunks_called: Mutex::new(0),
                 last_read_chunks_args: Mutex::new(None),
+                stat_batch_called: Mutex::new(0),
+                last_stat_batch_args: Mutex::new(None),
             }
         }
 
@@ -715,6 +780,14 @@ mod tests {
         async fn get_last_read_chunks_args(&self) -> Option<(u32, u32)> {
             *self.last_read_chunks_args.lock().await
         }
+
+        async fn get_stat_batch_call_count(&self) -> u32 {
+            *self.stat_batch_called.lock().await
+        }
+
+        async fn get_last_stat_batch_args(&self) -> Option<Vec<Uuid>> {
+            self.last_stat_batch_args.lock().await.clone()
+        }
     }
 
     #[async_trait]
@@ -741,8 +814,10 @@ mod tests {
 
         async fn stat_batch(
             &self,
-            _handles: Vec<Uuid>,
+            handles: Vec<Uuid>,
         ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
+            *self.stat_batch_called.lock().await += 1;
+            *self.last_stat_batch_args.lock().await = Some(handles.clone());
             self.stat_batch_result
                 .lock()
                 .await
@@ -3414,5 +3489,154 @@ mod tests {
             .await
             .expect("readlink after getattr should return the symlink target");
         assert_eq!(target, "../../foo");
+    }
+
+    // =======================================================================
+    // Issue: readdir should skip stat_batch for symlink entries with targets
+    // =======================================================================
+
+    /// When all entries in a directory are symlinks with symlink_target set,
+    /// stat_batch should NOT be called — the DirEntry can be constructed
+    /// entirely from ReaddirEntry data.
+    #[tokio::test]
+    async fn readdir_all_symlinks_skips_stat_batch() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link1_uuid = Uuid::now_v7();
+        let link2_uuid = Uuid::now_v7();
+
+        remote
+            .set_readdir(Ok(vec![
+                ReaddirEntry {
+                    name: "link1".to_string(),
+                    file_type: FileType::Symlink as i32,
+                    handle: link1_uuid.as_bytes().to_vec(),
+                    symlink_target: "../../foo".to_string(),
+                },
+                ReaddirEntry {
+                    name: "link2".to_string(),
+                    file_type: FileType::Symlink as i32,
+                    handle: link2_uuid.as_bytes().to_vec(),
+                    symlink_target: "/usr/bin/python3".to_string(),
+                },
+            ]))
+            .await;
+
+        // No stat_batch result set — if stat_batch is called, the test will panic
+        // (MockRemote returns an error for unset mocks).
+
+        let entries = view
+            .readdir(Path::new("."))
+            .await
+            .expect("readdir should succeed");
+        assert_eq!(entries.len(), 2);
+
+        // Verify symlink targets are correct
+        assert_eq!(entries[0].name, "link1");
+        assert_eq!(entries[0].file_type, FileType::Symlink as i32);
+        assert_eq!(entries[0].attrs.symlink_target, "../../foo");
+
+        assert_eq!(entries[1].name, "link2");
+        assert_eq!(entries[1].file_type, FileType::Symlink as i32);
+        assert_eq!(entries[1].attrs.symlink_target, "/usr/bin/python3");
+
+        // stat_batch should NOT have been called at all
+        assert_eq!(
+            remote.get_stat_batch_call_count().await,
+            0,
+            "stat_batch should not be called when all entries are symlinks with targets"
+        );
+
+        // readlink should work for both entries
+        assert_eq!(
+            view.readlink(Path::new("link1")).await.unwrap(),
+            "../../foo"
+        );
+        assert_eq!(
+            view.readlink(Path::new("link2")).await.unwrap(),
+            "/usr/bin/python3"
+        );
+
+        // Handles should be cached
+        assert_eq!(
+            view.handles.get_by_path(Path::new("link1")),
+            Some(link1_uuid)
+        );
+        assert_eq!(
+            view.handles.get_by_path(Path::new("link2")),
+            Some(link2_uuid)
+        );
+    }
+
+    /// Mixed directory: some symlinks (with targets) and some regular files.
+    /// stat_batch should only be called with the handles of non-symlink entries.
+    #[tokio::test]
+    async fn readdir_mixed_symlinks_and_regular_skips_stat_batch_for_symlinks() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+        let file_uuid = Uuid::now_v7();
+
+        remote
+            .set_readdir(Ok(vec![
+                ReaddirEntry {
+                    name: "my_link".to_string(),
+                    file_type: FileType::Symlink as i32,
+                    handle: link_uuid.as_bytes().to_vec(),
+                    symlink_target: "../../foo".to_string(),
+                },
+                ReaddirEntry {
+                    name: "regular.txt".to_string(),
+                    file_type: FileType::Regular as i32,
+                    handle: file_uuid.as_bytes().to_vec(),
+                    symlink_target: String::new(),
+                },
+            ]))
+            .await;
+
+        // stat_batch should only be called for the regular file
+        let file_attrs = make_file_attrs(100, [0x01; 32]);
+        remote
+            .set_stat_batch(Ok(vec![Ok(file_attrs.clone())]))
+            .await;
+
+        let entries = view
+            .readdir(Path::new("."))
+            .await
+            .expect("readdir should succeed");
+        assert_eq!(entries.len(), 2);
+
+        // Verify both entries have correct data
+        let link_entry = entries.iter().find(|e| e.name == "my_link").unwrap();
+        assert_eq!(link_entry.file_type, FileType::Symlink as i32);
+        assert_eq!(link_entry.attrs.symlink_target, "../../foo");
+
+        let file_entry = entries.iter().find(|e| e.name == "regular.txt").unwrap();
+        assert_eq!(file_entry.file_type, FileType::Regular as i32);
+        assert_eq!(file_entry.attrs.size, 100);
+
+        // stat_batch should have been called exactly once, with only the file handle
+        assert_eq!(
+            remote.get_stat_batch_call_count().await,
+            1,
+            "stat_batch should be called once for the regular file"
+        );
+        let stat_handles = remote
+            .get_last_stat_batch_args()
+            .await
+            .expect("stat_batch should have been called with handles");
+        assert_eq!(
+            stat_handles.len(),
+            1,
+            "stat_batch should only receive the regular file handle"
+        );
+        assert_eq!(
+            stat_handles[0], file_uuid,
+            "stat_batch should receive the regular file handle, not the symlink handle"
+        );
     }
 }
