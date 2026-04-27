@@ -111,6 +111,15 @@ impl<R: RemoteShare> RiftShareView<R> {
         self
     }
 
+    /// Cache symlink target if this entry is a symlink with a non-empty target.
+    async fn cache_symlink_target_if_present(&self, path: &Path, attrs: &FileAttrs) {
+        if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
+            self.handles
+                .insert_symlink_target(path.to_path_buf(), attrs.symlink_target.clone())
+                .await;
+        }
+    }
+
     fn resolve_path(&self, path: &Path) -> Result<Uuid, FsError> {
         let relative = path_to_relative(path);
         self.handles
@@ -211,12 +220,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         // Cache symlink target if this entry is a symlink with a non-empty target.
         // This is required because FUSE calls lstat() then readlink(), and
         // readlink() only looks in the cache — it does not make a network call.
-        if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
-            let relative = path_to_relative(path);
-            self.handles
-                .insert_symlink_target(relative, attrs.symlink_target.clone())
-                .await;
-        }
+        self.cache_symlink_target_if_present(&path_to_relative(path), &attrs)
+            .await;
 
         Ok(attrs)
     }
@@ -239,11 +244,9 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         self.handles.insert(child_path.clone(), child_uuid).await;
 
         // Cache symlink target if this entry is a symlink with a non-empty target
-        if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
-            self.handles
-                .insert_symlink_target(child_path, attrs.symlink_target.clone())
-                .await;
-        }
+        // Cache symlink target if this entry is a symlink with a non-empty target
+        self.cache_symlink_target_if_present(&child_path, &attrs)
+            .await;
 
         Ok(attrs)
     }
