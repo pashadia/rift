@@ -60,12 +60,16 @@ pub async fn readdir_response(
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
                 .then(|entry_result| {
                     let share_canonical = share_canonical.clone();
+                    let dir_display = dir_canonical.display().to_string();
                     async move {
                         match entry_result {
                             Ok(entry) => {
                                 process_dir_entry(entry, &share_canonical, handle_db).await
                             }
-                            Err(_) => None,
+                            Err(e) => {
+                                tracing::warn!(path = %dir_display, error = %e, "readdir: failed to read directory entry");
+                                None
+                            }
                         }
                     }
                 })
@@ -100,7 +104,13 @@ async fn process_dir_entry(
     share_canonical: &Path,
     handle_db: &HandleDatabase,
 ) -> Option<ReaddirEntry> {
-    let file_type = entry.file_type().await.ok()?;
+    let file_type = match entry.file_type().await {
+        Ok(ft) => ft,
+        Err(e) => {
+            tracing::warn!(path = %entry.path().display(), error = %e, "readdir: failed to get file type");
+            return None;
+        }
+    };
 
     let proto_type = if file_type.is_dir() {
         FileType::Directory as i32
@@ -127,7 +137,14 @@ async fn process_symlink_dir_entry(
     share_canonical: &Path,
     handle_db: &HandleDatabase,
 ) -> Option<ReaddirEntry> {
-    let target = fs::read_link(entry_path).await.ok()?;
+    let target = match fs::read_link(entry_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to read symlink target");
+            return None;
+        }
+    };
+    // broken symlink / canonicalize failure stays silent — it's expected filtering.
     verify_symlink_containment(entry_path, share_canonical).await?;
 
     let uuid = handle_db
@@ -151,7 +168,13 @@ async fn process_regular_dir_entry(
     proto_type: i32,
     handle_db: &HandleDatabase,
 ) -> Option<ReaddirEntry> {
-    let entry_canonical = fs::canonicalize(entry_path).await.ok()?;
+    let entry_canonical = match fs::canonicalize(entry_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to canonicalize entry");
+            return None;
+        }
+    };
     let uuid = handle_db
         .get_or_create_handle(&entry_canonical)
         .await
