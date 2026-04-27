@@ -533,6 +533,130 @@ async fn resolve_rejects_intermediate_symlink_escape() {
 }
 
 // ---------------------------------------------------------------------------
+// Security: broken symlink path traversal (..
+//
+// When a symlink is broken (canonicalize fails), the resolve() function
+// checks the symlink target for containment. However, Path::starts_with()
+// is component-based but does NOT resolve "..". This means:
+//   - An absolute target like "/share/../../etc/passwd" passes starts_with("/share")
+//   - A relative target like "../../etc/passwd" is not checked at all
+//
+// These tests verify that normalize_path() is used to resolve ".." before
+// the containment check.
+// ---------------------------------------------------------------------------
+
+/// SECURITY: A broken symlink whose absolute target contains ".." components
+/// that escape the share root must be rejected.
+///
+/// Path::starts_with() is component-based and does NOT resolve "..".
+/// Without normalization, "/share/../../nonexistent" passes
+/// Path::starts_with("/share") because the prefix components match lexically.
+///
+/// The target MUST NOT EXIST to ensure we enter the broken-symlink code path
+/// (canonicalize fails) rather than the normal path (canonicalize succeeds).
+#[tokio::test]
+#[cfg(unix)]
+async fn resolve_rejects_broken_symlink_with_dotdot_in_absolute_target() {
+    let share_tmp = TempDir::new().unwrap();
+    let share = share_tmp.path().to_path_buf();
+
+    // Create a subdirectory inside the share so we can construct a target
+    // that starts with the share path but escapes via "..".
+    let share_sub = share.join("sub");
+    std::fs::create_dir(&share_sub).unwrap();
+
+    // Create a broken symlink: share/link -> /<share>/../../nonexistent_etc
+    // The absolute target starts with share_canonical but ".." escapes it.
+    // The target MUST NOT EXIST to trigger the broken-symlink path.
+    let escaping_target = share_sub.join("..").join("..").join("nonexistent_etc");
+    let link_path = share.join("evil_abs_link");
+    std::os::unix::fs::symlink(&escaping_target, &link_path).unwrap();
+
+    let handle_db = rift_server::handle::HandleDatabase::new();
+    let handle = handle_db
+        .get_or_create_handle_non_canonical(&link_path)
+        .await
+        .unwrap();
+
+    let result = rift_server::handler::resolve(&share, &handle, &handle_db).await;
+    assert!(
+        result.is_err(),
+        "resolve() must reject a broken symlink whose absolute target escapes the share via '..'"
+    );
+}
+
+/// SECURITY: A broken symlink whose relative target contains ".." components
+/// that escape the share root must be rejected.
+///
+/// Relative targets were previously accepted without any containment check.
+/// A symlink deep inside the share could point to "../../nonexistent" and
+/// the resolve() function would allow it.
+///
+/// The target MUST NOT EXIST to ensure we enter the broken-symlink code path
+/// (canonicalize fails) rather than the normal path (canonicalize succeeds).
+#[tokio::test]
+#[cfg(unix)]
+async fn resolve_rejects_broken_symlink_with_dotdot_in_relative_target() {
+    let share_tmp = TempDir::new().unwrap();
+    let share = share_tmp.path().to_path_buf();
+
+    // Create a subdirectory deep inside the share.
+    let deep_dir = share.join("a").join("b").join("c");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+
+    // Create a broken symlink deep inside the share with a relative target
+    // that escapes: share/a/b/c/link -> ../../../../../nonexistent_etc
+    // (needs enough ".." to go past the share root)
+    // The target MUST NOT EXIST to trigger the broken-symlink path.
+    let link_path = deep_dir.join("evil_rel_link");
+    std::os::unix::fs::symlink("../../../../../nonexistent_etc", &link_path).unwrap();
+
+    let handle_db = rift_server::handle::HandleDatabase::new();
+    let handle = handle_db
+        .get_or_create_handle_non_canonical(&link_path)
+        .await
+        .unwrap();
+
+    let result = rift_server::handler::resolve(&share, &handle, &handle_db).await;
+    assert!(
+        result.is_err(),
+        "resolve() must reject a broken symlink whose relative target escapes the share via '..'"
+    );
+}
+
+/// A broken symlink whose relative target stays within the share must still
+/// be accepted.  This is the happy path for broken symlinks — the target
+/// simply doesn't exist yet, which is fine.
+#[tokio::test]
+#[cfg(unix)]
+async fn resolve_accepts_broken_symlink_with_valid_relative_target() {
+    let share_tmp = TempDir::new().unwrap();
+    let share = share_tmp.path().to_path_buf();
+
+    // Create a broken symlink: share/link -> nonexistent_file
+    // This is a simple relative target that stays within the share.
+    let link_path = share.join("good_link");
+    std::os::unix::fs::symlink("nonexistent_file", &link_path).unwrap();
+
+    let handle_db = rift_server::handle::HandleDatabase::new();
+    let handle = handle_db
+        .get_or_create_handle_non_canonical(&link_path)
+        .await
+        .unwrap();
+
+    let result = rift_server::handler::resolve(&share, &handle, &handle_db).await;
+    assert!(
+        result.is_ok(),
+        "resolve() must accept a broken symlink with a valid relative target within the share"
+    );
+    let resolved = result.unwrap();
+    assert_eq!(
+        resolved.canonical, link_path,
+        "resolved path must be the symlink itself for broken symlinks"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Must-fix: malformed protobuf payloads must not panic
 //
 // The server receives bytes over the network; a buggy or malicious client

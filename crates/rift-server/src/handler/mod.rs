@@ -150,23 +150,33 @@ pub async fn resolve(
                 );
             }
 
-            // Best-effort check: if the symlink target is an absolute path,
-            // verify it starts with the share root. Relative targets are fine
-            // (they resolve relative to the symlink's directory, which is
-            // already inside the share).
+            // Best-effort check: normalize the symlink target to resolve any
+            // ".." components, then verify it stays within the share root.
+            // Path::starts_with() is component-based and does NOT resolve "..",
+            // so we must normalize first to prevent e.g. "/share/../../etc/passwd"
+            // from passing the containment check.
             if let Ok(target) = tokio::fs::read_link(&stored_path).await {
-                if target.is_absolute() && !target.starts_with(&share_canonical) {
+                let normalized_target = if target.is_absolute() {
+                    normalize_path(&target)
+                } else {
+                    // Relative target: resolve against the symlink's parent directory,
+                    // then normalize to resolve any ".." components.
+                    let parent = stored_path.parent().unwrap_or(Path::new("/"));
+                    normalize_path(&parent.join(&target))
+                };
+
+                if !normalized_target.starts_with(&share_canonical) {
                     tracing::warn!(
                         path = %stored_path.display(),
                         target = %target.display(),
-                        "broken symlink target is absolute path outside share root"
+                        normalized = %normalized_target.display(),
+                        "broken symlink target escapes share root"
                     );
                     if let Some(_removed) = handle_db.remove(handle) {
-                        tracing::info!(handle = %handle, "evicted broken symlink with absolute target outside share");
+                        tracing::info!(handle = %handle, "evicted handle: broken symlink target escapes share");
                     }
                     anyhow::bail!(
-                        "broken symlink target escapes share root: {} -> {}",
-                        stored_path.display(),
+                        "broken symlink target escapes share root: {}",
                         target.display()
                     );
                 }
@@ -310,6 +320,43 @@ pub(crate) fn effective_path(canonical: PathBuf, fd_resolved: Option<PathBuf>) -
     fd_resolved.unwrap_or(canonical)
 }
 
+/// Normalize a path by resolving `.` and `..` components without filesystem access.
+/// This is purely lexical — it does not follow symlinks.
+///
+/// This is used to check symlink targets for containment within the share root.
+/// Without normalization, a path like "/share/../../etc/passwd" would pass
+/// `starts_with("/share")` because `Path::starts_with` is component-based
+/// and does not resolve `..`.
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {} // skip "."
+            std::path::Component::ParentDir => {
+                match components.last() {
+                    Some(std::path::Component::Normal(_)) => {
+                        components.pop();
+                    }
+                    Some(std::path::Component::RootDir) => {
+                        // Absolute path: can't go above root; skip ".."
+                    }
+                    _ => {
+                        // Relative path with no Normal to pop, or ".." after "..":
+                        // preserve the ".." — it's a leading relative traversal.
+                        components.push(component);
+                    }
+                }
+            }
+            c => components.push(c),
+        }
+    }
+    let mut result = PathBuf::new();
+    for component in components {
+        result.push(component);
+    }
+    result
+}
+
 pub(crate) fn error_detail(
     code: rift_protocol::messages::ErrorCode,
 ) -> rift_protocol::messages::ErrorDetail {
@@ -337,6 +384,61 @@ mod tests {
     use crate::handle::HandleDatabase;
 
     // ── effective_path tests ──────────────────────────────────────────
+
+    // ── normalize_path tests ──────────────────────────────────────────
+
+    #[test]
+    fn normalize_path_resolves_dotdot() {
+        let path = Path::new("/share/sub/../../etc/passwd");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn normalize_path_resolves_curdir() {
+        let path = Path::new("/share/./file.txt");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("/share/file.txt"));
+    }
+
+    #[test]
+    fn normalize_path_dotdot_at_root_stays_at_root() {
+        let path = Path::new("/../../etc/passwd");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn normalize_path_no_special_components() {
+        let path = Path::new("/share/a/b/c.txt");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("/share/a/b/c.txt"));
+    }
+
+    #[test]
+    fn normalize_path_relative_path() {
+        let path = Path::new("a/../b.txt");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("b.txt"));
+    }
+
+    #[test]
+    fn normalize_path_relative_dotdot_beyond_start() {
+        // Going above the start of a relative path: ".." pops nothing
+        let path = Path::new("../../etc/passwd");
+        let normalized = normalize_path(path);
+        // Both ".." are at the start, so they can't pop anything
+        assert_eq!(normalized, Path::new("../../etc/passwd"));
+    }
+
+    #[test]
+    fn normalize_path_mixed_dot_and_dotdot() {
+        let path = Path::new("/a/./b/../c/./d.txt");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("/a/c/d.txt"));
+    }
+
+    // ── effective_path tests (original) ────────────────────────────────────
 
     #[test]
     fn effective_path_returns_canonical_when_no_fd_resolved() {

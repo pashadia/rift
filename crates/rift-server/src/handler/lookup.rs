@@ -72,8 +72,16 @@ pub async fn lookup_response<M: MerkleCache>(
         };
 
         // Security: verify the symlink's resolved target is within the share.
+        //
+        // NOTE: The containment check uses `canonicalize()` which resolves `..`
+        // and symlinks via the filesystem. For non-broken symlinks, this is safe
+        // because `canonicalize` returns the fully-resolved absolute path.
         // Broken symlinks (target doesn't exist) will fail canonicalize and
         // return ErrorNotFound, making them invisible through the mount.
+        //
+        // Broken symlinks that escape via `..` in their relative or absolute
+        // target are handled by the `resolve()` function in mod.rs, which
+        // normalizes `..` in symlink targets before checking containment.
         let child_canonical = match tokio::fs::canonicalize(&child_path).await {
             Ok(p) => p,
             Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),

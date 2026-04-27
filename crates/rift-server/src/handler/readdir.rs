@@ -79,6 +79,19 @@ pub async fn readdir_response(
                             let target = tokio::fs::read_link(&entry_path).await.ok()?;
                             // Validate that the symlink target, when resolved, is within the share.
                             // This filters out symlinks pointing outside the share and broken symlinks.
+                            //
+                            // NOTE: The containment check uses `canonicalize()` which resolves `..`
+                            // and symlinks via the filesystem. For non-broken symlinks, this is safe
+                            // because `canonicalize` returns the fully-resolved absolute path.
+                            // For broken symlinks, `canonicalize` fails, so they are filtered out
+                            // entirely by the `Err(_)` branch above.
+                            //
+                            // The raw `target` from `read_link` is NOT checked for `..` components
+                            // here because it is only used as the `symlink_target` field in the
+                            // response (informational). The actual containment decision is based on
+                            // `canonical`, which is filesystem-resolved. Broken symlinks that
+                            // escape via `..` are handled by the `resolve()` function in mod.rs,
+                            // which normalizes `..` in symlink targets before checking containment.
                             let canonical = match tokio::fs::canonicalize(&entry_path).await {
                                 Ok(p) => p,
                                 Err(_) => return None, // broken symlink or inaccessible
