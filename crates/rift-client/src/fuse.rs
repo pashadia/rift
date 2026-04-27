@@ -194,6 +194,14 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         })
     }
 
+    /// Read the target of a symlink.
+    ///
+    /// This is cache-only: the symlink target was cached during a prior
+    /// `lookup` or `readdir` call. If the cache was evicted (e.g., after
+    /// `clear()`), `readlink` returns `ENOENT`. In practice, the FUSE
+    /// kernel always calls `lookup` or `readdir` before `readlink`, so
+    /// the cache should always be warm. A server fallback could be added
+    /// if cache eviction becomes a problem.
     #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn readlink(&self, _req: Request, path: &OsStr) -> Fuse3Result<ReplyData> {
         let rust_path = std::path::Path::new(path);

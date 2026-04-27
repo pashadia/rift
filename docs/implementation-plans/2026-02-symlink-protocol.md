@@ -232,3 +232,63 @@ cargo nextest run
   lookup/readdir
 - **Broken symlink handling**: Symlinks whose targets don't exist or are outside
   the share should return `ENOENT` from lookup, not crash the server
+
+---
+
+## Analysis: Should `symlink_target` use `optional string` instead of `string`?
+
+**Current state**: Both `FileAttrs.symlink_target` (field 9 in `common.proto`)
+and `ReaddirEntry.symlink_target` (field 4 in `operations.proto`) use plain
+`string`, which in proto3 defaults to the empty string `""`. We distinguish
+"not a symlink" from "is a symlink" by the empty-string sentinel: a regular
+file has `symlink_target = ""`, a symlink has it set to the target path.
+
+**Proposal**: Change to `optional string` for forward-compatibility and
+explicit presence tracking.
+
+**Arguments in favor**:
+
+- `optional string` provides explicit field presence: you can distinguish
+  "field was not set" from "field was set to empty string". This removes
+  ambiguity for future protocols where an empty symlink target might be
+  meaningful.
+- Makes the schema self-documenting: `optional` signals that the field is
+  only present in certain contexts (symlinks), rather than relying on the
+  convention that empty string = not applicable.
+
+**Arguments against (conclusion: not worth the change)**:
+
+1. **Breaking wire change**: Changing `string` to `optional string` in proto3
+   changes the wire encoding. `optional string` uses a "wrapped" message
+   representation with an extra tag+length delimiter, while plain `string`
+   encodes directly. Old clients/servers that decode an `optional string`
+   field will see it as unset (default empty string), so *reading* is
+   backward-compatible. However, the reverse — changing `optional string`
+   back to `string` — would be a breaking wire change for any message that
+   relied on the wrapper encoding. This is a one-way door.
+
+2. **Empty string is a valid sentinel**: Symlinks always have non-empty
+   targets (you cannot create `ln -s "" link`). Therefore, `symlink_target
+   = ""` is unambiguously "not a symlink". There is no real ambiguity that
+   `optional` would resolve.
+
+3. **Old servers/clients**: If we change to `optional string`, old servers
+   that send plain `string` would still be readable by new clients (proto3
+   treats missing `optional` as default). But new servers sending
+   `optional string` would encode it differently, and old clients would
+   see the field as empty string regardless — which is the same behavior
+   as today. So this is technically compatible, but the asymmetry in
+   encoding is a maintenance burden.
+
+4. **No current use case**: There is no known scenario where distinguishing
+   "symlink_target not set" from "symlink_target is empty string" is
+   needed. Symlinks always have non-empty targets, and regular files
+   never set symlink_target. The empty-string sentinel works correctly.
+
+**Conclusion**: Do not change `symlink_target` from `string` to `optional
+string`. The empty-string default in proto3 is a valid and unambiguous
+sentinel for "not a symlink", since symlink targets are always non-empty.
+The wire-encoding change is a one-way door that complicates
+backward/forward compatibility for no practical benefit. If a future
+use case requires presence tracking, adding a new `optional` field (e.g.,
+`optional string symlink_target_v2 = 10`) would preserve compatibility.

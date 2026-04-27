@@ -37,10 +37,16 @@ pub use stat::stat_response;
 /// A path resolved through the HandleDatabase and verified to be within
 /// the share root.
 ///
+/// # Symlink semantics
+///
 /// For regular files and directories, `canonical` contains the canonical
 /// (symlink-resolved, absolute) path. For symlinks, `canonical` contains
-/// the symlink's own path (not the target), so that callers can stat the
-/// symlink itself rather than the target.
+/// the symlink's own path — NOT the target's path. This is intentional:
+/// symlink handles must resolve to the symlink itself so that `stat()` returns
+/// symlink metadata and `readlink()` can read the target.
+///
+/// Callers that need the canonical target path should call
+/// `tokio::fs::canonicalize(&resolved.canonical)` themselves.
 ///
 /// Callers should use this resolved path for all subsequent filesystem
 /// operations.  If the path references a regular file, callers should
@@ -49,7 +55,8 @@ pub use stat::stat_response;
 #[derive(Debug, PartialEq)]
 pub struct ResolvedPath {
     /// For regular files and directories, this is the canonical (symlink-resolved,
-    /// absolute) path. For symlinks, this is the symlink's own path (not the target).
+    /// absolute) path. For symlinks, this is the symlink's own path — NOT the
+    /// target's path.
     pub canonical: PathBuf,
 }
 
@@ -126,8 +133,45 @@ pub async fn resolve(
                     .with_context(|| format!("path does not exist: {}", stored_path.display()));
             }
             // For symlinks with non-existent targets, canonicalize fails.
-            // The symlink itself exists. Allow the resolve but skip the
-            // share-check (canonical is unavailable).
+            // The symlink itself exists. We still must verify containment:
+            //   1. The stored (symlink) path must be within the share root.
+            //   2. If we can read the symlink target, and it's absolute,
+            //      it must also be within the share root.
+            // Relative targets are accepted (the link is within the share
+            // and the target simply doesn't exist yet, which is fine).
+            if !stored_path.starts_with(&share_canonical) {
+                tracing::warn!(path = %stored_path.display(), "broken symlink path escapes share root");
+                if let Some(_removed) = handle_db.remove(handle) {
+                    tracing::info!(handle = %handle, "evicted broken symlink handle that escaped share root");
+                }
+                anyhow::bail!(
+                    "broken symlink path escapes share root: {}",
+                    stored_path.display()
+                );
+            }
+
+            // Best-effort check: if the symlink target is an absolute path,
+            // verify it starts with the share root. Relative targets are fine
+            // (they resolve relative to the symlink's directory, which is
+            // already inside the share).
+            if let Ok(target) = tokio::fs::read_link(&stored_path).await {
+                if target.is_absolute() && !target.starts_with(&share_canonical) {
+                    tracing::warn!(
+                        path = %stored_path.display(),
+                        target = %target.display(),
+                        "broken symlink target is absolute path outside share root"
+                    );
+                    if let Some(_removed) = handle_db.remove(handle) {
+                        tracing::info!(handle = %handle, "evicted broken symlink with absolute target outside share");
+                    }
+                    anyhow::bail!(
+                        "broken symlink target escapes share root: {} -> {}",
+                        stored_path.display(),
+                        target.display()
+                    );
+                }
+            }
+
             return Ok(ResolvedPath {
                 canonical: stored_path,
             });
@@ -197,6 +241,11 @@ pub async fn resolve(
 
     // For symlinks: return the stored path, not the canonical target.
     // The canonical path was used for security validation only.
+    // Note: fd_resolved is intentionally discarded here — for symlinks, the
+    // fd-based TOCTOU check is skipped (see the #[cfg(target_os = "linux")] block
+    // above), so fd_resolved is always None when is_symlink is true. Even if it
+    // were Some, we would discard it because a symlink's resolved path must be
+    // the symlink itself, not any fd-resolved target.
     let resolved_path = if is_symlink {
         stored_path
     } else {
@@ -406,6 +455,76 @@ mod tests {
         assert_eq!(
             resolved.canonical, link,
             "resolve() for a broken symlink must return the symlink path, not fail"
+        );
+    }
+
+    /// SECURITY: A broken symlink whose stored path is outside the share root
+    /// must be rejected even though canonicalize fails (and thus the normal
+    /// containment check is skipped).  resolve() is the security boundary and
+    /// must re-verify on every access, not trust the stored path.
+    #[tokio::test]
+    async fn resolve_broken_symlink_outside_share_is_rejected() {
+        let share_tmp = TempDir::new().unwrap();
+        let share = share_tmp.path().to_path_buf();
+
+        // Create an outside directory with a broken symlink in it.
+        let outside_tmp = TempDir::new().unwrap();
+        let outside_dangling = outside_tmp.path().join("nonexistent.txt");
+        let outside_link = outside_tmp.path().join("outside_broken_link");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dangling, &outside_link).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Can't create broken symlinks on non-Unix; skip.
+            return;
+        }
+
+        // Simulate a handle that somehow points outside the share.
+        // In production this shouldn't happen, but resolve() must be the
+        // security boundary and verify containment on every access.
+        let handle_db = HandleDatabase::new();
+        let handle = Uuid::now_v7();
+        handle_db.insert_direct(handle, outside_link.clone());
+
+        let result = resolve(&share, &handle, &handle_db).await;
+        assert!(
+            result.is_err(),
+            "resolve() must reject a broken symlink whose stored path is outside the share root"
+        );
+    }
+
+    /// SECURITY: A broken symlink inside the share pointing to a relative
+    /// target is acceptable (the target simply doesn't exist yet). But a
+    /// broken symlink inside the share pointing to an absolute path outside
+    /// the share should be rejected via best-effort read_link check.
+    #[tokio::test]
+    async fn resolve_broken_symlink_inside_share_with_abs_target_outside_is_rejected() {
+        let share_tmp = TempDir::new().unwrap();
+        let share = share_tmp.path().to_path_buf();
+
+        // Create a broken symlink inside the share that points to an
+        // absolute path outside the share.
+        let outside_tmp = TempDir::new().unwrap();
+        let outside_abs_target = outside_tmp.path().join("secret.txt");
+        let link = share.join("evil_link");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_abs_target, &link).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Can't create broken symlinks on non-Unix; skip.
+            return;
+        }
+
+        let handle_db = HandleDatabase::new();
+        let handle = Uuid::now_v7();
+        handle_db.insert_direct(handle, link.clone());
+
+        let result = resolve(&share, &handle, &handle_db).await;
+        assert!(
+            result.is_err(),
+            "resolve() must reject a broken symlink inside share whose absolute target is outside the share"
         );
     }
 }
