@@ -604,9 +604,41 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
     #[instrument(skip(self), fields(path = %path.display()))]
     async fn readlink(&self, path: &Path) -> Result<String, FsError> {
         let relative = path_to_relative(path);
+
+        // Try cache first
+        if let Some(target) = self.handles.get_symlink_target(Path::new(&relative)) {
+            return Ok(target);
+        }
+
+        // Cache miss: fall back to server stat_batch
+        let handle = self
+            .handles
+            .get_by_path(Path::new(&relative))
+            .ok_or(FsError::NotFound)?;
+
+        let attrs = self
+            .remote
+            .stat_batch(vec![handle])
+            .await
+            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
+
+        let attrs = attrs.into_iter().next().ok_or(FsError::Io)??;
+
+        if attrs.file_type != FileType::Symlink as i32 {
+            return Err(FsError::Io);
+        }
+
+        let target = attrs.symlink_target;
+        if target.is_empty() {
+            return Err(FsError::Io);
+        }
+
+        // Warm the cache for next time
         self.handles
-            .get_symlink_target(Path::new(&relative))
-            .ok_or(FsError::NotFound)
+            .insert_symlink_target(relative, target.clone())
+            .await;
+
+        Ok(target)
     }
 }
 
@@ -3419,9 +3451,10 @@ mod tests {
         assert_eq!(target, "/usr/bin/python3");
     }
 
-    /// readlink for a non-symlink path should return NotFound.
+    /// readlink for a non-symlink path should return EIO because
+    /// the server stat_batch reveals it is not a symlink.
     #[tokio::test]
-    async fn readlink_non_symlink_returns_not_found() {
+    async fn readlink_non_symlink_returns_error() {
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
@@ -3433,8 +3466,17 @@ mod tests {
 
         let _ = view.lookup(Path::new("."), "regular.txt").await;
 
+        // stat_batch returns regular file attrs — not a symlink
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(100, [0x01; 32]))]))
+            .await;
+
         let result = view.readlink(Path::new("regular.txt")).await;
-        assert!(matches!(result, Err(FsError::NotFound)));
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "readlink for non-symlink should return EIO, got {:?}",
+            result
+        );
     }
 
     /// readlink for a path that was never seen should return NotFound.
@@ -3567,6 +3609,169 @@ mod tests {
         assert_eq!(
             view.handles.get_by_path(Path::new("link2")),
             Some(link2_uuid)
+        );
+    }
+
+    // =======================================================================
+    // readlink server fallback tests (cache miss → stat_batch)
+    // =======================================================================
+
+    /// When the symlink target cache is empty (cache miss), readlink falls back
+    /// to calling stat_batch on the server to retrieve the symlink target.
+    /// This fixes the bug where FUSE returns ENOENT for visible symlinks after
+    /// cache eviction or when getattr never ran for a path.
+    #[tokio::test]
+    async fn readlink_fetches_from_server_on_cache_miss() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+        // Insert the path→UUID mapping (so resolve_path works),
+        // but do NOT insert a symlink target (simulates cache miss).
+        view.handles
+            .insert(std::path::PathBuf::from("mylink"), link_uuid)
+            .await;
+
+        // Set up stat_batch to return symlink attrs with a target
+        remote
+            .set_stat_batch(Ok(vec![Ok(FileAttrs {
+                file_type: FileType::Symlink as i32,
+                symlink_target: "../actual_target".to_string(),
+                size: 17,
+                mode: 0o777,
+                nlinks: 1,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            })]))
+            .await;
+
+        // Call readlink — should fall back to stat_batch since cache is cold
+        let result = view.readlink(Path::new("mylink")).await;
+        assert!(
+            result.is_ok(),
+            "readlink should succeed on cache miss with server fallback, got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "../actual_target");
+
+        // Verify stat_batch was called exactly once with the link UUID
+        assert_eq!(remote.get_stat_batch_call_count().await, 1);
+        let args = remote.get_last_stat_batch_args().await.unwrap();
+        assert_eq!(args, vec![link_uuid]);
+
+        // Verify cache is now warm — second call should NOT hit stat_batch
+        let result2 = view.readlink(Path::new("mylink")).await;
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap(), "../actual_target");
+        assert_eq!(
+            remote.get_stat_batch_call_count().await,
+            1,
+            "second readlink should use cache, not call stat_batch again"
+        );
+    }
+
+    /// When readlink falls back to stat_batch but the server also fails,
+    /// the error should be EIO (FsError::Io), not ENOENT (FsError::NotFound).
+    /// This prevents confusing "file not found" errors for files that do exist
+    /// but whose symlink target couldn't be retrieved from the server.
+    #[tokio::test]
+    async fn readlink_returns_eio_on_server_failure() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+        // Path→UUID mapping exists, but no symlink target cached
+        view.handles
+            .insert(std::path::PathBuf::from("broken_link"), link_uuid)
+            .await;
+
+        // stat_batch returns a transport error
+        remote
+            .set_stat_batch(Err(anyhow::anyhow!("server error")))
+            .await;
+
+        let result = view.readlink(Path::new("broken_link")).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "readlink should return EIO on server failure, got {:?}",
+            result
+        );
+    }
+
+    /// When readlink falls back to stat_batch but the server returns a
+    /// non-symlink file type, readlink should return FsError::Io (EIO).
+    #[tokio::test]
+    async fn readlink_returns_eio_when_path_is_not_a_symlink() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("regular_file"), file_uuid)
+            .await;
+
+        // stat_batch returns regular file attrs, not a symlink
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(100, [0x01; 32]))]))
+            .await;
+
+        let result = view.readlink(Path::new("regular_file")).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "readlink should return EIO for non-symlink, got {:?}",
+            result
+        );
+    }
+
+    /// When readlink falls back to stat_batch and the server returns a symlink
+    /// with an empty target, readlink should return FsError::Io (EIO).
+    #[tokio::test]
+    async fn readlink_returns_eio_when_symlink_target_is_empty() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("empty_link"), link_uuid)
+            .await;
+
+        // stat_batch returns symlink attrs but with an empty target
+        remote
+            .set_stat_batch(Ok(vec![Ok(FileAttrs {
+                file_type: FileType::Symlink as i32,
+                symlink_target: String::new(),
+                ..make_file_attrs(0, [0x01; 32])
+            })]))
+            .await;
+
+        let result = view.readlink(Path::new("empty_link")).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "readlink should return EIO for symlink with empty target, got {:?}",
+            result
+        );
+    }
+
+    /// When readlink is called for a path that has no handle mapping at all
+    /// (not even a UUID), it should return NotFound — there's no way to query
+    /// the server without a handle.
+    #[tokio::test]
+    async fn readlink_returns_not_found_when_handle_missing() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote, root);
+
+        // No handle mapping, no symlink target — completely unknown path
+        let result = view.readlink(Path::new("totally_unknown")).await;
+        assert!(
+            matches!(result, Err(FsError::NotFound)),
+            "readlink should return NotFound for unknown path, got {:?}",
+            result
         );
     }
 
