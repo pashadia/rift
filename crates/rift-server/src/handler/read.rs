@@ -102,6 +102,43 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     };
 
+    // Reject symlink handles: the READ protocol must not follow symlinks
+    // and return the target's content. A symlink handle should only be
+    // used with STAT (to get symlink metadata) or READLINK.
+    let meta = match tokio::fs::symlink_metadata(&canonical).await {
+        Ok(m) => m,
+        Err(e) => {
+            let response = ReadResponse {
+                result: Some(read_response::Result::Error(ErrorDetail {
+                    code: io_err_kind_to_code(e.kind()) as i32,
+                    message: e.to_string(),
+                    metadata: None,
+                })),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+                .await?;
+            stream.finish_send().await?;
+            return Ok(());
+        }
+    };
+    if meta.is_symlink() {
+        let response = ReadResponse {
+            result: Some(read_response::Result::Error(ErrorDetail {
+                code: ErrorCode::ErrorUnsupported as i32,
+                message: "cannot read from a symlink handle".to_string(),
+                metadata: None,
+            })),
+        };
+        stream
+            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+        return Ok(());
+    }
+
+    // At this point we know the path is not a symlink, so opening it by
+    // canonical path won't follow a symlink.
     let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
         Err(e) => {
@@ -238,6 +275,116 @@ mod tests {
 
     use crate::handle::HandleDatabase;
     use crate::handler::NoopCache;
+
+    /// Reading a symlink handle must fail — the READ protocol must not
+    /// follow the symlink and return the target's content.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn read_response_rejects_symlink_handle() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let target = share.join("target.txt");
+        let link = share.join("link.txt");
+
+        // Create a regular file with known content, then a symlink to it.
+        std::fs::write(&target, b"secret target content").unwrap();
+        symlink("target.txt", &link).unwrap();
+
+        // Register the symlink's OWN path (not the canonical target)
+        // in the handle database — exactly as lookup_response would do.
+        let handle_db = HandleDatabase::new();
+        let uuid = uuid::Uuid::now_v7();
+        handle_db.insert_direct(uuid, link.clone());
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 1,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let (type_id, payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::READ_RESPONSE);
+        let resp = ReadResponse::decode(&payload[..]).unwrap();
+        match resp.result {
+            Some(read_response::Result::Error(e)) => {
+                assert_eq!(
+                    e.code,
+                    ErrorCode::ErrorUnsupported as i32,
+                    "symlink read must return ErrorUnsupported, got code {:?}",
+                    e.code
+                );
+            }
+            other => {
+                panic!("expected Error for symlink handle, got: {:?}", other);
+            }
+        }
+    }
+
+    /// Regression: reading a regular file handle must still succeed.
+    #[tokio::test]
+    async fn read_response_regular_file_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("regular.txt");
+
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0, // read all chunks
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let (type_id, payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::READ_RESPONSE);
+        let resp = ReadResponse::decode(&payload[..]).unwrap();
+        match resp.result {
+            Some(read_response::Result::Ok(success)) => {
+                assert!(
+                    success.chunk_count > 0,
+                    "regular file must have at least one chunk"
+                );
+            }
+            other => {
+                panic!("expected Ok for regular file handle, got: {:?}", other);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn read_rejects_excessive_chunk_count_before_any_io() {
