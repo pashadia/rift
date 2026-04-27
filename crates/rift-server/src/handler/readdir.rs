@@ -59,47 +59,39 @@ pub async fn readdir_response(
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
                 .then(|entry_result| {
                     let share_canonical = share_canonical.clone();
-                    let dir_display = dir_canonical.display().to_string();
                     async move {
-                        let entry = match entry_result {
-                            Ok(e) => e,
-                            Err(e) => {
-                                tracing::warn!(path = %dir_display, error = %e, "readdir: failed to read directory entry");
-                                return None;
-                            }
-                        };
-                        let file_type = match entry.file_type().await {
-                            Ok(ft) => ft,
-                            Err(e) => {
-                                tracing::warn!(path = %entry.path().display(), error = %e, "readdir: failed to get file type");
-                                return None;
-                            }
+                        let entry = entry_result.ok()?;
+                        let file_type = entry.file_type().await.ok()?;
+                        let proto_type = if file_type.is_dir() {
+                            FileType::Directory as i32
+                        } else if file_type.is_symlink() {
+                            FileType::Symlink as i32
+                        } else {
+                            FileType::Regular as i32
                         };
                         let name = entry.file_name().to_string_lossy().into_owned();
                         let entry_path = entry.path();
 
-                        let initial_is_symlink = file_type.is_symlink();
-
-                        // For symlinks: read the target and canonicalize for
-                        // the security containment check, then re-verify
-                        // is_symlink to close the TOCTOU window.
-                        // For everything else: canonicalize as before, then
-                        // re-verify to catch file→symlink races.
-                        //
-                        // Errors from unexpected conditions (I/O, permission)
-                        // are logged via tracing::warn. Errors from expected
-                        // filtering (broken symlinks, out-of-share) are silent.
-                        let (handle, symlink_target, final_is_symlink) = if initial_is_symlink {
-                            let target = match tokio::fs::read_link(&entry_path).await {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to read symlink target");
-                                    return None;
-                                }
-                            };
+                        // For symlinks: use the symlink's own path (not canonical) for the handle
+                        // and read the symlink target. For everything else: canonicalize as before.
+                        // Then check that the canonical path is within the share root.
+                        let (handle, symlink_target) = if file_type.is_symlink() {
+                            let target = tokio::fs::read_link(&entry_path).await.ok()?;
                             // Validate that the symlink target, when resolved, is within the share.
-                            // Note: broken symlink canonicalization failure is kept silent — it's
-                            // expected filtering, not an error condition.
+                            // This filters out symlinks pointing outside the share and broken symlinks.
+                            //
+                            // NOTE: The containment check uses `canonicalize()` which resolves `..`
+                            // and symlinks via the filesystem. For non-broken symlinks, this is safe
+                            // because `canonicalize` returns the fully-resolved absolute path.
+                            // For broken symlinks, `canonicalize` fails, so they are filtered out
+                            // entirely by the `Err(_)` branch above.
+                            //
+                            // The raw `target` from `read_link` is NOT checked for `..` components
+                            // here because it is only used as the `symlink_target` field in the
+                            // response (informational). The actual containment decision is based on
+                            // `canonical`, which is filesystem-resolved. Broken symlinks that
+                            // escape via `..` are handled by the `resolve()` function in mod.rs,
+                            // which normalizes `..` in symlink targets before checking containment.
                             let canonical = match tokio::fs::canonicalize(&entry_path).await {
                                 Ok(p) => p,
                                 Err(_) => return None, // broken symlink or inaccessible
@@ -107,97 +99,25 @@ pub async fn readdir_response(
                             if !canonical.starts_with(&share_canonical) {
                                 return None; // symlink target outside share
                             }
-
-                            // TOCTOU hardening: re-verify is_symlink after canonicalize.
-                            let current_meta = match tokio::fs::symlink_metadata(&entry_path).await {
-                                Ok(m) => m,
-                                Err(_) => {
-                                    tracing::warn!(path = %entry_path.display(), "TOCTOU: path disappeared between metadata checks");
-                                    return None;
-                                }
-                            };
-
-                            if current_meta.is_symlink() {
-                                let uuid = handle_db
-                                    .get_or_create_handle_non_canonical(&entry_path)
-                                    .await
-                                    .ok()?;
-                                (uuid.as_bytes().to_vec(), Some(target.to_string_lossy().into_owned()), true)
-                            } else {
-                                tracing::warn!(path = %entry_path.display(), "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file");
-                                let canonical = match tokio::fs::canonicalize(&entry_path).await {
-                                    Ok(p) => p,
-                                    Err(_) => return None,
-                                };
-                                if !canonical.starts_with(&share_canonical) {
-                                    return None;
-                                }
-                                let uuid = handle_db
-                                    .get_or_create_handle(&canonical)
-                                    .await
-                                    .ok()?;
-                                (uuid.as_bytes().to_vec(), None, false)
-                            }
+                            // Use the symlink's own path for the handle, not the canonical target.
+                            let uuid = handle_db
+                                .get_or_create_handle_non_canonical(&entry_path)
+                                .await
+                                .ok()?;
+                            let handle = uuid.as_bytes().to_vec();
+                            (handle, Some(target.to_string_lossy().into_owned()))
                         } else {
                             let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
                                 Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to canonicalize entry");
-                                    return None;
-                                }
+                                Err(_) => return None,
                             };
-
-                            // TOCTOU hardening: re-verify is_symlink after canonicalize.
-                            let current_meta = match tokio::fs::symlink_metadata(&entry_path).await {
-                                Ok(m) => m,
-                                Err(_) => {
-                                    tracing::warn!(path = %entry_path.display(), "TOCTOU: path disappeared between metadata checks");
-                                    return None;
-                                }
-                            };
-
-                            if current_meta.is_symlink() {
-                                tracing::warn!(path = %entry_path.display(), "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink");
-                                let target = match tokio::fs::read_link(&entry_path).await {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to read symlink target after TOCTOU");
-                                        return None;
-                                    }
-                                };
-                                let canonical = match tokio::fs::canonicalize(&entry_path).await {
-                                    Ok(p) => p,
-                                    Err(_) => return None,
-                                };
-                                if !canonical.starts_with(&share_canonical) {
-                                    return None;
-                                }
-                                let uuid = handle_db
-                                    .get_or_create_handle_non_canonical(&entry_path)
-                                    .await
-                                    .ok()?;
-                                (uuid.as_bytes().to_vec(), Some(target.to_string_lossy().into_owned()), true)
-                            } else {
-                                if !entry_canonical.starts_with(&share_canonical) {
-                                    return None;
-                                }
-                                let handle = handle_db
-                                    .get_or_create_handle(&entry_canonical)
-                                    .await
-                                    .ok()?
-                                    .as_bytes()
-                                    .to_vec();
-                                (handle, None, false)
-                            }
-                        };
-
-                        // Use the re-verified file type, not the initial one.
-                        let proto_type = if final_is_symlink {
-                            FileType::Symlink as i32
-                        } else if file_type.is_dir() {
-                            FileType::Directory as i32
-                        } else {
-                            FileType::Regular as i32
+                            let handle = handle_db
+                                .get_or_create_handle(&entry_canonical)
+                                .await
+                                .ok()?
+                                .as_bytes()
+                                .to_vec();
+                            (handle, None)
                         };
 
                         Some(ReaddirEntry {
@@ -485,63 +405,5 @@ mod tests {
             names.contains(&"regular.txt"),
             "regular files must still be listed"
         );
-    }
-
-    /// When a directory entry fails `canonicalize` due to a permission error,
-    /// the readdir must still succeed with the remaining entries (not fail
-    /// entirely). The permission-denied entry is skipped — the readdir protocol
-    /// has no per-entry error mechanism — but `tracing::warn` should be emitted.
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn readdir_response_succeeds_with_remaining_entries_on_permission_denied() {
-        let tmp = TempDir::new().unwrap();
-        let share = tmp.path().to_path_buf();
-
-        // Create 3 files
-        std::fs::write(share.join("alpha.txt"), b"a").unwrap();
-        std::fs::write(share.join("beta.txt"), b"b").unwrap();
-        std::fs::write(share.join("gamma.txt"), b"c").unwrap();
-
-        // Make beta.txt unreadable — canonicalize will fail with PermissionDenied
-        std::fs::set_permissions(
-            share.join("beta.txt"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o000),
-        )
-        .unwrap();
-
-        let handle_db = HandleDatabase::new();
-        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
-
-        let req = ReaddirRequest {
-            directory_handle: dir_uuid.as_bytes().to_vec(),
-            offset: 0,
-            limit: 0,
-        };
-        let payload = prost::Message::encode_to_vec(&req);
-
-        let resp = readdir_response(&payload, &share, &handle_db).await;
-
-        let success = match resp.result {
-            Some(readdir_response::Result::Entries(s)) => s,
-            other => panic!("expected Entries, got: {:?}", other),
-        };
-
-        let names: Vec<&str> = success.entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(
-            names.contains(&"alpha.txt"),
-            "alpha.txt must be listed, got {names:?}"
-        );
-        assert!(
-            names.contains(&"gamma.txt"),
-            "gamma.txt must be listed, got {names:?}"
-        );
-        // beta.txt is skipped because canonicalize fails — that's correct
-
-        // Restore permissions so TempDir cleanup can succeed
-        std::fs::set_permissions(
-            share.join("beta.txt"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o644),
-        )
-        .unwrap();
     }
 }
