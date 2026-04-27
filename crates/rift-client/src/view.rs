@@ -480,47 +480,11 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        if !self.no_cache {
-            if let Some(ref cache) = self.cache {
-                match cache.get_manifest(&handle).await {
-                    Ok(Some(manifest)) => {
-                        if manifest.root.as_bytes() == merkle_root.as_slice() {
-                            if manifest_covers_range(&manifest.chunks, offset, length, file_size) {
-                                match cache
-                                    .reconstruct_range(&manifest.chunks, offset, length, file_size)
-                                    .await
-                                {
-                                    Ok(data) => {
-                                        tracing::debug!("read {} bytes from cache", data.len());
-                                        return Ok(data);
-                                    }
-                                    Err(ref bad_hashes) => {
-                                        tracing::warn!(
-                                            "cache data corrupted: {} chunks failed hash verification",
-                                            bad_hashes.len()
-                                        );
-                                        if let Err(e) = cache.remove_manifest(&handle).await {
-                                            tracing::warn!("failed to remove manifest: {}", e);
-                                        }
-                                    }
-                                }
-                            } else {
-                                tracing::debug!("manifest does not cover requested range, falling through to server");
-                            }
-                        } else {
-                            tracing::debug!("root hash changed, cache invalid");
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!("no cached manifest for handle");
-                    }
-                    Err(e) => {
-                        tracing::warn!("cache error: {}", e);
-                    }
-                }
-            }
-        } else {
-            tracing::debug!("no-cache mode: bypassing manifest cache");
+        if let Some(data) = self
+            .try_cached_read(&handle, offset, length, &merkle_root, file_size)
+            .await
+        {
+            return Ok(data);
         }
 
         let end = offset.saturating_add(length).min(file_size);
@@ -546,36 +510,14 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         verify_chunks_integrity(&read_result.chunks, &root_hash, &read_result.merkle_root)?;
 
-        if !self.no_cache {
-            if let Some(ref cache) = self.cache {
-                for chunk in &read_result.chunks {
-                    if let Err(e) = cache.put_chunk(&chunk.hash, &chunk.data).await {
-                        tracing::warn!("failed to cache chunk: {}", e);
-                    }
-                }
-                let root = rift_common::crypto::Blake3Hash::from_slice(&merkle_root)
-                    .map_err(|_| FsError::Io)?;
-                let manifest = crate::cache::db::Manifest {
-                    root,
-                    chunks: resolved
-                        .leaves
-                        .iter()
-                        .enumerate()
-                        .map(|(i, leaf)| crate::cache::db::ChunkInfo {
-                            index: leaf.chunk_index,
-                            offset: chunk_starts[i],
-                            length: leaf.length,
-                            hash: *leaf.hash.as_bytes(),
-                        })
-                        .collect(),
-                };
-                if let Err(e) = cache.put_manifest(&handle, &manifest).await {
-                    tracing::warn!("failed to cache manifest: {}", e);
-                }
-            }
-        } else {
-            tracing::debug!("no-cache mode: skipping cache write");
-        }
+        self.cache_fetched_chunks(
+            &handle,
+            &merkle_root,
+            &read_result.chunks,
+            &resolved.leaves,
+            &chunk_starts,
+        )
+        .await;
 
         assemble_byte_range(read_result.chunks, start_chunk, &chunk_starts, offset, end)
     }
@@ -677,6 +619,104 @@ fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_si
 }
 
 impl<R: RemoteShare> RiftShareView<R> {
+    async fn cache_fetched_chunks(
+        &self,
+        handle: &Uuid,
+        merkle_root: &[u8],
+        chunks: &[crate::client::ChunkData],
+        leaves: &[ResolvedLeaf],
+        chunk_starts: &[u64],
+    ) {
+        if self.no_cache {
+            tracing::debug!("no-cache mode: skipping cache write");
+            return;
+        }
+        let Some(ref cache) = self.cache else {
+            return;
+        };
+        for chunk in chunks {
+            if let Err(e) = cache.put_chunk(&chunk.hash, &chunk.data).await {
+                tracing::warn!("failed to cache chunk: {}", e);
+            }
+        }
+        let root = match rift_common::crypto::Blake3Hash::from_slice(merkle_root) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let manifest = crate::cache::db::Manifest {
+            root,
+            chunks: leaves
+                .iter()
+                .enumerate()
+                .map(|(i, leaf)| crate::cache::db::ChunkInfo {
+                    index: leaf.chunk_index,
+                    offset: chunk_starts[i],
+                    length: leaf.length,
+                    hash: *leaf.hash.as_bytes(),
+                })
+                .collect(),
+        };
+        if let Err(e) = cache.put_manifest(handle, &manifest).await {
+            tracing::warn!("failed to cache manifest: {}", e);
+        }
+    }
+
+    async fn try_cached_read(
+        &self,
+        handle: &Uuid,
+        offset: u64,
+        length: u64,
+        merkle_root: &[u8],
+        file_size: u64,
+    ) -> Option<Vec<u8>> {
+        if self.no_cache {
+            tracing::debug!("no-cache mode: bypassing manifest cache");
+            return None;
+        }
+        let cache = self.cache.as_ref()?;
+        match cache.get_manifest(handle).await {
+            Ok(Some(manifest)) => {
+                if manifest.root.as_bytes() != merkle_root {
+                    tracing::debug!("root hash changed, cache invalid");
+                    return None;
+                }
+                if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
+                    tracing::debug!(
+                        "manifest does not cover requested range, falling through to server"
+                    );
+                    return None;
+                }
+                match cache
+                    .reconstruct_range(&manifest.chunks, offset, length, file_size)
+                    .await
+                {
+                    Ok(data) => {
+                        tracing::debug!("read {} bytes from cache", data.len());
+                        Some(data)
+                    }
+                    Err(ref bad_hashes) => {
+                        tracing::warn!(
+                            "cache data corrupted: {} chunks failed hash verification",
+                            bad_hashes.len()
+                        );
+                        if let Err(e) = cache.remove_manifest(handle).await {
+                            tracing::warn!("failed to remove manifest: {}", e);
+                        }
+                        None
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("no cached manifest for handle");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("cache error: {}", e);
+                None
+            }
+        }
+    }
+
     async fn try_read_from_cache(
         &self,
         handle: &Uuid,
