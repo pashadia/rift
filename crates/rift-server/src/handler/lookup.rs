@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use prost::Message as _;
 use tracing::instrument;
@@ -31,25 +31,19 @@ pub async fn lookup_response<M: MerkleCache>(
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> LookupResponse {
-    let req = match LookupRequest::decode(payload) {
-        Ok(r) => r,
-        Err(_) => return lookup_error(ErrorCode::ErrorUnsupported),
+    // Decode and validate the request.
+    let req = match decode_lookup_request(payload) {
+        Some(r) => r,
+        None => return lookup_error(ErrorCode::ErrorUnsupported),
     };
 
-    if !is_valid_name_component(&req.name) {
-        return lookup_error(ErrorCode::ErrorUnsupported);
-    }
-
-    let parent_uuid = match Uuid::from_slice(&req.parent_handle) {
-        Ok(u) => u,
-        Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
+    // Resolve parent handle to canonical path.
+    let parent_canonical = match resolve_parent_path(share, &req.parent_handle, handle_db).await {
+        Some(p) => p,
+        None => return lookup_error(ErrorCode::ErrorNotFound),
     };
 
-    let parent_canonical = match resolve(share, &parent_uuid, handle_db).await {
-        Ok(r) => r.canonical,
-        Err(_) => return lookup_error(ErrorCode::ErrorNotFound),
-    };
-
+    // Canonicalize the share root once.
     let share_canonical = match tokio::fs::canonicalize(share).await {
         Ok(p) => p,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
@@ -57,11 +51,7 @@ pub async fn lookup_response<M: MerkleCache>(
 
     let child_path = parent_canonical.join(&req.name);
 
-    // --- Symlink handling ---
-    // Check if the child is a symlink using symlink_metadata (doesn't follow links).
-    // If it is, read the target and canonicalize for the security containment check.
-    // Then re-verify is_symlink to close the TOCTOU window between the initial
-    // symlink_metadata and canonicalize.
+    // Get initial metadata to determine file type.
     let child_meta = match tokio::fs::symlink_metadata(&child_path).await {
         Ok(m) => m,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
@@ -69,100 +59,113 @@ pub async fn lookup_response<M: MerkleCache>(
 
     let initial_is_symlink = child_meta.is_symlink();
 
-    // For symlinks, read the target and canonicalize for containment check.
-    // The containment check ensures symlink targets outside the share are rejected.
+    // Attempt symlink handling first.
     if initial_is_symlink {
-        // Read the symlink target.
-        let target = match tokio::fs::read_link(&child_path).await {
-            Ok(t) => t,
-            Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
-        };
-
-        // Security: verify the symlink's resolved target is within the share.
-        //
-        // NOTE: The containment check uses `canonicalize()` which resolves `..`
-        // and symlinks via the filesystem. For non-broken symlinks, this is safe
-        // because `canonicalize` returns the fully-resolved absolute path.
-        // Broken symlinks (target doesn't exist) will fail canonicalize and
-        // return ErrorNotFound, making them invisible through the mount.
-        //
-        // Broken symlinks that escape via `..` in their relative or absolute
-        // target are handled by the `resolve()` function in mod.rs, which
-        // normalizes `..` in symlink targets before checking containment.
-        if verify_symlink_containment(&child_path, &share_canonical)
-            .await
-            .is_none()
-        {
-            return lookup_error(ErrorCode::ErrorNotFound);
+        if let Some(resp) = handle_symlink_child(&child_path, &share_canonical, handle_db).await {
+            return resp;
         }
-
-        // TOCTOU hardening: re-verify is_symlink after canonicalize.
-        // Between the initial symlink_metadata and canonicalize, the filesystem
-        // could change (symlink replaced by regular file or vice versa).
-        let current_meta = match tokio::fs::symlink_metadata(&child_path).await {
-            Ok(m) => m,
-            Err(_) => {
-                tracing::warn!(
-                    path = %child_path.display(),
-                    "TOCTOU: path disappeared between metadata checks"
-                );
-                return lookup_error(ErrorCode::ErrorNotFound);
-            }
-        };
-
-        if current_meta.is_symlink() {
-            // Still a symlink — proceed as intended.
-            // Handle is for the symlink path itself, not the target.
-            let handle = match handle_db
-                .get_or_create_handle_non_canonical(&child_path)
-                .await
-            {
-                Ok(uuid) => uuid.as_bytes().to_vec(),
-                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
-            };
-
-            let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
-            let symlink_target_str = target.to_string_lossy().into_owned();
-
-            return LookupResponse {
-                result: Some(lookup_response::Result::Entry(LookupResult {
-                    handle,
-                    attrs: Some(build_attrs_with_symlink_target(
-                        &current_meta,
-                        root_hash,
-                        symlink_target_str,
-                    )),
-                })),
-            };
-        } else {
-            // Was a symlink, replaced by a regular file/directory between
-            // the initial symlink_metadata and canonicalize. Treat it as a
-            // regular file from now on — fall through to the non-symlink path.
-            tracing::warn!(
-                path = %child_path.display(),
-                "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
-            );
-            // Fall through to non-symlink path below.
-        }
+        // TOCTOU detected type change — fall through to regular path.
     }
 
-    // --- Non-symlink path (regular file or directory) ---
-    // Also reached via fall-through when a symlink was replaced by a regular file.
+    // Regular file or directory (including fall-through from symlink TOCTOU case).
     let child_canonical = match tokio::fs::canonicalize(&child_path).await {
         Ok(p) => p,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    let symlink_out_of_the_share = !is_within_share(&child_canonical, &share_canonical);
-    if symlink_out_of_the_share {
+    // Handle the regular/updated-symlink case.
+    handle_regular_child(
+        &child_path,
+        &child_canonical,
+        &share_canonical,
+        initial_is_symlink,
+        handle_db,
+        db,
+        chunker,
+    )
+    .await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Decode the lookup payload and validate name component.
+/// Returns `Some(LookupRequest)` if valid, `None` on decode error or invalid name.
+fn decode_lookup_request(payload: &[u8]) -> Option<LookupRequest> {
+    let req = LookupRequest::decode(payload).ok()?;
+    if !is_valid_name_component(&req.name) {
+        return None;
+    }
+    Some(req)
+}
+
+/// Resolve the parent handle to its canonical path via the HandleDatabase.
+/// Returns `Some(PathBuf)` on success, `None` if the handle is invalid or not found.
+async fn resolve_parent_path(
+    share: &Path,
+    parent_handle: &[u8],
+    handle_db: &HandleDatabase,
+) -> Option<PathBuf> {
+    let parent_uuid = Uuid::from_slice(parent_handle).ok()?;
+    let resolved = resolve(share, &parent_uuid, handle_db).await.ok()?;
+    Some(resolved.canonical)
+}
+
+/// Handle a symlink child: verify containment, TOCTOU re-check, build response.
+/// Returns `Some(LookupResponse)` if confirmed symlink after all checks.
+/// Returns `None` if a TOCTOU type change was detected (caller should fall through
+/// to the regular file/directory path).
+async fn handle_symlink_child(
+    child_path: &Path,
+    share_canonical: &Path,
+    handle_db: &HandleDatabase,
+) -> Option<LookupResponse> {
+    // Read the symlink target.
+    let target = tokio::fs::read_link(child_path).await.ok()?;
+
+    // Security: verify the symlink's resolved target is within the share.
+    if verify_symlink_containment(child_path, share_canonical)
+        .await
+        .is_none()
+    {
+        return Some(lookup_error(ErrorCode::ErrorNotFound));
+    }
+
+    // TOCTOU hardening: re-verify is_symlink after canonicalize.
+    let current_meta = tokio::fs::symlink_metadata(child_path).await.ok()?;
+    if !current_meta.is_symlink() {
+        // Was a symlink, replaced by a regular file/directory — fall through.
+        tracing::warn!(
+            path = %child_path.display(),
+            "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
+        );
+        return None;
+    }
+
+    // Still a symlink — proceed to build the symlink response.
+    Some(build_symlink_entry(child_path, &current_meta, &target, handle_db).await)
+}
+
+/// Handle a regular file or directory (or a symlink that changed type via TOCTOU).
+/// Performs TOCTOU re-check when the initial type was regular and a symlink now exists.
+async fn handle_regular_child<M: MerkleCache>(
+    child_path: &Path,
+    child_canonical: &Path,
+    share_canonical: &Path,
+    initial_is_symlink: bool,
+    handle_db: &HandleDatabase,
+    db: &M,
+    chunker: Chunker,
+) -> LookupResponse {
+    // Check containment for the canonical path.
+    if !is_within_share(child_canonical, share_canonical) {
         return lookup_error(ErrorCode::ErrorNotFound);
     }
 
-    // TOCTOU hardening: re-verify is_symlink after canonicalize for the
-    // non-symlink path. Between symlink_metadata and canonicalize, a regular
-    // file could have been replaced by a symlink.
+    // TOCTOU hardening: re-verify is_symlink after canonicalize for the non-symlink path.
     if !initial_is_symlink {
-        let current_meta = match tokio::fs::symlink_metadata(&child_path).await {
+        let current_meta = match tokio::fs::symlink_metadata(child_path).await {
             Ok(m) => m,
             Err(_) => {
                 tracing::warn!(
@@ -173,63 +176,84 @@ pub async fn lookup_response<M: MerkleCache>(
             }
         };
         if current_meta.is_symlink() {
-            // Regular file was replaced by a symlink. Treat it as a symlink now.
+            // Regular file was replaced by a symlink. Re-do containment and build symlink response.
             tracing::warn!(
                 path = %child_path.display(),
                 "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink"
             );
-            let target = match tokio::fs::read_link(&child_path).await {
+            let target = match tokio::fs::read_link(child_path).await {
                 Ok(t) => t,
                 Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
             };
-            // Redo containment check through the new symlink.
-            if verify_symlink_containment(&child_path, &share_canonical)
+            if verify_symlink_containment(child_path, share_canonical)
                 .await
                 .is_none()
             {
                 return lookup_error(ErrorCode::ErrorNotFound);
             }
-
-            let handle = match handle_db
-                .get_or_create_handle_non_canonical(&child_path)
-                .await
-            {
-                Ok(uuid) => uuid.as_bytes().to_vec(),
-                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
-            };
-
-            let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
-
-            return LookupResponse {
-                result: Some(lookup_response::Result::Entry(LookupResult {
-                    handle,
-                    attrs: Some(build_attrs_with_symlink_target(
-                        &current_meta,
-                        root_hash,
-                        target.to_string_lossy().into_owned(),
-                    )),
-                })),
-            };
+            return build_symlink_entry(child_path, &current_meta, &target, handle_db).await;
         }
     }
 
-    let meta = match tokio::fs::metadata(&child_canonical).await {
+    // Regular file or directory: get metadata and build response.
+    let meta = match tokio::fs::metadata(child_canonical).await {
         Ok(m) => m,
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    let handle = match handle_db.get_or_create_handle(&child_canonical).await {
+    build_regular_entry(child_canonical, &meta, handle_db, db, chunker).await
+}
+
+/// Build a `LookupResponse` for a symlink entry.
+async fn build_symlink_entry(
+    child_path: &Path,
+    meta: &std::fs::Metadata,
+    target: &Path,
+    handle_db: &HandleDatabase,
+) -> LookupResponse {
+    let handle = match handle_db
+        .get_or_create_handle_non_canonical(child_path)
+        .await
+    {
         Ok(uuid) => uuid.as_bytes().to_vec(),
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    let root_hash = get_or_compute_merkle_root(&child_canonical, &meta, db, chunker).await;
+    let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
+    let symlink_target_str = target.to_string_lossy().into_owned();
 
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
             handle,
             attrs: Some(build_attrs_with_symlink_target(
-                &meta,
+                meta,
+                root_hash,
+                symlink_target_str,
+            )),
+        })),
+    }
+}
+
+/// Build a `LookupResponse` for a regular file or directory entry.
+async fn build_regular_entry<M: MerkleCache>(
+    child_canonical: &Path,
+    meta: &std::fs::Metadata,
+    handle_db: &HandleDatabase,
+    db: &M,
+    chunker: Chunker,
+) -> LookupResponse {
+    let handle = match handle_db.get_or_create_handle(child_canonical).await {
+        Ok(uuid) => uuid.as_bytes().to_vec(),
+        Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
+    };
+
+    let root_hash = get_or_compute_merkle_root(child_canonical, meta, db, chunker).await;
+
+    LookupResponse {
+        result: Some(lookup_response::Result::Entry(LookupResult {
+            handle,
+            attrs: Some(build_attrs_with_symlink_target(
+                meta,
                 root_hash,
                 String::new(),
             )),
