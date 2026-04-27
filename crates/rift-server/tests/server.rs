@@ -887,6 +887,153 @@ async fn readdir_and_lookup_return_consistent_handles_for_symlink() {
 }
 
 // ---------------------------------------------------------------------------
+// Nested symlink test coverage
+//
+// The old integration test covered nested symlinks
+// (double_link.txt -> link_file.txt -> target_file.txt). The symlink test
+// above only covers single-level symlinks. Nested symlinks exercise a
+// different canonicalization chain and are easy to regress.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[cfg(unix)]
+async fn readdir_and_lookup_return_consistent_handles_for_nested_symlink() {
+    // Test that nested symlinks (double_link -> link -> target) each get
+    // a DISTINCT handle, that each reports its *immediate* target (not the
+    // final target), and that readdir and lookup return consistent handles.
+
+    use rift_protocol::messages::{lookup_response, msg, FileType, LookupRequest, ReaddirRequest};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    // Create: target.txt, link.txt -> target.txt, double_link.txt -> link.txt
+    std::fs::write(root.join("target.txt"), b"content").unwrap();
+    std::os::unix::fs::symlink("target.txt", root.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("link.txt", root.join("double_link.txt")).unwrap();
+
+    let addr = helpers::start_server(root).await;
+    let (conn, root_handle) = helpers::connect_and_handshake(addr).await;
+
+    // Use readdir to get the entries
+    let mut stream = conn.open_stream().await.unwrap();
+    let readdir_req = ReaddirRequest {
+        directory_handle: root_handle.clone(),
+        offset: 0,
+        limit: 0,
+    };
+    stream
+        .send_frame(msg::READDIR_REQUEST, &readdir_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let frame = stream.recv_frame().await.unwrap().unwrap();
+    let (_, payload) = frame;
+    let readdir_resp = rift_protocol::messages::ReaddirResponse::decode(&payload[..]).unwrap();
+    let readdir_entries = match readdir_resp.result {
+        Some(rift_protocol::messages::readdir_response::Result::Entries(s)) => s.entries,
+        _ => panic!("expected entries"),
+    };
+
+    // Find the three entries
+    let target_entry = readdir_entries
+        .iter()
+        .find(|e| e.name == "target.txt")
+        .expect("target.txt should be in readdir result");
+    let link_entry = readdir_entries
+        .iter()
+        .find(|e| e.name == "link.txt")
+        .expect("link.txt should be in readdir result");
+    let double_link_entry = readdir_entries
+        .iter()
+        .find(|e| e.name == "double_link.txt")
+        .expect("double_link.txt should be in readdir result");
+
+    // Each must have a DISTINCT handle (three different UUIDs)
+    assert_ne!(
+        target_entry.handle, link_entry.handle,
+        "target and link must have different handles"
+    );
+    assert_ne!(
+        link_entry.handle, double_link_entry.handle,
+        "link and double_link must have different handles"
+    );
+    assert_ne!(
+        target_entry.handle, double_link_entry.handle,
+        "target and double_link must have different handles"
+    );
+
+    // double_link.txt reports symlink_target = "link.txt" (immediate target, not final)
+    assert_eq!(
+        double_link_entry.file_type,
+        FileType::Symlink as i32,
+        "double_link.txt must have FileType::Symlink"
+    );
+    assert_eq!(
+        double_link_entry.symlink_target, "link.txt",
+        "double_link.txt must report immediate target, not final target"
+    );
+
+    // link.txt reports symlink_target = "target.txt"
+    assert_eq!(
+        link_entry.file_type,
+        FileType::Symlink as i32,
+        "link.txt must have FileType::Symlink"
+    );
+    assert_eq!(
+        link_entry.symlink_target, "target.txt",
+        "link.txt must report its immediate target"
+    );
+
+    // target.txt reports FileType::Regular (not Symlink)
+    assert_eq!(
+        target_entry.file_type,
+        FileType::Regular as i32,
+        "target.txt must have FileType::Regular"
+    );
+
+    // Lookup double_link.txt should return same handle and attrs as readdir
+    let double_link_handle = double_link_entry.handle.clone();
+    let mut stream = conn.open_stream().await.unwrap();
+    let lookup_req = LookupRequest {
+        parent_handle: root_handle,
+        name: "double_link.txt".to_string(),
+    };
+    stream
+        .send_frame(msg::LOOKUP_REQUEST, &lookup_req.encode_to_vec())
+        .await
+        .unwrap();
+    stream.finish_send().await.unwrap();
+
+    let frame = stream.recv_frame().await.unwrap().unwrap();
+    let (_, payload) = frame;
+    let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
+    let lookup_entry = match lookup_resp.result {
+        Some(lookup_response::Result::Entry(e)) => e,
+        _ => panic!("expected entry"),
+    };
+
+    // Lookup should return same handle as readdir
+    assert_eq!(
+        double_link_handle, lookup_entry.handle,
+        "readdir and lookup should return same handle for double_link"
+    );
+
+    // Lookup should report Symlink type and immediate target
+    let attrs = lookup_entry.attrs.as_ref().expect("attrs must be present");
+    assert_eq!(
+        attrs.file_type,
+        FileType::Symlink as i32,
+        "lookup double_link must have FileType::Symlink"
+    );
+    assert_eq!(
+        attrs.symlink_target, "link.txt",
+        "lookup double_link must report immediate target, not final target"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Must-fix: protocol version validation
 //
 // The server must reject clients that send a RiftHello with an unknown
