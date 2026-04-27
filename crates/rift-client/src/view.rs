@@ -205,6 +205,105 @@ fn path_to_relative(path: &Path) -> std::path::PathBuf {
     }
 }
 
+/// Build cumulative chunk start offsets from resolved leaves.
+///
+/// Returns a vector where `result[i]` is the byte offset of leaf `i`,
+/// and `result[N]` is the total file size (sentinel).
+/// Returns `Err(FsError::Io)` if the total doesn't match `file_size`.
+fn build_chunk_starts(leaves: &[ResolvedLeaf], file_size: u64) -> Result<Vec<u64>, FsError> {
+    let mut starts = Vec::with_capacity(leaves.len() + 1);
+    let mut acc = 0u64;
+    for leaf in leaves {
+        starts.push(acc);
+        acc = acc.checked_add(leaf.length).ok_or(FsError::Io)?;
+    }
+    starts.push(acc);
+    if acc != file_size {
+        tracing::error!("chunk_starts total {} != file_size {}", acc, file_size);
+        return Err(FsError::Io);
+    }
+    Ok(starts)
+}
+
+/// Find the chunk index range `[start_chunk, end_chunk)` that covers `[offset, end)`.
+///
+/// Uses `partition_point` for O(log n) lookup.
+fn calculate_chunk_range(chunk_starts: &[u64], offset: u64, end: u64) -> (u32, u32) {
+    let start_chunk = chunk_starts
+        .partition_point(|&s| s <= offset)
+        .saturating_sub(1) as u32;
+    let end_chunk = chunk_starts.partition_point(|&s| s < end) as u32;
+    (start_chunk, end_chunk)
+}
+
+/// Verify each chunk's Blake3 hash and length, then verify the Merkle root.
+///
+/// The `root_hash` parameter is the expected root hash (from the stat response).
+/// The `merkle_root` in `result` must match it.
+fn verify_chunks_integrity(
+    chunks: &[crate::client::ChunkData],
+    root_hash: &Blake3Hash,
+    merkle_root: &[u8],
+) -> Result<(), FsError> {
+    for chunk in chunks {
+        let computed = Blake3Hash::new(&chunk.data);
+        let expected = Blake3Hash::from_slice(&chunk.hash).map_err(|_| FsError::Io)?;
+        if computed != expected {
+            tracing::error!("chunk {} hash mismatch", chunk.index);
+            return Err(FsError::Io);
+        }
+        if chunk.data.len() as u64 != chunk.length {
+            tracing::error!("chunk {} length mismatch", chunk.index);
+            return Err(FsError::Io);
+        }
+    }
+    let computed_root = Blake3Hash::from_slice(merkle_root).map_err(|_| FsError::Io)?;
+    if computed_root != *root_hash {
+        tracing::error!("transfer root hash mismatch");
+        return Err(FsError::Io);
+    }
+    Ok(())
+}
+
+/// Sort chunks by index, verify contiguous indices, concatenate data,
+/// and extract the byte range `[offset..offset+length)`.
+fn assemble_byte_range(
+    chunks: Vec<crate::client::ChunkData>,
+    start_chunk: u32,
+    chunk_starts: &[u64],
+    offset: u64,
+    end: u64,
+) -> Result<Vec<u8>, FsError> {
+    let mut sorted: Vec<_> = chunks.into_iter().collect();
+    sorted.sort_by_key(|c| c.index);
+    for (i, chunk) in sorted.iter().enumerate() {
+        if chunk.index != start_chunk + i as u32 {
+            tracing::error!(
+                "chunk index mismatch: expected {}, got {}",
+                start_chunk + i as u32,
+                chunk.index
+            );
+            return Err(FsError::Io);
+        }
+    }
+    let mut all_data = Vec::new();
+    for chunk in sorted {
+        all_data.extend(chunk.data);
+    }
+    let actual_start_byte = chunk_starts[start_chunk as usize];
+    let start_offset = (offset - actual_start_byte) as usize;
+    let requested_length = (end - offset) as usize;
+    Ok(all_data
+        .get(start_offset..start_offset + requested_length)
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| {
+            all_data
+                .get(start_offset..)
+                .map(|s| s.to_vec())
+                .unwrap_or_default()
+        }))
+}
+
 #[async_trait]
 impl<R: RemoteShare> ShareView for RiftShareView<R> {
     #[instrument(skip(self), fields(path = %path.display()))]
@@ -381,8 +480,6 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        // When no_cache is enabled, skip the manifest cache look-up entirely
-        // so every read hits the server.
         if !self.no_cache {
             if let Some(ref cache) = self.cache {
                 match cache.get_manifest(&handle).await {
@@ -402,7 +499,6 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                                             "cache data corrupted: {} chunks failed hash verification",
                                             bad_hashes.len()
                                         );
-                                        // Evict the corrupted manifest so subsequent reads re-fetch
                                         if let Err(e) = cache.remove_manifest(&handle).await {
                                             tracing::warn!("failed to remove manifest: {}", e);
                                         }
@@ -428,36 +524,16 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         }
 
         let end = offset.saturating_add(length).min(file_size);
-
-        // Step 4: Recursively resolve the full Merkle tree, verifying hashes.
         let root_hash = Blake3Hash::from_slice(&merkle_root).map_err(|_| FsError::Io)?;
 
         let resolved = self.resolve_merkle_tree(handle, &root_hash).await?;
-
         if resolved.leaves.is_empty() && file_size > 0 {
             return Err(FsError::Io);
         }
 
-        // Build chunk_starts from the complete sorted leaf list.
-        let mut chunk_starts: Vec<u64> = Vec::with_capacity(resolved.leaves.len() + 1);
-        let mut acc = 0u64;
-        for leaf in &resolved.leaves {
-            chunk_starts.push(acc);
-            acc += leaf.length;
-        }
-        chunk_starts.push(acc); // sentinel = total file size
-
-        if acc != file_size {
-            tracing::error!("chunk_starts total {} != file_size {}", acc, file_size);
-            return Err(FsError::Io);
-        }
-
-        let start_chunk = chunk_starts
-            .partition_point(|&s| s <= offset)
-            .saturating_sub(1) as u32;
-        let end_chunk = chunk_starts.partition_point(|&s| s < end) as u32;
+        let chunk_starts = build_chunk_starts(&resolved.leaves, file_size)?;
+        let (start_chunk, end_chunk) = calculate_chunk_range(&chunk_starts, offset, end);
         let chunk_count = end_chunk - start_chunk;
-
         if chunk_count == 0 {
             return Ok(vec![]);
         }
@@ -468,30 +544,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
 
-        // Step 5: Verify each chunk's hash and length.
-        for chunk in &read_result.chunks {
-            let computed = Blake3Hash::new(&chunk.data);
-            let expected = Blake3Hash::from_slice(&chunk.hash).map_err(|_| FsError::Io)?;
-            if computed != expected {
-                tracing::error!("chunk {} hash mismatch", chunk.index);
-                return Err(FsError::Io);
-            }
-            if chunk.data.len() as u64 != chunk.length {
-                tracing::error!("chunk {} length mismatch", chunk.index);
-                return Err(FsError::Io);
-            }
-        }
+        verify_chunks_integrity(&read_result.chunks, &root_hash, &read_result.merkle_root)?;
 
-        // Verify the Merkle root from TRANSFER_COMPLETE matches the expected root.
-        let computed_root =
-            Blake3Hash::from_slice(&read_result.merkle_root).map_err(|_| FsError::Io)?;
-        if computed_root != root_hash {
-            tracing::error!("transfer root hash mismatch");
-            return Err(FsError::Io);
-        }
-
-        // When no_cache is enabled, also skip writing fetched data to cache
-        // so the next read will also go to the server.
         if !self.no_cache {
             if let Some(ref cache) = self.cache {
                 for chunk in &read_result.chunks {
@@ -523,40 +577,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             tracing::debug!("no-cache mode: skipping cache write");
         }
 
-        // Validate that received chunks have the expected indices and
-        // assemble data in index order (not received order).
-        let mut sorted_chunks: Vec<_> = read_result.chunks.into_iter().collect();
-        sorted_chunks.sort_by_key(|c| c.index);
-        for (i, chunk) in sorted_chunks.iter().enumerate() {
-            if chunk.index != start_chunk + i as u32 {
-                tracing::error!(
-                    "chunk index mismatch: expected {}, got {}",
-                    start_chunk + i as u32,
-                    chunk.index
-                );
-                return Err(FsError::Io);
-            }
-        }
-
-        let mut all_data = Vec::new();
-        for chunk in sorted_chunks {
-            all_data.extend(chunk.data);
-        }
-
-        let actual_start_byte = chunk_starts[start_chunk as usize];
-        let start_offset = (offset - actual_start_byte) as usize;
-        let requested_length = (end - offset) as usize;
-        let result = all_data
-            .get(start_offset..start_offset + requested_length)
-            .map(|s| s.to_vec())
-            .unwrap_or_else(|| {
-                all_data
-                    .get(start_offset..)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_default()
-            });
-
-        Ok(result)
+        assemble_byte_range(read_result.chunks, start_chunk, &chunk_starts, offset, end)
     }
 
     #[instrument(skip(self), fields(path = %path.display()))]
@@ -3748,5 +3769,219 @@ mod tests {
             2,
             "stat_batch should receive both symlink and regular file handles"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for pure helper functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_chunk_starts_single_leaf() {
+        let leaves = vec![ResolvedLeaf {
+            chunk_index: 0,
+            length: 100,
+            hash: Blake3Hash::from_slice(&[0u8; 32]).unwrap(),
+        }];
+        let starts = build_chunk_starts(&leaves, 100).unwrap();
+        assert_eq!(starts, vec![0, 100]);
+    }
+
+    #[test]
+    fn build_chunk_starts_multiple_leaves() {
+        let leaves = vec![
+            ResolvedLeaf {
+                chunk_index: 0,
+                length: 64,
+                hash: Blake3Hash::from_slice(&[0u8; 32]).unwrap(),
+            },
+            ResolvedLeaf {
+                chunk_index: 1,
+                length: 64,
+                hash: Blake3Hash::from_slice(&[1u8; 32]).unwrap(),
+            },
+            ResolvedLeaf {
+                chunk_index: 2,
+                length: 32,
+                hash: Blake3Hash::from_slice(&[2u8; 32]).unwrap(),
+            },
+        ];
+        let starts = build_chunk_starts(&leaves, 160).unwrap();
+        assert_eq!(starts, vec![0, 64, 128, 160]);
+    }
+
+    #[test]
+    fn build_chunk_starts_rejects_size_mismatch() {
+        let leaves = vec![ResolvedLeaf {
+            chunk_index: 0,
+            length: 100,
+            hash: Blake3Hash::from_slice(&[0u8; 32]).unwrap(),
+        }];
+        // Total 100 but file_size is 200
+        assert!(build_chunk_starts(&leaves, 200).is_err());
+    }
+
+    #[test]
+    fn build_chunk_starts_empty_leaves_zero_file() {
+        let starts = build_chunk_starts(&[], 0).unwrap();
+        assert_eq!(starts, vec![0]);
+    }
+
+    #[test]
+    fn calculate_chunk_range_start_of_file() {
+        let starts = vec![0u64, 64, 128, 160];
+        let (s, e) = calculate_chunk_range(&starts, 0, 64);
+        assert_eq!(s, 0);
+        assert_eq!(e, 1);
+    }
+
+    #[test]
+    fn calculate_chunk_range_middle_of_file() {
+        let starts = vec![0u64, 64, 128, 160];
+        let (s, e) = calculate_chunk_range(&starts, 65, 160);
+        assert_eq!(s, 1);
+        assert_eq!(e, 3);
+    }
+
+    #[test]
+    fn calculate_chunk_range_exact_boundary() {
+        let starts = vec![0u64, 64, 128, 160];
+        let (s, e) = calculate_chunk_range(&starts, 64, 128);
+        assert_eq!(s, 1);
+        assert_eq!(e, 2);
+    }
+
+    #[test]
+    fn verify_chunks_integrity_accepts_valid() {
+        let data = b"hello world".to_vec();
+        let hash = *Blake3Hash::new(&data).as_bytes();
+        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
+        let chunks = vec![crate::client::ChunkData {
+            index: 0,
+            length: data.len() as u64,
+            hash,
+            data: data.clone(),
+        }];
+        // Use the actual merkle root derived from the root hash
+        let merkle_root = root_hash.as_bytes().to_vec();
+        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_ok());
+    }
+
+    #[test]
+    fn verify_chunks_integrity_rejects_bad_chunk_hash() {
+        let data = b"hello world".to_vec();
+        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
+        let bad_hash = [0xFFu8; 32];
+        let chunks = vec![crate::client::ChunkData {
+            index: 0,
+            length: data.len() as u64,
+            hash: bad_hash,
+            data: data.clone(),
+        }];
+        let merkle_root = root_hash.as_bytes().to_vec();
+        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
+    }
+
+    #[test]
+    fn verify_chunks_integrity_rejects_bad_chunk_length() {
+        let data = b"hello world".to_vec();
+        let hash = *Blake3Hash::new(&data).as_bytes();
+        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
+        let chunks = vec![crate::client::ChunkData {
+            index: 0,
+            length: 9999, // wrong length
+            hash,
+            data: data.clone(),
+        }];
+        let merkle_root = root_hash.as_bytes().to_vec();
+        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
+    }
+
+    #[test]
+    fn verify_chunks_integrity_rejects_root_mismatch() {
+        let data = b"hello world".to_vec();
+        let hash = *Blake3Hash::new(&data).as_bytes();
+        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
+        let wrong_root = Blake3Hash::from_slice(&[1u8; 32]).unwrap();
+        let chunks = vec![crate::client::ChunkData {
+            index: 0,
+            length: data.len() as u64,
+            hash,
+            data: data.clone(),
+        }];
+        // merkle_root doesn't match root_hash
+        let merkle_root = wrong_root.as_bytes().to_vec();
+        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
+    }
+
+    #[test]
+    fn assemble_byte_range_single_chunk_from_start() {
+        let data = vec![0xAAu8; 100];
+        let hash = *Blake3Hash::new(&data).as_bytes();
+        let chunks = vec![crate::client::ChunkData {
+            index: 0,
+            length: 100,
+            hash,
+            data: data.clone(),
+        }];
+        let starts = vec![0u64, 100];
+        let result = assemble_byte_range(chunks, 0, &starts, 0, 50).unwrap();
+        assert_eq!(result, &data[0..50]);
+    }
+
+    #[test]
+    fn assemble_byte_range_offset_within_chunk() {
+        let data = vec![0xAAu8; 100];
+        let hash = *Blake3Hash::new(&data).as_bytes();
+        let chunks = vec![crate::client::ChunkData {
+            index: 0,
+            length: 100,
+            hash,
+            data: data.clone(),
+        }];
+        let starts = vec![0u64, 100];
+        let result = assemble_byte_range(chunks, 0, &starts, 10, 30).unwrap();
+        assert_eq!(result, &data[10..30]);
+    }
+
+    #[test]
+    fn assemble_byte_range_across_two_chunks() {
+        let chunk0 = vec![0u8; 64];
+        let chunk1 = vec![1u8; 64];
+        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
+        let h1 = *Blake3Hash::new(&chunk1).as_bytes();
+        let chunks = vec![
+            crate::client::ChunkData {
+                index: 0,
+                length: 64,
+                hash: h0,
+                data: chunk0.clone(),
+            },
+            crate::client::ChunkData {
+                index: 1,
+                length: 64,
+                hash: h1,
+                data: chunk1.clone(),
+            },
+        ];
+        let starts = vec![0u64, 64, 128];
+        let result = assemble_byte_range(chunks, 0, &starts, 32, 96).unwrap();
+        assert_eq!(result.len(), 64);
+        assert_eq!(&result[0..32], &chunk0[32..64]);
+        assert_eq!(&result[32..64], &chunk1[0..32]);
+    }
+
+    #[test]
+    fn assemble_byte_range_rejects_non_contiguous_indices() {
+        let data = vec![0xAAu8; 100];
+        let hash = *Blake3Hash::new(&data).as_bytes();
+        // chunk with index 5 but start_chunk=0
+        let chunks = vec![crate::client::ChunkData {
+            index: 5,
+            length: 100,
+            hash,
+            data: data.clone(),
+        }];
+        let starts = vec![0u64, 100];
+        assert!(assemble_byte_range(chunks, 0, &starts, 0, 100).is_err());
     }
 }
