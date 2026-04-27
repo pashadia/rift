@@ -139,15 +139,13 @@ pub async fn resolve(
             //      it must also be within the share root.
             // Relative targets are accepted (the link is within the share
             // and the target simply doesn't exist yet, which is fine).
-            if !stored_path.starts_with(&share_canonical) {
-                tracing::warn!(path = %stored_path.display(), "broken symlink path escapes share root");
-                if let Some(_removed) = handle_db.remove(handle) {
-                    tracing::info!(handle = %handle, "evicted broken symlink handle that escaped share root");
-                }
-                anyhow::bail!(
-                    "broken symlink path escapes share root: {}",
-                    stored_path.display()
-                );
+            if !is_within_share(&stored_path, &share_canonical) {
+                return Err(evict_and_bail(
+                    handle_db,
+                    handle,
+                    &stored_path,
+                    "broken symlink path escapes share root",
+                ));
             }
 
             // Best-effort check: normalize the symlink target to resolve any
@@ -165,7 +163,7 @@ pub async fn resolve(
                     normalize_path(&parent.join(&target))
                 };
 
-                if !normalized_target.starts_with(&share_canonical) {
+                if !is_within_share(&normalized_target, &share_canonical) {
                     tracing::warn!(
                         path = %stored_path.display(),
                         target = %target.display(),
@@ -192,50 +190,25 @@ pub async fn resolve(
     // Between the initial symlink_metadata (Step 0) and canonicalize (Step 1),
     // the filesystem could change (symlink replaced by file or vice versa).
     // Re-check to ensure we take the correct branch.
-    let is_symlink = if is_symlink {
-        // Was a symlink — check if it still is.
-        match tokio::fs::symlink_metadata(&stored_path).await {
-            Ok(meta) if meta.is_symlink() => true,
-            Ok(_meta) => {
-                // Symlink was replaced by a regular file/directory between
-                // Step 0 and Step 1. Treat it as a regular file from now on.
-                tracing::warn!(
-                    path = %stored_path.display(),
-                    "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
-                );
-                false
-            }
-            Err(_) => {
-                // Path disappeared — the handle is stale.
-                tracing::warn!(path = %stored_path.display(), "TOCTOU: path disappeared between metadata checks");
-                if let Some(_removed) = handle_db.remove(handle) {
-                    tracing::info!(handle = %handle, "evicted handle: path disappeared");
-                }
-                anyhow::bail!("path disappeared: {}", stored_path.display());
-            }
-        }
-    } else {
-        // Was not a symlink — check if it has become one.
-        match tokio::fs::symlink_metadata(&stored_path).await {
-            Ok(meta) if meta.is_symlink() => {
-                // Regular file was replaced by a symlink. This is unusual but
-                // possible via TOCTOU. Treat it as a symlink now.
-                tracing::warn!(
-                    path = %stored_path.display(),
-                    "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink"
-                );
-                true
-            }
-            _ => false,
+    let is_symlink = match reverify_file_type(&stored_path, is_symlink).await {
+        Some(b) => b,
+        None => {
+            return Err(evict_and_bail(
+                handle_db,
+                handle,
+                &stored_path,
+                "TOCTOU: path disappeared between metadata checks",
+            ));
         }
     };
 
-    if !canonical.starts_with(&share_canonical) {
-        tracing::warn!(path = %canonical.display(), "path escapes share root");
-        if let Some(_removed) = handle_db.remove(handle) {
-            tracing::info!(handle = %handle, "evicted handle that escaped share root");
-        }
-        anyhow::bail!("path escapes share root: {}", stored_path.display());
+    if !is_within_share(&canonical, &share_canonical) {
+        return Err(evict_and_bail(
+            handle_db,
+            handle,
+            &canonical,
+            "path escapes share root",
+        ));
     }
 
     // Step 2: Re-canonicalize via opened fd to narrow TOCTOU window.
@@ -263,15 +236,13 @@ pub async fn resolve(
                 use std::os::unix::io::AsRawFd;
                 let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
                 if let Ok(fd_canonical) = tokio::fs::canonicalize(&fd_path).await {
-                    if !fd_canonical.starts_with(&share_canonical) {
-                        tracing::warn!(
-                            path = %fd_canonical.display(),
-                            "TOCTOU: path escaped share root between resolution and open"
-                        );
-                        if let Some(_removed) = handle_db.remove(handle) {
-                            tracing::info!(handle = %handle, "evicted handle that escaped share via race");
-                        }
-                        anyhow::bail!("path escapes share root (TOCTOU race detected)");
+                    if !is_within_share(&fd_canonical, &share_canonical) {
+                        return Err(evict_and_bail(
+                            handle_db,
+                            handle,
+                            &fd_canonical,
+                            "TOCTOU: path escaped share root between resolution and open",
+                        ));
                     }
                     // If the fd resolves to a different path than our initial
                     // canonicalization, the file was replaced between our checks.
@@ -355,6 +326,61 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
         result.push(component);
     }
     result
+}
+
+/// Returns `true` if `path` is within the share root, `false` if it escapes.
+pub(crate) fn is_within_share(path: &Path, share_canonical: &Path) -> bool {
+    path.starts_with(share_canonical)
+}
+
+/// Canonicalize a symlink path, verify the resolved target is within the share,
+/// and return the canonical path. Returns `None` if the symlink escapes the share
+/// or is broken (canonicalize fails).
+pub(crate) async fn verify_symlink_containment(
+    symlink_path: &Path,
+    share_canonical: &Path,
+) -> Option<PathBuf> {
+    let canonical = tokio::fs::canonicalize(symlink_path).await.ok()?;
+    if !is_within_share(&canonical, share_canonical) {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Re-verify file type after canonicalize for TOCTOU hardening.
+/// Returns `Some(current_is_symlink)` on success, or `None` if the path disappeared.
+/// Logs a warning on type change.
+pub(crate) async fn reverify_file_type(path: &Path, was_symlink: bool) -> Option<bool> {
+    let current_meta = tokio::fs::symlink_metadata(path).await.ok()?;
+    let current_is_symlink = current_meta.is_symlink();
+    if current_is_symlink != was_symlink {
+        if was_symlink {
+            tracing::warn!(
+                path = %path.display(),
+                "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
+            );
+        } else {
+            tracing::warn!(
+                path = %path.display(),
+                "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink"
+            );
+        }
+    }
+    Some(current_is_symlink)
+}
+
+/// Evict a handle from the database, log the eviction, and return an error.
+fn evict_and_bail(
+    handle_db: &HandleDatabase,
+    handle: &Uuid,
+    path: &Path,
+    reason: &str,
+) -> anyhow::Error {
+    tracing::warn!(path = %path.display(), "{}", reason);
+    if let Some(_removed) = handle_db.remove(handle) {
+        tracing::info!(handle = %handle, "evicted handle: {}", reason);
+    }
+    anyhow::anyhow!("{}: {}", reason, path.display())
 }
 
 pub(crate) fn error_detail(

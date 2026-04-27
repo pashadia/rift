@@ -5,20 +5,33 @@ use tracing::instrument;
 
 use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
 use rift_protocol::messages::{
-    msg, read_response, BlockHeader, ChunkInfo, ErrorCode, ErrorDetail, ReadRequest, ReadResponse,
-    ReadSuccess, TransferComplete,
+    msg, read_response, BlockHeader, ChunkInfo, ErrorCode, ReadRequest, ReadResponse, ReadSuccess,
+    TransferComplete,
 };
 use rift_transport::RiftStream;
 
 use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
+use crate::handler;
 use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::{io_err_kind_to_code, resolve};
 
 /// Maximum number of chunks a client can request in a single ReadRequest.
 /// This prevents DoS attacks where a client requests u32::MAX chunks.
 pub const MAX_CHUNK_COUNT: u32 = 256;
+
+/// Send an error response on the stream and finish the send.
+async fn send_read_error<S: RiftStream>(stream: &mut S, code: ErrorCode) -> anyhow::Result<()> {
+    let response = ReadResponse {
+        result: Some(read_response::Result::Error(handler::error_detail(code))),
+    };
+    stream
+        .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
+    Ok(())
+}
 
 /// `start_chunk >= chunk_boundaries.len()` is always a protocol error (`ErrorNotFound`),
 /// even for empty files. The client should know the chunk count from stat; requesting
@@ -35,70 +48,26 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     let req = match ReadRequest::decode(payload) {
         Ok(r) => r,
         Err(_) => {
-            let response = ReadResponse {
-                result: Some(read_response::Result::Error(ErrorDetail {
-                    code: ErrorCode::ErrorUnsupported as i32,
-                    message: "invalid request".to_string(),
-                    metadata: None,
-                })),
-            };
-            stream
-                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
+            return send_read_error(stream, ErrorCode::ErrorUnsupported).await;
         }
     };
 
     // Validate chunk_count before any filesystem access to prevent DoS.
     if req.chunk_count > MAX_CHUNK_COUNT {
-        let response = ReadResponse {
-            result: Some(read_response::Result::Error(ErrorDetail {
-                code: ErrorCode::ErrorUnsupported as i32,
-                message: format!("chunk_count exceeds maximum of {}", MAX_CHUNK_COUNT),
-                metadata: None,
-            })),
-        };
-        stream
-            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-        return Ok(());
+        return send_read_error(stream, ErrorCode::ErrorUnsupported).await;
     }
 
     let handle = match Uuid::from_slice(&req.handle) {
         Ok(u) => u,
         Err(_) => {
-            let response = ReadResponse {
-                result: Some(read_response::Result::Error(ErrorDetail {
-                    code: ErrorCode::ErrorNotFound as i32,
-                    message: "invalid handle".to_string(),
-                    metadata: None,
-                })),
-            };
-            stream
-                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
+            return send_read_error(stream, ErrorCode::ErrorNotFound).await;
         }
     };
 
     let canonical = match resolve(share, &handle, handle_db).await {
         Ok(r) => r.canonical,
         Err(_) => {
-            let response = ReadResponse {
-                result: Some(read_response::Result::Error(ErrorDetail {
-                    code: ErrorCode::ErrorNotFound as i32,
-                    message: "file not found".to_string(),
-                    metadata: None,
-                })),
-            };
-            stream
-                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
+            return send_read_error(stream, ErrorCode::ErrorNotFound).await;
         }
     };
 
@@ -108,33 +77,11 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     let meta = match tokio::fs::symlink_metadata(&canonical).await {
         Ok(m) => m,
         Err(e) => {
-            let response = ReadResponse {
-                result: Some(read_response::Result::Error(ErrorDetail {
-                    code: io_err_kind_to_code(e.kind()) as i32,
-                    message: e.to_string(),
-                    metadata: None,
-                })),
-            };
-            stream
-                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
         }
     };
     if meta.is_symlink() {
-        let response = ReadResponse {
-            result: Some(read_response::Result::Error(ErrorDetail {
-                code: ErrorCode::ErrorUnsupported as i32,
-                message: "cannot read from a symlink handle".to_string(),
-                metadata: None,
-            })),
-        };
-        stream
-            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-        return Ok(());
+        return send_read_error(stream, ErrorCode::ErrorUnsupported).await;
     }
 
     // At this point we know the path is not a symlink, so opening it by
@@ -142,18 +89,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
         Err(e) => {
-            let response = ReadResponse {
-                result: Some(read_response::Result::Error(ErrorDetail {
-                    code: io_err_kind_to_code(e.kind()) as i32,
-                    message: e.to_string(),
-                    metadata: None,
-                })),
-            };
-            stream
-                .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
-            return Ok(());
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
         }
     };
 
@@ -164,18 +100,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     let chunk_boundaries = chunker.chunk(&content);
 
     if req.start_chunk as usize >= chunk_boundaries.len() {
-        let response = ReadResponse {
-            result: Some(read_response::Result::Error(ErrorDetail {
-                code: ErrorCode::ErrorNotFound as i32,
-                message: "start_chunk exceeds file chunk count".to_string(),
-                metadata: None,
-            })),
-        };
-        stream
-            .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
-            .await?;
-        stream.finish_send().await?;
-        return Ok(());
+        return send_read_error(stream, ErrorCode::ErrorNotFound).await;
     }
 
     let start = req.start_chunk as usize;
@@ -425,7 +350,7 @@ mod tests {
                     e.code
                 );
                 assert!(
-                    e.message.contains("chunk_count exceeds maximum"),
+                    e.message.contains("ERROR_UNSUPPORTED"),
                     "unexpected error message: {}",
                     e.message
                 );

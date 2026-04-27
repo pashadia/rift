@@ -14,7 +14,9 @@ use crate::handle::HandleDatabase;
 use crate::handler::attrs::build_attrs_with_symlink_target;
 use crate::handler::merkle_cache::{get_or_compute_merkle_root, sentinel_hash_for_non_file};
 use crate::handler::merkle_cache_trait::MerkleCache;
-use crate::handler::{error_detail, io_err_kind_to_code, resolve};
+use crate::handler::{
+    error_detail, io_err_kind_to_code, is_within_share, resolve, verify_symlink_containment,
+};
 
 /// Handle a `LookupRequest`: resolve `(parent_handle, name)` to a child
 /// handle and its attributes.
@@ -87,11 +89,10 @@ pub async fn lookup_response<M: MerkleCache>(
         // Broken symlinks that escape via `..` in their relative or absolute
         // target are handled by the `resolve()` function in mod.rs, which
         // normalizes `..` in symlink targets before checking containment.
-        let child_canonical = match tokio::fs::canonicalize(&child_path).await {
-            Ok(p) => p,
-            Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
-        };
-        if !child_canonical.starts_with(&share_canonical) {
+        if verify_symlink_containment(&child_path, &share_canonical)
+            .await
+            .is_none()
+        {
             return lookup_error(ErrorCode::ErrorNotFound);
         }
 
@@ -152,7 +153,7 @@ pub async fn lookup_response<M: MerkleCache>(
         Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
     };
 
-    let symlink_out_of_the_share = !child_canonical.starts_with(&share_canonical);
+    let symlink_out_of_the_share = !is_within_share(&child_canonical, &share_canonical);
     if symlink_out_of_the_share {
         return lookup_error(ErrorCode::ErrorNotFound);
     }
@@ -182,11 +183,10 @@ pub async fn lookup_response<M: MerkleCache>(
                 Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
             };
             // Redo containment check through the new symlink.
-            let symlink_canonical = match tokio::fs::canonicalize(&child_path).await {
-                Ok(p) => p,
-                Err(e) => return lookup_error(io_err_kind_to_code(e.kind())),
-            };
-            if !symlink_canonical.starts_with(&share_canonical) {
+            if verify_symlink_containment(&child_path, &share_canonical)
+                .await
+                .is_none()
+            {
                 return lookup_error(ErrorCode::ErrorNotFound);
             }
 

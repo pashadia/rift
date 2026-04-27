@@ -11,7 +11,7 @@ use rift_protocol::messages::{
 use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
-use crate::handler::{error_detail, io_err_kind_to_code, resolve};
+use crate::handler::{error_detail, io_err_kind_to_code, resolve, verify_symlink_containment};
 
 /// Handle a `ReaddirRequest`: list the directory at `directory_handle`,
 /// applying `offset` and `limit` (0 = unlimited).
@@ -92,13 +92,8 @@ pub async fn readdir_response(
                             // `canonical`, which is filesystem-resolved. Broken symlinks that
                             // escape via `..` are handled by the `resolve()` function in mod.rs,
                             // which normalizes `..` in symlink targets before checking containment.
-                            let canonical = match tokio::fs::canonicalize(&entry_path).await {
-                                Ok(p) => p,
-                                Err(_) => return None, // broken symlink or inaccessible
-                            };
-                            if !canonical.starts_with(&share_canonical) {
-                                return None; // symlink target outside share
-                            }
+                            let _canonical =
+                                verify_symlink_containment(&entry_path, &share_canonical).await?;
                             // Use the symlink's own path for the handle, not the canonical target.
                             let uuid = handle_db
                                 .get_or_create_handle_non_canonical(&entry_path)
