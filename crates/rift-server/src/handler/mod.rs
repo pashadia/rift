@@ -178,6 +178,48 @@ pub async fn resolve(
         }
     };
 
+    // TOCTOU hardening: re-verify is_symlink after canonicalize.
+    // Between the initial symlink_metadata (Step 0) and canonicalize (Step 1),
+    // the filesystem could change (symlink replaced by file or vice versa).
+    // Re-check to ensure we take the correct branch.
+    let is_symlink = if is_symlink {
+        // Was a symlink — check if it still is.
+        match tokio::fs::symlink_metadata(&stored_path).await {
+            Ok(meta) if meta.is_symlink() => true,
+            Ok(_meta) => {
+                // Symlink was replaced by a regular file/directory between
+                // Step 0 and Step 1. Treat it as a regular file from now on.
+                tracing::warn!(
+                    path = %stored_path.display(),
+                    "TOCTOU: symlink was replaced by regular file between metadata checks, treating as regular file"
+                );
+                false
+            }
+            Err(_) => {
+                // Path disappeared — the handle is stale.
+                tracing::warn!(path = %stored_path.display(), "TOCTOU: path disappeared between metadata checks");
+                if let Some(_removed) = handle_db.remove(handle) {
+                    tracing::info!(handle = %handle, "evicted handle: path disappeared");
+                }
+                anyhow::bail!("path disappeared: {}", stored_path.display());
+            }
+        }
+    } else {
+        // Was not a symlink — check if it has become one.
+        match tokio::fs::symlink_metadata(&stored_path).await {
+            Ok(meta) if meta.is_symlink() => {
+                // Regular file was replaced by a symlink. This is unusual but
+                // possible via TOCTOU. Treat it as a symlink now.
+                tracing::warn!(
+                    path = %stored_path.display(),
+                    "TOCTOU: regular file was replaced by symlink between metadata checks, treating as symlink"
+                );
+                true
+            }
+            _ => false,
+        }
+    };
+
     if !canonical.starts_with(&share_canonical) {
         tracing::warn!(path = %canonical.display(), "path escapes share root");
         if let Some(_removed) = handle_db.remove(handle) {
