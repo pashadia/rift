@@ -201,11 +201,24 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
     #[instrument(skip(self), fields(path = %path.display()))]
     async fn getattr(&self, path: &Path) -> Result<FileAttrs, FsError> {
         let handle = self.resolve_path(path)?;
-        self.remote
+        let attrs = self
+            .remote
             .stat_batch(vec![handle])
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?
-            .remove(0)
+            .remove(0)?;
+
+        // Cache symlink target if this entry is a symlink with a non-empty target.
+        // This is required because FUSE calls lstat() then readlink(), and
+        // readlink() only looks in the cache — it does not make a network call.
+        if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
+            let relative = path_to_relative(path);
+            self.handles
+                .insert_symlink_target(relative, attrs.symlink_target.clone())
+                .await;
+        }
+
+        Ok(attrs)
     }
 
     #[instrument(skip(self), fields(parent = %parent.display(), name = %name))]
@@ -3358,5 +3371,48 @@ mod tests {
 
         let result = view.readlink(Path::new("never_heard_of")).await;
         assert!(matches!(result, Err(FsError::NotFound)));
+    }
+
+    // =======================================================================
+    // Issue 4: getattr should cache symlink_target so readlink works after getattr
+    // =======================================================================
+
+    /// The POSIX sequence lstat() -> readlink() must work. In FUSE terms,
+    /// `getattr` is called first, then `readlink`. Currently `getattr` does
+    /// not cache `symlink_target`, so `readlink` returns `NotFound`.
+    #[tokio::test]
+    async fn getattr_symlink_caches_target_and_readlink_returns_it() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let link_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("my_link"), link_uuid)
+            .await;
+
+        // stat_batch returns symlink attrs with symlink_target
+        remote
+            .set_stat_batch(Ok(vec![Ok(FileAttrs {
+                file_type: FileType::Symlink as i32,
+                symlink_target: "../../foo".to_string(),
+                ..make_file_attrs(10, [0x01; 32])
+            })]))
+            .await;
+
+        // Step 1: call getattr — should cache the symlink_target
+        let attrs = view
+            .getattr(Path::new("my_link"))
+            .await
+            .expect("getattr should succeed");
+        assert_eq!(attrs.file_type, FileType::Symlink as i32);
+        assert_eq!(attrs.symlink_target, "../../foo");
+
+        // Step 2: call readlink — should return the cached target
+        let target = view
+            .readlink(Path::new("my_link"))
+            .await
+            .expect("readlink after getattr should return the symlink target");
+        assert_eq!(target, "../../foo");
     }
 }
