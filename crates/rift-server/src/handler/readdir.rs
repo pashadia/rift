@@ -52,62 +52,68 @@ pub async fn readdir_response(
     let entries: Vec<ReaddirEntry> = match tokio::fs::read_dir(&dir_canonical).await {
         Ok(read_dir) => {
             let stream = ReadDirStream::new(read_dir);
+            let share_canonical = tokio::fs::canonicalize(share)
+                .await
+                .ok()
+                .unwrap_or_else(|| share.to_path_buf());
             let entries_with_none: Vec<Option<ReaddirEntry>> = stream
-                .then(|entry_result| async move {
-                    let entry = entry_result.ok()?;
-                    let file_type = entry.file_type().await.ok()?;
-                    let proto_type = if file_type.is_dir() {
-                        FileType::Directory as i32
-                    } else if file_type.is_symlink() {
-                        FileType::Symlink as i32
-                    } else {
-                        FileType::Regular as i32
-                    };
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let entry_path = entry.path();
-
-                    // For symlinks: use the symlink's own path (not canonical) for the handle
-                    // and read the symlink target. For everything else: canonicalize as before.
-                    // Then check that the canonical path is within the share root.
-                    let (handle, symlink_target) = if file_type.is_symlink() {
-                        let target = tokio::fs::read_link(&entry_path).await.ok()?;
-                        // Validate that the symlink target, when resolved, is within the share.
-                        // This filters out symlinks pointing outside the share and broken symlinks.
-                        let canonical = match tokio::fs::canonicalize(&entry_path).await {
-                            Ok(p) => p,
-                            Err(_) => return None, // broken symlink or inaccessible
+                .then(|entry_result| {
+                    let share_canonical = share_canonical.clone();
+                    async move {
+                        let entry = entry_result.ok()?;
+                        let file_type = entry.file_type().await.ok()?;
+                        let proto_type = if file_type.is_dir() {
+                            FileType::Directory as i32
+                        } else if file_type.is_symlink() {
+                            FileType::Symlink as i32
+                        } else {
+                            FileType::Regular as i32
                         };
-                        let share_canonical = tokio::fs::canonicalize(share).await.ok()?;
-                        if !canonical.starts_with(&share_canonical) {
-                            return None; // symlink target outside share
-                        }
-                        // Use the symlink's own path for the handle, not the canonical target.
-                        let uuid = handle_db
-                            .get_or_create_handle_non_canonical(&entry_path)
-                            .await
-                            .ok()?;
-                        let handle = uuid.as_bytes().to_vec();
-                        (handle, Some(target.to_string_lossy().into_owned()))
-                    } else {
-                        let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
-                            Ok(p) => p,
-                            Err(_) => return None,
-                        };
-                        let handle = handle_db
-                            .get_or_create_handle(&entry_canonical)
-                            .await
-                            .ok()?
-                            .as_bytes()
-                            .to_vec();
-                        (handle, None)
-                    };
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let entry_path = entry.path();
 
-                    Some(ReaddirEntry {
-                        name,
-                        file_type: proto_type,
-                        handle,
-                        symlink_target: symlink_target.unwrap_or_default(),
-                    })
+                        // For symlinks: use the symlink's own path (not canonical) for the handle
+                        // and read the symlink target. For everything else: canonicalize as before.
+                        // Then check that the canonical path is within the share root.
+                        let (handle, symlink_target) = if file_type.is_symlink() {
+                            let target = tokio::fs::read_link(&entry_path).await.ok()?;
+                            // Validate that the symlink target, when resolved, is within the share.
+                            // This filters out symlinks pointing outside the share and broken symlinks.
+                            let canonical = match tokio::fs::canonicalize(&entry_path).await {
+                                Ok(p) => p,
+                                Err(_) => return None, // broken symlink or inaccessible
+                            };
+                            if !canonical.starts_with(&share_canonical) {
+                                return None; // symlink target outside share
+                            }
+                            // Use the symlink's own path for the handle, not the canonical target.
+                            let uuid = handle_db
+                                .get_or_create_handle_non_canonical(&entry_path)
+                                .await
+                                .ok()?;
+                            let handle = uuid.as_bytes().to_vec();
+                            (handle, Some(target.to_string_lossy().into_owned()))
+                        } else {
+                            let entry_canonical = match tokio::fs::canonicalize(&entry_path).await {
+                                Ok(p) => p,
+                                Err(_) => return None,
+                            };
+                            let handle = handle_db
+                                .get_or_create_handle(&entry_canonical)
+                                .await
+                                .ok()?
+                                .as_bytes()
+                                .to_vec();
+                            (handle, None)
+                        };
+
+                        Some(ReaddirEntry {
+                            name,
+                            file_type: proto_type,
+                            handle,
+                            symlink_target: symlink_target.unwrap_or_default(),
+                        })
+                    }
                 })
                 .collect()
                 .await;
@@ -284,6 +290,67 @@ mod tests {
             stored_path, link_path,
             "symlink handle must map to the symlink's own path, not the canonical target"
         );
+    }
+
+    /// When a directory contains multiple symlinks, every one must report the
+    /// correct `file_type` and `symlink_target`. This also serves as a regression
+    /// guard for the share_canonical hoist: if the hoist were broken, entries
+    /// could silently vanish or report wrong metadata.
+    #[tokio::test]
+    async fn readdir_response_multiple_symlinks_all_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create 3 regular files and 3 symlinks pointing to them.
+        for i in 0..3 {
+            let file_name = format!("file{i}.txt");
+            let link_name = format!("link{i}.txt");
+            std::fs::write(share.join(&file_name), b"data").unwrap();
+            std::os::unix::fs::symlink(&file_name, share.join(&link_name)).unwrap();
+        }
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&share).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+
+        // All 6 entries (3 files + 3 symlinks) must be present.
+        assert_eq!(
+            success.entries.len(),
+            6,
+            "expected exactly 6 entries (3 files + 3 symlinks)"
+        );
+
+        for i in 0..3 {
+            let link_name = format!("link{i}.txt");
+            let target_name = format!("file{i}.txt");
+            let entry = success
+                .entries
+                .iter()
+                .find(|e| e.name == link_name)
+                .unwrap_or_else(|| panic!("must list {link_name}"));
+            assert_eq!(
+                entry.file_type,
+                FileType::Symlink as i32,
+                "{link_name} must have FileType::Symlink"
+            );
+            assert_eq!(
+                entry.symlink_target, target_name,
+                "{link_name} symlink_target must be {target_name}"
+            );
+        }
     }
 
     /// Symlinks whose canonical target is outside the share must be filtered out.
