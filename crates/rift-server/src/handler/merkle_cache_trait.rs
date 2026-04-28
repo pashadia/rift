@@ -16,6 +16,9 @@ pub type PutMerkleFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + Send
 pub type PutTreeFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + Send + 'a>>;
 pub type GetChildrenFut<'a> =
     Pin<Box<dyn Future<Output = SqliteResult<Option<Vec<MerkleChild>>>> + Send + 'a>>;
+pub type GetAllLeafInfoFut<'a> =
+    Pin<Box<dyn Future<Output = SqliteResult<Option<Vec<LeafInfo>>>> + Send + 'a>>;
+pub type DeleteMerkleFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + Send + 'a>>;
 
 /// Trait abstracting Merkle tree cache operations.
 ///
@@ -23,6 +26,10 @@ pub type GetChildrenFut<'a> =
 /// Eliminates `Option<&Database>` and the `db.as_ref().as_ref()` double-unwrap pattern.
 pub trait MerkleCache: Send + Sync {
     fn get_merkle<'a>(&'a self, path: &'a Path) -> GetMerkleFut<'a>;
+
+    fn get_all_leaf_info<'a>(&'a self, path: &'a Path) -> GetAllLeafInfoFut<'a>;
+
+    fn delete_merkle<'a>(&'a self, path: &'a Path) -> DeleteMerkleFut<'a>;
 
     fn put_merkle<'a>(
         &'a self,
@@ -49,6 +56,14 @@ pub trait MerkleCache: Send + Sync {
 impl MerkleCache for Database {
     fn get_merkle<'a>(&'a self, path: &'a Path) -> GetMerkleFut<'a> {
         Box::pin(self.get_merkle(path))
+    }
+
+    fn get_all_leaf_info<'a>(&'a self, path: &'a Path) -> GetAllLeafInfoFut<'a> {
+        Box::pin(self.get_all_leaf_info(path))
+    }
+
+    fn delete_merkle<'a>(&'a self, path: &'a Path) -> DeleteMerkleFut<'a> {
+        Box::pin(self.delete_merkle(path))
     }
 
     fn put_merkle<'a>(
@@ -85,6 +100,14 @@ pub struct NoopCache;
 impl MerkleCache for NoopCache {
     fn get_merkle<'a>(&'a self, _path: &'a Path) -> GetMerkleFut<'a> {
         Box::pin(async { Ok(None) })
+    }
+
+    fn get_all_leaf_info<'a>(&'a self, _path: &'a Path) -> GetAllLeafInfoFut<'a> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn delete_merkle<'a>(&'a self, _path: &'a Path) -> DeleteMerkleFut<'a> {
+        Box::pin(async { Ok(()) })
     }
 
     fn put_merkle<'a>(

@@ -1,9 +1,12 @@
+use std::io::SeekFrom;
 use std::path::Path;
 
+use bytes::BytesMut;
 use prost::Message as _;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 
-use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
+use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleTree};
 use rift_protocol::messages::{
     msg, read_response, BlockHeader, ChunkInfo, ErrorCode, ReadRequest, ReadResponse, ReadSuccess,
     TransferComplete,
@@ -17,9 +20,23 @@ use crate::handler;
 use crate::handler::merkle_cache_trait::MerkleCache;
 use crate::handler::{io_err_kind_to_code, resolve};
 
+use crate::metadata::merkle::MerkleEntry;
+
 /// Maximum number of chunks a client can request in a single ReadRequest.
 /// This prevents DoS attacks where a client requests u32::MAX chunks.
 pub const MAX_CHUNK_COUNT: u32 = 256;
+
+/// Error indicating the Merkle cache is stale and the cold path should be used.
+#[derive(Debug)]
+struct StaleCache;
+
+impl std::fmt::Display for StaleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stale merkle cache")
+    }
+}
+
+impl std::error::Error for StaleCache {}
 
 /// Send an error response on the stream and finish the send.
 async fn send_read_error<S: RiftStream>(stream: &mut S, code: ErrorCode) -> anyhow::Result<()> {
@@ -138,6 +155,170 @@ async fn update_merkle_cache<M: MerkleCache>(
     Ok(())
 }
 
+/// Verify all cached chunks in [start, end) by reading from disk and
+/// checking BLAKE3 hashes. Returns `Err(StaleCache)` on mismatch.
+async fn verify_cached_chunks(
+    file: &mut tokio::fs::File,
+    leaf_infos: &[LeafInfo],
+    leaf_hashes: &[Blake3Hash],
+    start: usize,
+    end: usize,
+    buf: &mut BytesMut,
+) -> anyhow::Result<()> {
+    for (i, info) in leaf_infos[start..end].iter().enumerate() {
+        let chunk_idx = start + i;
+        let expected_hash = &leaf_hashes[chunk_idx];
+
+        if buf.len() < info.length as usize {
+            buf.resize(info.length as usize, 0);
+        }
+
+        file.seek(SeekFrom::Start(info.offset)).await?;
+        file.read_exact(&mut buf[..info.length as usize]).await?;
+
+        let actual_hash = Blake3Hash::new(&buf[..info.length as usize]);
+        if actual_hash != *expected_hash {
+            tracing::warn!(chunk_idx, "chunk hash mismatch in warm path");
+            anyhow::bail!(StaleCache);
+        }
+    }
+    Ok(())
+}
+
+/// Stream verified chunks as BLOCK_HEADER + BLOCK_DATA frames.
+async fn send_cached_chunk_frames<S: RiftStream>(
+    stream: &mut S,
+    file: &mut tokio::fs::File,
+    leaf_infos: &[LeafInfo],
+    leaf_hashes: &[Blake3Hash],
+    start: usize,
+    end: usize,
+    buf: &mut BytesMut,
+) -> anyhow::Result<()> {
+    for (i, info) in leaf_infos[start..end].iter().enumerate() {
+        let chunk_idx = start + i;
+        let expected_hash = &leaf_hashes[chunk_idx];
+
+        file.seek(SeekFrom::Start(info.offset)).await?;
+        file.read_exact(&mut buf[..info.length as usize]).await?;
+
+        let block_header = BlockHeader {
+            chunk: Some(ChunkInfo {
+                index: chunk_idx as u32,
+                length: info.length,
+                hash: expected_hash.as_bytes().to_vec(),
+            }),
+        };
+        stream
+            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+            .await?;
+        stream
+            .send_frame(msg::BLOCK_DATA, &buf[..info.length as usize])
+            .await?;
+    }
+    Ok(())
+}
+
+/// Stream a read response using cached chunk boundaries.
+///
+/// Returns `Err(StaleCache)` if the cache is inconsistent or a chunk hash does
+/// not match, signalling the caller to fall back to the cold path.
+async fn stream_cached_read<S: RiftStream, M: MerkleCache>(
+    stream: &mut S,
+    canonical: &Path,
+    cached: &MerkleEntry,
+    req_start_chunk: u32,
+    req_chunk_count: u32,
+    db: &M,
+) -> anyhow::Result<()> {
+    let total_chunks = cached.leaf_hashes.len();
+    let start = req_start_chunk as usize;
+
+    if start >= total_chunks {
+        return send_read_error(stream, ErrorCode::ErrorNotFound).await;
+    }
+
+    let count = if req_chunk_count == 0 {
+        total_chunks.saturating_sub(start)
+    } else {
+        req_chunk_count as usize
+    };
+    let end = (start + count).min(total_chunks);
+    let actual_count = end - start;
+
+    let leaf_infos = match db.get_all_leaf_info(canonical).await {
+        Ok(Some(infos)) => infos,
+        Ok(None) => anyhow::bail!(StaleCache),
+        Err(e) => {
+            tracing::warn!(
+                path = %canonical.display(),
+                error = %e,
+                "get_all_leaf_info failed, treating as stale cache"
+            );
+            anyhow::bail!(StaleCache);
+        }
+    };
+
+    if leaf_infos.len() != total_chunks {
+        anyhow::bail!(StaleCache);
+    }
+
+    let mut file = match tokio::fs::File::open(canonical).await {
+        Ok(f) => f,
+        Err(e) => {
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
+        }
+    };
+
+    let mut buf = BytesMut::with_capacity(512 * 1024);
+
+    if let Err(e) = verify_cached_chunks(
+        &mut file,
+        &leaf_infos,
+        &cached.leaf_hashes,
+        start,
+        end,
+        &mut buf,
+    )
+    .await
+    {
+        if e.downcast_ref::<StaleCache>().is_some() {
+            db.delete_merkle(canonical).await.ok();
+        }
+        return Err(e);
+    }
+
+    let response = ReadResponse {
+        result: Some(read_response::Result::Ok(ReadSuccess {
+            chunk_count: actual_count as u32,
+        })),
+    };
+    stream
+        .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
+        .await?;
+
+    send_cached_chunk_frames(
+        stream,
+        &mut file,
+        &leaf_infos,
+        &cached.leaf_hashes,
+        start,
+        end,
+        &mut buf,
+    )
+    .await?;
+
+    let transfer_complete = TransferComplete {
+        merkle_root: cached.root.as_bytes().to_vec(),
+    };
+    stream
+        .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
+
+    Ok(())
+}
+
 /// `start_chunk >= chunk_boundaries.len()` is always a protocol error (`ErrorNotFound`),
 /// even for empty files. The client should know the chunk count from stat; requesting
 /// a nonexistent chunk index indicates a bug or desync.
@@ -178,8 +359,30 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         return send_read_error(stream, ErrorCode::ErrorUnsupported).await;
     }
 
-    // At this point we know the path is not a symlink, so opening it by
-    // canonical path won't follow a symlink.
+    // Try warm path: use cached chunk boundaries for incremental read.
+    if let Some(cached) = db.get_merkle(&canonical).await.ok().flatten() {
+        match stream_cached_read(
+            stream,
+            &canonical,
+            &cached,
+            req.start_chunk,
+            req.chunk_count,
+            db,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if e.downcast_ref::<StaleCache>().is_some() => {
+                tracing::warn!(
+                    path = %canonical.display(),
+                    "warm path detected stale cache, falling back to cold path"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Cold path: read the entire file, chunk it, and stream it.
     let content = match tokio::fs::read(&canonical).await {
         Ok(c) => c,
         Err(e) => {
@@ -232,12 +435,22 @@ mod tests {
     use super::*;
 
     use prost::Message;
-    use rift_common::crypto::Chunker;
+    use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
     use rift_transport::connection::InMemoryConnection;
     use rift_transport::RiftConnection;
 
     use crate::handle::HandleDatabase;
     use crate::handler::NoopCache;
+    use crate::metadata::db::Database;
+
+    /// Collect all frames from a stream until the remote half-closes.
+    async fn collect_frames(stream: &mut impl RiftStream) -> Vec<(u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        while let Some((type_id, payload)) = stream.recv_frame().await.unwrap() {
+            frames.push((type_id, payload.to_vec()));
+        }
+        frames
+    }
 
     /// Reading a symlink handle must fail — the READ protocol must not
     /// follow the symlink and return the target's content.
@@ -395,5 +608,302 @@ mod tests {
             }
             other => panic!("expected Error, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn warm_path_read_with_populated_cache_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("warm.txt");
+        let content = b"hello world warm path";
+        std::fs::write(&file, content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        let file_content = std::fs::read(&file).unwrap();
+        let chunker = Chunker::default();
+        let chunk_boundaries = chunker.chunk(&file_content);
+        let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+            .iter()
+            .map(|(offset, length)| Blake3Hash::new(&file_content[*offset..*offset + *length]))
+            .collect();
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+        let meta = std::fs::metadata(&canonical).unwrap();
+        let mtime_ns = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_merkle(&canonical).await.unwrap().is_some(),
+            "cache must be warm"
+        );
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let frames = collect_frames(&mut client_stream).await;
+        assert!(!frames.is_empty(), "must receive frames");
+        assert_eq!(
+            frames[0].0,
+            msg::READ_RESPONSE,
+            "first frame must be READ_RESPONSE"
+        );
+
+        let resp = ReadResponse::decode(&frames[0].1[..]).unwrap();
+        let chunk_count = match resp.result {
+            Some(read_response::Result::Ok(success)) => success.chunk_count,
+            other => panic!("expected Ok, got: {:?}", other),
+        };
+
+        assert_eq!(
+            frames.len(),
+            1 + (chunk_count as usize * 2) + 1,
+            "expected READ_RESPONSE + 2*chunk_count + TRANSFER_COMPLETE"
+        );
+
+        let mut reconstructed = Vec::new();
+        for i in 0..chunk_count as usize {
+            let header_idx = 1 + i * 2;
+            let data_idx = 1 + i * 2 + 1;
+            assert_eq!(frames[header_idx].0, msg::BLOCK_HEADER);
+            assert_eq!(frames[data_idx].0, msg::BLOCK_DATA);
+            reconstructed.extend_from_slice(&frames[data_idx].1);
+        }
+        assert_eq!(
+            &reconstructed[..],
+            &file_content[..],
+            "reconstructed content must match original"
+        );
+
+        let last = frames.last().unwrap();
+        assert_eq!(
+            last.0,
+            msg::TRANSFER_COMPLETE,
+            "last frame must be TRANSFER_COMPLETE"
+        );
+        let tc = TransferComplete::decode(&last.1[..]).unwrap();
+        assert_eq!(
+            tc.merkle_root,
+            root.as_bytes().to_vec(),
+            "merkle root must match cached root"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_path_falls_back_on_stale_mtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("stale.txt");
+        let original_content = b"original content";
+        std::fs::write(&file, original_content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        let file_content = std::fs::read(&file).unwrap();
+        let chunker = Chunker::default();
+        let chunk_boundaries = chunker.chunk(&file_content);
+        let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+            .iter()
+            .map(|(offset, length)| Blake3Hash::new(&file_content[*offset..*offset + *length]))
+            .collect();
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+        let meta = std::fs::metadata(&canonical).unwrap();
+        let mtime_ns = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        // Modify file (changes mtime and/or size), making cache stale.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let new_content = b"modified content!!";
+        std::fs::write(&file, new_content).unwrap();
+
+        assert!(
+            db.get_merkle(&canonical).await.unwrap().is_none(),
+            "cache must be stale after mtime change"
+        );
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let frames = collect_frames(&mut client_stream).await;
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].0, msg::READ_RESPONSE);
+
+        let resp = ReadResponse::decode(&frames[0].1[..]).unwrap();
+        let chunk_count = match resp.result {
+            Some(read_response::Result::Ok(success)) => success.chunk_count,
+            other => panic!("expected Ok, got: {:?}", other),
+        };
+
+        let mut reconstructed = Vec::new();
+        for i in 0..chunk_count as usize {
+            let data_idx = 1 + i * 2 + 1;
+            reconstructed.extend_from_slice(&frames[data_idx].1);
+        }
+        assert_eq!(
+            &reconstructed[..],
+            new_content.as_slice(),
+            "fallback must return new content"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_path_falls_back_on_hash_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("mismatch.txt");
+        let original_content = b"hash mismatch test data";
+        std::fs::write(&file, original_content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        let file_content = std::fs::read(&file).unwrap();
+        let chunker = Chunker::default();
+        let chunk_boundaries = chunker.chunk(&file_content);
+        let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+            .iter()
+            .map(|(offset, length)| Blake3Hash::new(&file_content[*offset..*offset + *length]))
+            .collect();
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+        let meta = std::fs::metadata(&canonical).unwrap();
+        let original_mtime = meta.modified().unwrap();
+        let mtime_ns = original_mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_merkle(&canonical).await.unwrap().is_some(),
+            "cache must be warm"
+        );
+
+        // Modify file content but keep size identical so get_merkle still returns Some
+        // (after we restore mtime).
+        let mut new_content = original_content.to_vec();
+        for b in &mut new_content {
+            *b = b.wrapping_add(1);
+        }
+        std::fs::write(&file, &new_content).unwrap();
+
+        // Restore original mtime so get_merkle does not detect staleness.
+        let ft = filetime::FileTime::from_system_time(original_mtime);
+        filetime::set_file_mtime(&file, ft).unwrap();
+
+        // Same size, same mtime — get_merkle should return Some.
+        assert!(
+            db.get_merkle(&canonical).await.unwrap().is_some(),
+            "cache must still appear valid after mtime restoration"
+        );
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let frames = collect_frames(&mut client_stream).await;
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].0, msg::READ_RESPONSE);
+
+        let resp = ReadResponse::decode(&frames[0].1[..]).unwrap();
+        let chunk_count = match resp.result {
+            Some(read_response::Result::Ok(success)) => success.chunk_count,
+            other => panic!("expected Ok, got: {:?}", other),
+        };
+
+        let mut reconstructed = Vec::new();
+        for i in 0..chunk_count as usize {
+            let data_idx = 1 + i * 2 + 1;
+            reconstructed.extend_from_slice(&frames[data_idx].1);
+        }
+        assert_eq!(
+            &reconstructed[..],
+            &new_content[..],
+            "fallback must return modified content after hash mismatch"
+        );
     }
 }
