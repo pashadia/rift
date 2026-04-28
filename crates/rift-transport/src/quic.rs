@@ -161,7 +161,7 @@ impl RiftStream for QuicStream {
                     payload_len = payload.len(),
                     "decoded frame from buffer"
                 );
-                return Ok(Some((type_id, Bytes::from(payload))));
+                return Ok(Some((type_id, payload)));
             }
 
             // Need more bytes from the QUIC stream.
@@ -175,8 +175,7 @@ impl RiftStream for QuicStream {
                         return Ok(None);
                     }
                     // Attempt to decode one last frame from remaining bytes.
-                    return Ok(codec::decode_message(&mut self.read_buf)?
-                        .map(|(t, p)| (t, Bytes::from(p))));
+                    return Ok(codec::decode_message(&mut self.read_buf)?);
                 }
                 Err(e) => return Err(TransportError::QuicRead(e)),
             }
