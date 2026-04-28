@@ -21,6 +21,7 @@ cargo check
 ```
 
 ### Testing
+
 ```bash
 # Run all tests
 cargo test
@@ -265,6 +266,7 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 - **Tech stack**: `docs/05-implementation/technology-stack.md`
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:full hash:f65d5d33 -->
+
 ## Issue Tracking with bd (beads)
 
 **IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
@@ -330,10 +332,12 @@ bd close bd-42 --reason "Completed" --json
 5. **Complete**: `bd close <id> --reason "Done"`
 
 ### Quality
+
 - Use `--acceptance` and `--design` fields when creating issues
 - Use `--validate` to check description completeness
 
 ### Lifecycle
+
 - `bd defer <id>` / `bd supersede <id>` for issue management
 - `bd stale` / `bd orphans` / `bd lint` for hygiene
 - `bd human <id>` to flag for human decisions
@@ -379,10 +383,43 @@ For more details, see README.md and docs/QUICKSTART.md.
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-
 <!-- END BEADS INTEGRATION -->
+
+### Pre-Commit Hooks
+
+The project has **pre-commit hooks** that automatically run `cargo check`, `cargo clippy --all-targets`, and `cargo test --workspace` before every commit. You do NOT need to manually run these checks before committing — the hooks will do it for you. If you want to verify earlier (during development), you can run them manually, but it's not required before commit.
+
+### Subagent Protocol
+
+When working as a subagent in a team:
+
+- **Message the lead when done**, after committing. Do NOT just run `sleep` loops — you will be notified.
+- **Do NOT push to origin** — the lead handles merging to main.
+- **DO commit your work** with a clear commit message including the bead ID (e.g., `feat(crypto): streaming chunker (rift-b0er.1.1)`).
+- **Follow TDD strictly**: RED → GREEN → REFACTOR for every change.
+- Pre-commit hooks run automatically; you don't need to manually run the full suite before committing.
+
+### Git Worktrees
+
+**ALL work must happen in git worktrees, never directly on the main working tree.** This applies to both subagents and the team lead.
+
+Worktrees live under `.worktrees/` in the project root (already in `.gitignore`):
+
+```bash
+# Create a worktree for a task
+mkdir -p .worktrees
+git worktree add .worktrees/<branch-name> -b <branch-name>
+
+# Example
+git worktree add .worktrees/phase1-bytes -b phase1-bytes
+
+# Run the agent in the worktree
+cd .worktrees/phase1-bytes
+```
+
+Rules:
+
+- **Never** create worktrees as sibling directories (e.g., `../rift-bytes`). Always use `.worktrees/` under the project root.
+- **Never** commit or modify files on the `main` working tree directly — always use a worktree.
+- The lead merges completed branches into main after verifying tests pass.
+- Clean up worktrees after merge: `git worktree remove .worktrees/<branch-name>`
