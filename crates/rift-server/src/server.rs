@@ -221,29 +221,11 @@ where
         // Data operations
         // ------------------------------------------------------------------
         msg::READ_REQUEST => {
-            handler::read_response(
-                &mut stream,
-                &payload,
-                &ctx.share,
-                ctx.db(),
-                &ctx.handle_db,
-                ctx.chunker,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
+            handle_read_request(&mut stream, &payload, &ctx).await?;
         }
 
         msg::MERKLE_DRILL => {
-            handler::merkle_drill_response(
-                &mut stream,
-                &payload,
-                &ctx.share,
-                ctx.db(),
-                &ctx.handle_db,
-                ctx.chunker,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
+            handle_merkle_drill_request(&mut stream, &payload, &ctx).await?;
         }
 
         // ------------------------------------------------------------------
@@ -338,6 +320,46 @@ where
         .await?;
     stream.finish_send().await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming dispatch wrappers
+// ---------------------------------------------------------------------------
+
+/// Handle a READ_REQUEST by delegating to the read handler with context.
+async fn handle_read_request<S: RiftStream, M: MerkleCache>(
+    stream: &mut S,
+    payload: &[u8],
+    ctx: &RequestContext<M>,
+) -> anyhow::Result<()> {
+    handler::read_response(
+        stream,
+        payload,
+        &ctx.share,
+        ctx.db(),
+        &ctx.handle_db,
+        ctx.chunker,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("read failed: {}", e))
+}
+
+/// Handle a MERKLE_DRILL request by delegating to the drill handler with context.
+async fn handle_merkle_drill_request<S: RiftStream, M: MerkleCache>(
+    stream: &mut S,
+    payload: &[u8],
+    ctx: &RequestContext<M>,
+) -> anyhow::Result<()> {
+    handler::merkle_drill_response(
+        stream,
+        payload,
+        &ctx.share,
+        ctx.db(),
+        &ctx.handle_db,
+        ctx.chunker,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -518,5 +540,51 @@ mod tests {
         assert_eq!(type_id, msg::STAT_RESPONSE);
         // After finish_send, client should get Ok(None)
         assert!(client_stream.recv_frame().await.unwrap().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Test 6: handle_read_request proxies to handler::read_response
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn handle_read_request_proxies_to_handler() {
+        use rift_protocol::messages::ReadRequest;
+        use rift_transport::connection::InMemoryConnection;
+
+        let (_dir, share) = make_share();
+        let db: Arc<NoopCache> = Arc::new(NoopCache);
+        let handle_db = Arc::new(HandleDatabase::new());
+
+        // Register a handle for hello.txt
+        let file_path = share.join("hello.txt");
+        let uuid = handle_db.get_or_create_handle(&file_path).await.unwrap();
+
+        let ctx = RequestContext {
+            share,
+            db,
+            handle_db,
+            chunker: Chunker::default(),
+        };
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 1,
+        };
+        let payload = req.encode_to_vec();
+
+        let result = handle_read_request(&mut server_stream, &payload, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "handle_read_request should succeed: {:?}",
+            result
+        );
+
+        // Client should receive at least one response frame
+        let (type_id, _resp_payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::READ_RESPONSE);
     }
 }
