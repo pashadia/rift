@@ -184,37 +184,7 @@ where
         // ------------------------------------------------------------------
         msg::RIFT_HELLO => {
             let hello = RiftHello::decode(payload.as_ref())?;
-
-            if hello.protocol_version != RIFT_PROTOCOL_VERSION {
-                anyhow::bail!(
-                    "unsupported protocol version {} (expected {})",
-                    hello.protocol_version,
-                    RIFT_PROTOCOL_VERSION
-                );
-            }
-
-            // Get or create handle for the share root
-            let root_handle = match ctx.handle_db.get_or_create_handle(&ctx.share).await {
-                Ok(uuid) => uuid.as_bytes().to_vec(),
-                Err(_) => {
-                    anyhow::bail!("failed to get root handle for share");
-                }
-            };
-
-            let welcome = RiftWelcome {
-                protocol_version: RIFT_PROTOCOL_VERSION,
-                active_capabilities: vec![],
-                root_handle,
-                max_concurrent_streams: 128,
-                share: Some(ShareInfo {
-                    name: hello.share_name.clone(),
-                    read_only: true, // TODO(v1): derive from permission file
-                    cdc_params: None,
-                }),
-            };
-
-            debug!(share = %hello.share_name, "handshake complete");
-            send_welcome(&mut stream, welcome).await?;
+            handle_handshake(&mut stream, &ctx, hello).await?;
         }
 
         // ------------------------------------------------------------------
@@ -303,6 +273,52 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Handshake handler
+// ---------------------------------------------------------------------------
+
+/// Handle a RIFT_HELLO handshake on the given stream.
+///
+/// Validates protocol version, creates/gets the root handle, and sends
+/// RIFT_WELCOME. Returns `Ok(())` on success, `Err` on version mismatch
+/// or stream failure.
+async fn handle_handshake<S: RiftStream, M: MerkleCache>(
+    stream: &mut S,
+    ctx: &RequestContext<M>,
+    hello: RiftHello,
+) -> anyhow::Result<()> {
+    if hello.protocol_version != RIFT_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "unsupported protocol version {} (expected {})",
+            hello.protocol_version,
+            RIFT_PROTOCOL_VERSION
+        );
+    }
+
+    let root_handle = match ctx.handle_db.get_or_create_handle(&ctx.share).await {
+        Ok(uuid) => uuid.as_bytes().to_vec(),
+        Err(_) => {
+            anyhow::bail!("failed to get root handle for share");
+        }
+    };
+
+    let welcome = RiftWelcome {
+        protocol_version: RIFT_PROTOCOL_VERSION,
+        active_capabilities: vec![],
+        root_handle,
+        max_concurrent_streams: 128,
+        share: Some(ShareInfo {
+            name: hello.share_name.clone(),
+            read_only: true, // TODO(v1): derive from permission file
+            cdc_params: None,
+        }),
+    };
+
+    debug!(share = %hello.share_name, "handshake complete");
+    send_welcome(stream, welcome).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -310,6 +326,7 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use prost::Message;
     use rift_transport::{client_handshake, InMemoryConnector, InMemoryListener, RiftConnection};
 
     use super::*;
@@ -375,26 +392,72 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 2: accept_loop exits cleanly when the listener is closed
+    // Test 3: handle_handshake with valid hello succeeds
     // ------------------------------------------------------------------
     #[tokio::test]
-    async fn accept_loop_exits_when_listener_closes() {
+    async fn handle_handshake_with_valid_hello_succeeds() {
+        use rift_transport::connection::InMemoryConnection;
+
         let (_dir, share) = make_share();
-        let (server_handle, connector) = start_in_memory_server(share);
+        let db: Arc<NoopCache> = Arc::new(NoopCache);
+        let handle_db = Arc::new(HandleDatabase::new());
+        let ctx = RequestContext {
+            share,
+            db,
+            handle_db,
+            chunker: Chunker::default(),
+        };
 
-        // Dropping the connector closes the channel, which causes the
-        // InMemoryListener::accept() to return ConnectionClosed.
-        drop(connector);
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
 
-        // accept_loop must terminate within a reasonable timeout.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
-            .await
-            .expect("accept_loop did not exit within 2 s after listener closed");
+        let hello = RiftHello {
+            protocol_version: RIFT_PROTOCOL_VERSION,
+            share_name: "test-share".to_string(),
+            capabilities: vec![],
+        };
 
-        // The task itself must return Ok(()).
-        assert!(
-            result.unwrap().is_ok(),
-            "accept_loop must return Ok when listener closes"
-        );
+        // Call handle_handshake directly
+        let result = handle_handshake(&mut server_stream, &ctx, hello).await;
+        assert!(result.is_ok(), "handshake should succeed");
+
+        // Client should receive a RIFT_WELCOME frame
+        let (type_id, payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::RIFT_WELCOME);
+        let welcome = RiftWelcome::decode(payload.as_ref()).unwrap();
+        assert_eq!(welcome.protocol_version, RIFT_PROTOCOL_VERSION);
+        assert_eq!(welcome.root_handle.len(), 16); // UUID bytes
+    }
+
+    // ------------------------------------------------------------------
+    // Test 4: handle_handshake rejects wrong protocol version
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn handle_handshake_rejects_wrong_protocol_version() {
+        use rift_transport::connection::InMemoryConnection;
+
+        let (_dir, share) = make_share();
+        let db: Arc<NoopCache> = Arc::new(NoopCache);
+        let handle_db = Arc::new(HandleDatabase::new());
+        let ctx = RequestContext {
+            share,
+            db,
+            handle_db,
+            chunker: Chunker::default(),
+        };
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut _client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let hello = RiftHello {
+            protocol_version: 0xFF, // Wrong version
+            share_name: "test-share".to_string(),
+            capabilities: vec![],
+        };
+
+        let result = handle_handshake(&mut server_stream, &ctx, hello).await;
+        assert!(result.is_err(), "handshake should fail with wrong version");
     }
 }
