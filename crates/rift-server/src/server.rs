@@ -191,36 +191,30 @@ where
         // Metadata operations (with optional Merkle cache)
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
-            let response =
+            dispatch_simple(&mut stream, msg::STAT_RESPONSE, || {
                 handler::stat_response(&payload, &ctx.share, ctx.db(), &ctx.handle_db, ctx.chunker)
-                    .await;
-            stream
-                .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
+            })
+            .await?;
         }
 
         msg::LOOKUP_REQUEST => {
-            let response = handler::lookup_response(
-                &payload,
-                &ctx.share,
-                ctx.db(),
-                &ctx.handle_db,
-                ctx.chunker,
-            )
-            .await;
-            stream
-                .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
+            dispatch_simple(&mut stream, msg::LOOKUP_RESPONSE, || {
+                handler::lookup_response(
+                    &payload,
+                    &ctx.share,
+                    ctx.db(),
+                    &ctx.handle_db,
+                    ctx.chunker,
+                )
+            })
+            .await?;
         }
 
         msg::READDIR_REQUEST => {
-            let response = handler::readdir_response(&payload, &ctx.share, &ctx.handle_db).await;
-            stream
-                .send_frame(msg::READDIR_RESPONSE, &response.encode_to_vec())
-                .await?;
-            stream.finish_send().await?;
+            dispatch_simple(&mut stream, msg::READDIR_RESPONSE, || {
+                handler::readdir_response(&payload, &ctx.share, &ctx.handle_db)
+            })
+            .await?;
         }
 
         // ------------------------------------------------------------------
@@ -315,6 +309,34 @@ async fn handle_handshake<S: RiftStream, M: MerkleCache>(
 
     debug!(share = %hello.share_name, "handshake complete");
     send_welcome(stream, welcome).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Simple request→response dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch a simple request<>response: call `handler`, encode the response,
+/// send a single frame, then `finish_send`.
+///
+/// This eliminates the repeated "call handler → encode → send_frame → finish_send"
+/// pattern for stat, lookup, and readdir handlers.
+async fn dispatch_simple<S, F, Fut, R>(
+    stream: &mut S,
+    response_type: u8,
+    handler: F,
+) -> anyhow::Result<()>
+where
+    S: RiftStream,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+    R: prost::Message,
+{
+    let response = handler().await;
+    stream
+        .send_frame(response_type, &response.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
     Ok(())
 }
 
@@ -459,5 +481,42 @@ mod tests {
 
         let result = handle_handshake(&mut server_stream, &ctx, hello).await;
         assert!(result.is_err(), "handshake should fail with wrong version");
+    }
+
+    // ------------------------------------------------------------------
+    // Test 5: dispatch_simple sends a single frame and finishes
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn dispatch_simple_sends_frame_and_finishes() {
+        use rift_transport::connection::InMemoryConnection;
+
+        let (_dir, share) = make_share();
+        let db: Arc<NoopCache> = Arc::new(NoopCache);
+        let handle_db = Arc::new(HandleDatabase::new());
+        // dispatch_simple doesn't use ctx directly in this unit test,
+        // since we provide a simple closure that returns a default response.
+        let _ctx = RequestContext {
+            share,
+            db,
+            handle_db,
+            chunker: Chunker::default(),
+        };
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        // Use dispatch_simple to send a minimal response
+        let result = dispatch_simple(&mut server_stream, msg::STAT_RESPONSE, || async {
+            rift_protocol::messages::StatResponse::default()
+        })
+        .await;
+        assert!(result.is_ok(), "dispatch_simple should succeed");
+
+        // Client should receive exactly one frame
+        let (type_id, _payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::STAT_RESPONSE);
+        // After finish_send, client should get Ok(None)
+        assert!(client_stream.recv_frame().await.unwrap().is_none());
     }
 }
