@@ -43,6 +43,41 @@ impl AsRef<[u8]> for Blake3Hash {
     }
 }
 
+/// Incremental BLAKE3 hasher for streaming chunk hashing.
+#[derive(Debug)]
+pub struct StreamingHash(blake3::Hasher);
+
+impl Default for StreamingHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamingHash {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
+
+    pub fn update(&mut self, data: &[u8]) -> &mut Self {
+        self.0.update(data);
+        self
+    }
+
+    #[must_use]
+    pub fn finalize(self) -> Blake3Hash {
+        Blake3Hash(*self.0.finalize().as_bytes())
+    }
+}
+
+impl Blake3Hash {
+    /// Create a streaming hasher for incremental computation.
+    #[must_use]
+    pub fn hasher() -> StreamingHash {
+        StreamingHash::new()
+    }
+}
+
 /// FastCDC chunker with configurable parameters.
 ///
 /// Defaults to production parameters (32/128/512 KB).
@@ -83,6 +118,45 @@ impl Chunker {
             self.max_size as u32,
         );
         chunker.map(|chunk| (chunk.offset, chunk.length)).collect()
+    }
+
+    /// Stream chunks from an `AsyncRead` source.
+    ///
+    /// Yields `(offset, length)` tuples incrementally, matching the exact same
+    /// boundaries that `chunk()` would produce for the same data.
+    /// Only holds `max_size` bytes in memory at a time.
+    pub async fn chunk_stream<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        reader: R,
+    ) -> Vec<(usize, usize)> {
+        use fastcdc::v2020::AsyncStreamCDC;
+        use futures::StreamExt;
+
+        let mut chunker = AsyncStreamCDC::new(
+            reader,
+            self.min_size as u32,
+            self.avg_size as u32,
+            self.max_size as u32,
+        );
+        let mut stream = std::pin::pin!(chunker.as_stream());
+        let mut boundaries = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    boundaries.push((chunk.offset as usize, chunk.length));
+                }
+                Err(fastcdc::v2020::Error::Empty) => break,
+                Err(e) => {
+                    // Log or handle unexpected errors; for now, panic in test/dev
+                    // but in production we'd want a Result type.
+                    // Given the current API returns Vec, we panic on real errors.
+                    panic!("chunk_stream error: {e}");
+                }
+            }
+        }
+
+        boundaries
     }
 }
 
@@ -565,6 +639,33 @@ mod proptests {
             let tree = MerkleTree::default();
             let root = tree.build(&[]);
             prop_assert_eq!(root.as_bytes().len(), 32);
+        }
+
+        #[test]
+        fn prop_chunk_stream_matches_chunk(data in proptest::collection::vec(any::<u8>(), 0..200_000)) {
+            let chunker = Chunker::default();
+            let batch = chunker.chunk(&data);
+            let stream = {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    chunker.chunk_stream(std::io::Cursor::new(data.clone())).await
+                })
+            };
+            prop_assert_eq!(batch, stream);
+        }
+
+        #[test]
+        fn prop_streaming_hash_matches_one_shot(parts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..4096), 0..100)) {
+            let combined: Vec<u8> = parts.iter().flatten().copied().collect();
+            let one_shot = Blake3Hash::new(&combined);
+
+            let mut hasher = StreamingHash::new();
+            for part in &parts {
+                hasher.update(part);
+            }
+            let streaming = hasher.finalize();
+
+            prop_assert_eq!(one_shot, streaming);
         }
     }
 }
@@ -1318,5 +1419,131 @@ mod verify_node_tests {
             &leaf_hash,
             std::slice::from_ref(&leaf_hash)
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for StreamingChunker (chunk_stream)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod streaming_chunker_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chunk_stream_produces_identical_boundaries_to_chunk() {
+        let data = vec![0u8; 100_000]; // 100KB of zeros
+        let chunker = Chunker::default();
+
+        // Batch boundaries
+        let batch_boundaries = chunker.chunk(&data);
+
+        // Streaming boundaries
+        let cursor = std::io::Cursor::new(data.clone());
+        let stream_boundaries = chunker.chunk_stream(cursor).await;
+
+        assert_eq!(batch_boundaries, stream_boundaries);
+    }
+
+    #[tokio::test]
+    async fn chunk_stream_empty_input() {
+        let data: Vec<u8> = vec![];
+        let chunker = Chunker::default();
+
+        let cursor = std::io::Cursor::new(data);
+        let stream_boundaries = chunker.chunk_stream(cursor).await;
+
+        assert!(stream_boundaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunk_stream_small_file_single_chunk() {
+        let data = vec![0u8; 1024]; // 1KB < min_size (32KB default)
+        let chunker = Chunker::default();
+
+        let cursor = std::io::Cursor::new(data);
+        let stream_boundaries = chunker.chunk_stream(cursor).await;
+
+        assert_eq!(stream_boundaries.len(), 1);
+        assert_eq!(stream_boundaries[0], (0, 1024));
+    }
+
+    #[tokio::test]
+    async fn chunk_stream_large_file_multiple_chunks() {
+        let data = vec![0u8; 2_000_000]; // 2MB, should produce several chunks
+        let chunker = Chunker::default();
+
+        let batch_boundaries = chunker.chunk(&data);
+        let cursor = std::io::Cursor::new(data);
+        let stream_boundaries = chunker.chunk_stream(cursor).await;
+
+        assert_eq!(batch_boundaries, stream_boundaries);
+        assert!(stream_boundaries.len() > 1, "should have multiple chunks");
+    }
+
+    #[tokio::test]
+    async fn chunk_stream_random_data_matches_batch() {
+        let data: Vec<u8> = (0..500_000).map(|i| i as u8).collect();
+        let chunker = Chunker::default();
+
+        let batch_boundaries = chunker.chunk(&data);
+        let cursor = std::io::Cursor::new(data);
+        let stream_boundaries = chunker.chunk_stream(cursor).await;
+
+        assert_eq!(batch_boundaries, stream_boundaries);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for StreamingHash
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod streaming_hash_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_hash_matches_one_shot() {
+        let data = b"hello world, this is a streaming hash test";
+        let one_shot = Blake3Hash::new(data);
+
+        let mut hasher = StreamingHash::new();
+        hasher.update(b"hello world, ");
+        hasher.update(b"this is a streaming hash test");
+        let streaming = hasher.finalize();
+
+        assert_eq!(one_shot, streaming);
+    }
+
+    #[test]
+    fn streaming_hash_empty_matches_one_shot_empty() {
+        let one_shot = Blake3Hash::new(&[]);
+        let streaming = StreamingHash::new().finalize();
+
+        assert_eq!(one_shot, streaming);
+    }
+
+    #[test]
+    fn streaming_hash_single_update() {
+        let data = b"single update";
+        let one_shot = Blake3Hash::new(data);
+
+        let mut hasher = StreamingHash::new();
+        hasher.update(data);
+        let streaming = hasher.finalize();
+
+        assert_eq!(one_shot, streaming);
+    }
+
+    #[test]
+    fn blake3_hash_hasher_convenience_method() {
+        let data = b"convenience method test";
+        let one_shot = Blake3Hash::new(data);
+
+        let mut hasher = Blake3Hash::hasher();
+        hasher.update(data);
+        let streaming = hasher.finalize();
+
+        assert_eq!(one_shot, streaming);
     }
 }

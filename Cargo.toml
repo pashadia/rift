@@ -69,7 +69,7 @@ futures = "0.3"
 
 # Hashing and CDC
 blake3 = "1"
-fastcdc = "3"
+fastcdc = { version = "3", features = ["tokio"] }
 hmac = "0.12"
 sha2 = "0.10"
 

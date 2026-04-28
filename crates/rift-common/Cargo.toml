@@ -18,6 +18,8 @@ postcard = { version = "1", features = ["alloc"] }
 libc.workspace = true
 uuid.workspace = true
 scc.workspace = true
+tokio.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
