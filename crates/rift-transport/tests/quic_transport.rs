@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Integration tests for the QUIC transport layer.
 //!
 //! Each test spins up real loopback QUIC endpoints using rcgen-generated

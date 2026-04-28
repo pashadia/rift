@@ -10,15 +10,18 @@ use fastcdc::v2020::FastCDC;
 pub struct Blake3Hash([u8; 32]);
 
 impl Blake3Hash {
+    #[must_use]
     pub fn new(data: &[u8]) -> Self {
         let hash = blake3::hash(data);
         Self(*hash.as_bytes())
     }
 
+    #[must_use]
     pub const fn from_array(arr: [u8; 32]) -> Self {
         Self(arr)
     }
 
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -62,6 +65,7 @@ impl Default for Chunker {
 }
 
 impl Chunker {
+    #[must_use]
     pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Self {
         Self {
             min_size,
@@ -70,6 +74,7 @@ impl Chunker {
         }
     }
 
+    #[must_use]
     pub fn chunk(&self, data: &[u8]) -> Vec<(usize, usize)> {
         let chunker = FastCDC::new(
             data,
@@ -127,11 +132,13 @@ impl Default for MerkleTree {
 }
 
 impl MerkleTree {
+    #[must_use]
     pub fn new(fanout: usize) -> Self {
         Self { fanout }
     }
 
     /// Build a Merkle tree from leaf hashes
+    #[must_use]
     pub fn build(&self, leaf_hashes: &[Blake3Hash]) -> Blake3Hash {
         if leaf_hashes.is_empty() {
             return Blake3Hash::new(&[]);
@@ -159,13 +166,20 @@ impl MerkleTree {
             current_level = next_level;
         }
 
-        current_level.into_iter().next().unwrap()
+        // SAFETY: current_level is never empty after the while loop
+        // because we always push at least one element to next_level in each iteration.
+
+        current_level
+            .into_iter()
+            .next()
+            .expect("current_level is never empty after the while loop")
     }
 
     /// Verify that `parent_hash` matches the hash computed from `children`.
     ///
     /// Uses the same hashing scheme as `build()`: a single child is identity
     /// (parent == child), while two or more children are BLAKE3-hashed together.
+    #[must_use]
     pub fn verify_node(parent_hash: &Blake3Hash, children: &[Blake3Hash]) -> bool {
         if children.is_empty() {
             return *parent_hash == Blake3Hash::new(&[]);
@@ -184,6 +198,7 @@ impl MerkleTree {
     /// Serialize leaf hashes into a packed byte array for storage.
     ///
     /// Each 32-byte hash is stored contiguously. No additional framing.
+    #[must_use]
     pub fn serialize_leaves(&self, leaves: &[Blake3Hash]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(leaves.len() * 32);
         for leaf in leaves {
@@ -202,7 +217,7 @@ impl MerkleTree {
 
         let mut leaves = Vec::with_capacity(bytes.len() / 32);
         for chunk in bytes.chunks_exact(32) {
-            leaves.push(Blake3Hash::from_slice(chunk).unwrap());
+            leaves.push(Blake3Hash::from_slice(chunk)?);
         }
         Ok(leaves)
     }
@@ -222,6 +237,7 @@ impl MerkleTree {
     /// nodes at higher levels are always subtrees. This avoids any ambiguity from
     /// hash-based lookup (which would theoretically misdetect an intermediate hash
     /// that collides with a leaf hash, though BLAKE3 makes this astronomically unlikely).
+    #[must_use]
     pub fn build_with_cache(
         &self,
         leaf_hashes: &[Blake3Hash],
@@ -273,7 +289,13 @@ impl MerkleTree {
             current_level = next_level;
         }
 
-        let root = current_level.into_iter().next().unwrap();
+        // SAFETY: current_level is never empty after the while loop
+        // because we always push at least one element to next_level in each iteration.
+
+        let root = current_level
+            .into_iter()
+            .next()
+            .expect("current_level is never empty after the while loop");
         (root, cache)
     }
 
@@ -283,6 +305,7 @@ impl MerkleTree {
     /// per-chunk metadata suitable for DB storage.
     /// The `chunk_boundaries` slice must be the same length as `leaf_hashes`
     /// and provide (offset, length) for each chunk.
+    #[must_use]
     pub fn build_with_cache_and_offsets(
         &self,
         leaf_hashes: &[Blake3Hash],
@@ -557,7 +580,7 @@ mod merkle_child_tests {
     #[test]
     fn merkle_child_subtree_roundtrip() {
         let hash = Blake3Hash::new(b"subtree data");
-        let child = MerkleChild::Subtree(hash.clone());
+        let child = MerkleChild::Subtree(hash);
         let encoded = postcard::to_allocvec(&child).unwrap();
         let decoded: MerkleChild = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, child);
@@ -567,7 +590,7 @@ mod merkle_child_tests {
     fn merkle_child_leaf_roundtrip() {
         let hash = Blake3Hash::new(b"leaf data");
         let child = MerkleChild::Leaf {
-            hash: hash.clone(),
+            hash,
             length: 65536,
             chunk_index: 42,
         };
@@ -578,9 +601,10 @@ mod merkle_child_tests {
 
     #[test]
     fn merkle_child_deterministic_serialization() {
-        let hash = Blake3Hash::new(b"deterministic");
-        let child1 = MerkleChild::Subtree(hash.clone());
-        let child2 = MerkleChild::Subtree(hash.clone());
+        let hash1 = Blake3Hash::new(b"deterministic");
+        let hash2 = Blake3Hash::new(b"deterministic");
+        let child1 = MerkleChild::Subtree(hash1);
+        let child2 = MerkleChild::Subtree(hash2);
         let enc1 = postcard::to_allocvec(&child1).unwrap();
         let enc2 = postcard::to_allocvec(&child2).unwrap();
         assert_eq!(enc1, enc2);
@@ -725,7 +749,7 @@ mod merkle_ext_tests {
     fn serialize_leaves_single_element() {
         let tree = MerkleTree::default();
         let leaf = Blake3Hash::new(b"test");
-        let leaves = vec![leaf.clone()];
+        let leaves = vec![leaf];
 
         let serialized = tree.serialize_leaves(&leaves);
         assert_eq!(serialized.len(), 32);

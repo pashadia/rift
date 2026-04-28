@@ -79,6 +79,7 @@ pub struct TofuStore {
 }
 
 impl TofuStore {
+    #[must_use]
     pub fn new(known: HashMap<String, String>) -> Self {
         Self {
             known,
@@ -111,6 +112,7 @@ impl TofuPolicy {
     }
 
     /// Returns a clone of the `Arc` so the caller can observe and persist state.
+    #[must_use]
     pub fn store(&self) -> Arc<Mutex<TofuStore>> {
         Arc::clone(&self.store)
     }
@@ -118,7 +120,10 @@ impl TofuPolicy {
 
 impl FingerprintPolicy for TofuPolicy {
     fn check(&self, fingerprint: &str) -> Result<(), CertError> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| CertError::Malformed("store lock poisoned".into()))?;
         match store.known.get(&self.host) {
             None => {
                 // First contact: pin the fingerprint.

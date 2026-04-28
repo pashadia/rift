@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! End-to-end FUSE tests that use a real server.
 
 #![cfg(all(target_os = "linux", feature = "fuse"))]

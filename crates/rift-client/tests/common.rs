@@ -1,6 +1,8 @@
+#![allow(clippy::unwrap_used)]
 //! Common test helpers for integration tests that need a real server.
 
 #![allow(dead_code)] // This is a library of test helpers
+#![allow(clippy::must_use_candidate)]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

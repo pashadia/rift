@@ -53,7 +53,9 @@ impl ChunkStore {
             // Proceed with rewrite (size mismatch is suspicious).
         }
 
-        let parent = path.parent().expect("hash path always has a parent");
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hash path has no parent"))?;
 
         // Create shard directories if needed
         tokio::fs::create_dir_all(parent).await?;

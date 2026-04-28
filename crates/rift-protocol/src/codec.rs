@@ -64,8 +64,8 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Vec<u8>)>, Codec
     }
 
     // We have a complete frame — now consume from the real buffer.
-    decode_varint(buf)?.unwrap(); // type_id
-    decode_varint(buf)?.unwrap(); // length
+    decode_varint(buf)?.ok_or(CodecError::InvalidVarint)?; // type_id
+    decode_varint(buf)?.ok_or(CodecError::InvalidVarint)?; // length
     let payload = buf.split_to(length).to_vec();
 
     Ok(Some((type_id as u8, payload)))

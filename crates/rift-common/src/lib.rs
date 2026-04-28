@@ -11,4 +11,5 @@ pub mod types;
 pub use error::{FsError, RiftError};
 
 #[cfg(test)]
+#[cfg(test)]
 pub mod test_utils;

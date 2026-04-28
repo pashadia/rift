@@ -17,6 +17,7 @@ impl<K> BidirectionalMap<K>
 where
     K: Eq + Hash + Clone,
 {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handle_to_key: Arc::new(HashIndex::new()),
@@ -24,6 +25,7 @@ where
         }
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             handle_to_key: Arc::new(HashIndex::with_capacity(capacity)),
@@ -58,6 +60,7 @@ where
         Ok(())
     }
 
+    #[must_use]
     pub fn get_by_handle(&self, handle: &Uuid) -> Option<K> {
         self.handle_to_key.peek_with(handle, |_, v| v.clone())
     }
@@ -73,6 +76,7 @@ where
         Some(key)
     }
 
+    #[must_use]
     pub fn remove(&self, handle: &Uuid) -> Option<K> {
         let key = self.handle_to_key.peek_with(handle, |_, v| v.clone())?;
         let _ = self.handle_to_key.remove_sync(handle);
@@ -80,10 +84,12 @@ where
         Some(key)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.handle_to_key.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.handle_to_key.is_empty()
     }
@@ -227,7 +233,7 @@ mod tests {
         let handle = Uuid::now_v7();
         map.insert(handle, "file.txt".to_string()).unwrap();
         assert!(!map.is_empty());
-        map.remove(&handle);
+        let _ = map.remove(&handle);
         assert!(map.is_empty());
     }
 

@@ -91,6 +91,7 @@ impl InMemoryConnection {
     ///
     /// The client's `peer_fingerprint()` returns `"test-server-fingerprint"`;
     /// the server's returns `"test-client-fingerprint"`.
+    #[must_use]
     pub fn pair() -> (Self, Self) {
         Self::pair_with_fingerprints("test-server-fingerprint", "test-client-fingerprint")
     }
@@ -99,6 +100,7 @@ impl InMemoryConnection {
     ///
     /// `server_fingerprint` — what the client's `peer_fingerprint()` returns.
     /// `client_fingerprint` — what the server's `peer_fingerprint()` returns.
+    #[must_use]
     pub fn pair_with_fingerprints(
         server_fingerprint: &str,
         client_fingerprint: &str,
@@ -244,7 +246,10 @@ impl<C: RiftConnection> RecordingConnection<C> {
 
     /// Access the recorded frames.
     pub fn recorded_frames(&self) -> Vec<FrameRecord> {
-        self.frames_sent.lock().unwrap().clone()
+        self.frames_sent
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Number of times `open_stream` was called.
@@ -298,10 +303,13 @@ impl<S: RiftStream> RecordingStream<S> {
 #[async_trait]
 impl<S: RiftStream> RiftStream for RecordingStream<S> {
     async fn send_frame(&mut self, type_id: u8, payload: &[u8]) -> Result<(), TransportError> {
-        self.frames_sent.lock().unwrap().push(FrameRecord {
-            type_id,
-            payload: payload.to_vec(),
-        });
+        self.frames_sent
+            .lock()
+            .map_err(|_| TransportError::ConnectionClosed)?
+            .push(FrameRecord {
+                type_id,
+                payload: payload.to_vec(),
+            });
         self.inner.send_frame(type_id, payload).await
     }
 

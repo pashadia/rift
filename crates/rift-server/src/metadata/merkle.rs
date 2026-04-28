@@ -47,8 +47,7 @@ impl Database {
             .modified()
             .map(|t| {
                 t.duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
+                    .map_or(0, |d| d.as_nanos() as u64)
             })
             .unwrap_or(0);
 
@@ -128,8 +127,7 @@ impl Database {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map_or(0, |d| d.as_secs()) as i64;
 
         let merkle = MerkleTree::default();
         let serialized_leaves = merkle.serialize_leaves(leaf_hashes);
@@ -232,8 +230,7 @@ impl Database {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
+                    .map_or(0, |d| d.as_secs()) as i64;
 
                 tx.execute(
                     "INSERT OR REPLACE INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -489,23 +486,13 @@ mod tests {
     #[cfg(unix)]
     async fn get_merkle_handles_pre_epoch_mtime() {
         // Pre-epoch mtime caused panic on unwrap()
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("pre_epoch.txt");
         fs::write(&file_path, b"test content").unwrap();
 
-        // Set mtime before Unix epoch (1969-12-31)
-        let path_c = CString::new(file_path.as_os_str().as_bytes()).unwrap();
-        let times = libc::timespec {
-            tv_sec: -86400, // one day before epoch
-            tv_nsec: 0,
-        };
-        let times_arr = [times, times]; // atime, mtime
-        let ret =
-            unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times_arr.as_ptr(), 0) };
-        assert_eq!(ret, 0, "utimensat failed");
+        // Set mtime before Unix epoch (1969-12-31) using safe std::fs API
+        let pre_epoch = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(86400);
+        filetime::set_file_mtime(&file_path, pre_epoch.into()).unwrap();
 
         // Should not panic - function must complete without panic
         let db = Database::open_in_memory().await.unwrap();

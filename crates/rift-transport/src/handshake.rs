@@ -190,13 +190,15 @@ mod tests {
 
     /// Sending a well-formed RiftHello should be decoded correctly by recv_hello.
     #[tokio::test]
+
     async fn recv_hello_with_valid_hello_returns_correct_fields() {
         let (client, server) = InMemoryConnection::pair();
 
         let server_task = tokio::spawn(async move {
             let mut s = server.accept_stream().await.unwrap();
-            let result = recv_hello(&mut s).await;
-            let hello = result.expect("recv_hello should succeed with valid RiftHello");
+            let hello = recv_hello(&mut s)
+                .await
+                .expect("recv_hello with valid RiftHello");
             assert_eq!(hello.share_name, "test", "share_name mismatch");
             assert_eq!(hello.protocol_version, 1, "protocol_version mismatch");
             assert!(

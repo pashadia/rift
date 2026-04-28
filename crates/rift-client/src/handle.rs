@@ -28,6 +28,7 @@ impl Default for HandleMap {
 
 impl HandleMap {
     /// Create an empty map.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             path_to_uuid: TreeIndex::new(),
@@ -91,6 +92,7 @@ pub struct HandleCache {
 }
 
 impl HandleCache {
+    #[must_use]
     pub fn new(root: Uuid) -> Self {
         let cache = Self {
             map: HandleMap::new(),

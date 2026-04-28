@@ -35,6 +35,7 @@ impl<M: MerkleCache> RequestContext<M> {
     ///
     /// This is a convenience accessor that replaces the previous
     /// `db.as_ref()` calls at handler call sites.
+    #[must_use]
     pub fn db(&self) -> &M {
         self.db.as_ref()
     }

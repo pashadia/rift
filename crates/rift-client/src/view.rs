@@ -106,6 +106,7 @@ impl<R: RemoteShare> RiftShareView<R> {
     /// Enable no-cache mode: every read bypasses the local cache and fetches
     /// fresh data from the server. Cached data is also not written back.
     /// Intended for debugging data-integrity issues, NOT for production.
+    #[must_use]
     pub fn with_no_cache(mut self) -> Self {
         self.no_cache = true;
         self
@@ -317,11 +318,8 @@ fn build_dir_entry(
     };
     let symlink_target = (entry.file_type == FileType::Symlink as i32)
         .then(|| {
-            if !attrs.symlink_target.is_empty() {
-                Some(String::from_utf8_lossy(&attrs.symlink_target).into_owned())
-            } else {
-                None
-            }
+            (!attrs.symlink_target.is_empty())
+                .then(|| String::from_utf8_lossy(&attrs.symlink_target).into_owned())
         })
         .flatten();
     (
@@ -668,6 +666,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         }
     }
 
+    #[allow(clippy::cognitive_complexity)] // TODO: refactor into smaller functions
     async fn try_cached_read(
         &self,
         handle: &Uuid,
@@ -762,6 +761,7 @@ impl<R: RemoteShare> RiftShareView<R> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::too_many_lines)]
     use super::*;
     use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
     use async_trait::async_trait;
@@ -933,6 +933,7 @@ mod tests {
     /// Build self-consistent mock chunks from raw data vecs.
     /// Returns (chunk_hashes, root_hash, chunk_data_vec).
     /// Each chunk's hash = blake3(data), root = MerkleTree::build(hashes).
+    #[allow(clippy::similar_names)] // chunks_data and chunk_data are intentionally similar
     fn build_mock_chunks(chunks_data: Vec<Vec<u8>>) -> (Vec<[u8; 32]>, [u8; 32], Vec<ChunkData>) {
         use rift_common::crypto::MerkleTree;
         let chunk_hashes: Vec<[u8; 32]> = chunks_data.iter().map(|d| blake3_of(d)).collect();
@@ -3858,7 +3859,7 @@ mod tests {
             index: 0,
             length: data.len() as u64,
             hash,
-            data: data.clone(),
+            data,
         }];
         // Use the actual merkle root derived from the root hash
         let merkle_root = root_hash.as_bytes().to_vec();
@@ -3874,7 +3875,7 @@ mod tests {
             index: 0,
             length: data.len() as u64,
             hash: bad_hash,
-            data: data.clone(),
+            data,
         }];
         let merkle_root = root_hash.as_bytes().to_vec();
         assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
@@ -3889,7 +3890,7 @@ mod tests {
             index: 0,
             length: 9999, // wrong length
             hash,
-            data: data.clone(),
+            data,
         }];
         let merkle_root = root_hash.as_bytes().to_vec();
         assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
@@ -3905,7 +3906,7 @@ mod tests {
             index: 0,
             length: data.len() as u64,
             hash,
-            data: data.clone(),
+            data,
         }];
         // merkle_root doesn't match root_hash
         let merkle_root = wrong_root.as_bytes().to_vec();
@@ -3943,6 +3944,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)] // chunk0 and chunks are intentionally similar
     fn assemble_byte_range_across_two_chunks() {
         let chunk0 = vec![0u8; 64];
         let chunk1 = vec![1u8; 64];
@@ -3978,7 +3980,7 @@ mod tests {
             index: 5,
             length: 100,
             hash,
-            data: data.clone(),
+            data,
         }];
         let starts = vec![0u64, 100];
         assert!(assemble_byte_range(chunks, 0, &starts, 0, 100).is_err());

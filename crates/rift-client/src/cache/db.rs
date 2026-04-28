@@ -145,7 +145,9 @@ impl FileCache {
     pub async fn put_root_hash(&self, handle: &Uuid, root_hash: &Blake3Hash) -> SqliteResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| {
+                rusqlite::Error::InvalidParameterName(format!("system time error: {}", e))
+            })?
             .as_secs() as i64;
 
         let handle_str = handle.to_string();
@@ -191,7 +193,9 @@ impl FileCache {
     pub async fn put_manifest(&self, handle: &Uuid, manifest: &Manifest) -> SqliteResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| {
+                rusqlite::Error::InvalidParameterName(format!("system time error: {}", e))
+            })?
             .as_secs() as i64;
 
         let handle_str = handle.to_string();
@@ -311,13 +315,15 @@ impl FileCache {
 
     /// Store chunk data keyed by its hash.
     ///
-    /// Delegates to `ChunkStore::write_chunk`. Panics if the cache was
+    /// Delegates to `ChunkStore::write_chunk`. Returns an error if the cache was
     /// opened in-memory (no chunk storage available).
     pub async fn put_chunk(&self, hash: &[u8; 32], data: &[u8]) -> SqliteResult<()> {
-        let store = self
-            .chunk_store
-            .as_ref()
-            .expect("put_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()");
+        let store = self.chunk_store.as_ref().ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(
+                "put_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()"
+                    .to_string(),
+            )
+        })?;
         store.write_chunk(hash, data).await.map_err(|e| {
             rusqlite::Error::InvalidParameterName(format!("chunk I/O error: {}", e))
         })?;
@@ -326,13 +332,15 @@ impl FileCache {
 
     /// Get chunk data by its hash.
     ///
-    /// Delegates to `ChunkStore::read_chunk`. Panics if the cache was
+    /// Delegates to `ChunkStore::read_chunk`. Returns an error if the cache was
     /// opened in-memory (no chunk storage available).
     pub async fn get_chunk(&self, hash: &[u8; 32]) -> SqliteResult<Option<Vec<u8>>> {
-        let store = self
-            .chunk_store
-            .as_ref()
-            .expect("get_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()");
+        let store = self.chunk_store.as_ref().ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(
+                "get_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()"
+                    .to_string(),
+            )
+        })?;
         Ok(store.read_chunk(hash).await.map_err(|e| {
             rusqlite::Error::InvalidParameterName(format!("chunk I/O error: {}", e))
         })?)
@@ -343,6 +351,7 @@ impl FileCache {
     /// Reads only the chunk files needed for the requested range.
     /// Returns the assembled bytes, or `Err` listing missing/corrupted chunk hashes.
     /// Panics if the cache was opened in-memory (no chunk storage available).
+    #[allow(clippy::cognitive_complexity)] // TODO: refactor into smaller functions
     pub async fn reconstruct_range(
         &self,
         chunks: &[ChunkInfo],

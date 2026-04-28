@@ -6,10 +6,12 @@ pub struct ClientPaths {
 }
 
 impl ClientPaths {
+    #[must_use]
     pub fn new(base: PathBuf) -> Self {
         Self { base }
     }
 
+    #[must_use]
     pub fn default_paths() -> Self {
         let base = dirs::state_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -17,6 +19,7 @@ impl ClientPaths {
         Self { base }
     }
 
+    #[must_use]
     pub fn with_override(state_dir: Option<PathBuf>) -> Self {
         match state_dir {
             Some(dir) => Self::new(dir),
@@ -24,26 +27,32 @@ impl ClientPaths {
         }
     }
 
+    #[must_use]
     pub fn base_dir(&self) -> &PathBuf {
         &self.base
     }
 
+    #[must_use]
     pub fn cert_path(&self) -> PathBuf {
         self.base.join("client.cert")
     }
 
+    #[must_use]
     pub fn key_path(&self) -> PathBuf {
         self.base.join("client.key")
     }
 
+    #[must_use]
     pub fn known_servers_path(&self) -> PathBuf {
         self.base.join("known-servers.toml")
     }
 
+    #[must_use]
     pub fn cache_dir(&self) -> PathBuf {
         self.base.join("cache")
     }
 
+    #[must_use]
     pub fn sync_dir(&self) -> PathBuf {
         self.base.join("sync")
     }

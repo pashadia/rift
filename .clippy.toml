@@ -1,17 +1,16 @@
 # Clippy configuration file
 # https://doc.rust-lang.org/clippy/configuration.html
 
-too-many-lines-threshold = 150
 too-many-arguments-threshold = 7
 cognitive-complexity-threshold = 30
 type-complexity-threshold = 5000
 
-# Don't complain about unwrap/dbg/print in test code
+# Don't complain about unwrap/expect in test code
 allow-unwrap-in-tests = true
 allow-dbg-in-tests = true
 allow-print-in-tests = true
 
-# Recognized identifiers in doc comments (won't trigger doc_valid_idents)
+# Recognized identifiers in doc comments
 doc-valid-idents = [
     "Beefy",
     "CDC",

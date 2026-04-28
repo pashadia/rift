@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Tests for `RiftClient`.
 //!
 //! All tests spin up a real server (from `rift_server`) on a loopback QUIC

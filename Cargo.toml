@@ -21,6 +21,34 @@ license = "MIT OR Apache-2.0"
 authors = ["Rift Contributors"]
 repository = "https://github.com/yourusername/rift"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Correctness & bug prevention
+unwrap_used = "deny"
+expect_used = "allow"
+
+# Complexity & readability
+too_many_lines = "warn"
+excessive_nesting = "warn"
+cognitive_complexity = "warn"
+similar_names = "warn"
+fn_params_excessive_bools = "warn"
+
+# API design & idioms
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+semicolon_if_nothing_returned = "warn"
+
+# Error handling
+question_mark = "warn"
+if_then_some_else_none = "warn"
+
+# Performance
+clone_on_copy = "deny"
+redundant_clone = "warn"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

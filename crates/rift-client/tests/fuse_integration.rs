@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! FUSE integration tests for the rift-client.
 #![cfg(all(target_os = "linux", feature = "fuse"))]
 

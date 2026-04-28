@@ -205,8 +205,11 @@ pub fn server_endpoint(
 
 /// Build a QUIC client endpoint that presents a mTLS client certificate.
 pub fn client_endpoint(cert_der: &[u8], key_der: &[u8]) -> Result<ClientEndpoint, TransportError> {
+    let addr: std::net::SocketAddr = "0.0.0.0:0"
+        .parse()
+        .expect("hardcoded socket address must parse");
     Ok(ClientEndpoint {
-        inner: quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?,
+        inner: quinn::Endpoint::client(addr)?,
         cert_der: Some(cert_der.to_vec()),
         key_der: Some(key_der.to_vec()),
     })
@@ -217,8 +220,11 @@ pub fn client_endpoint(cert_der: &[u8], key_der: &[u8]) -> Result<ClientEndpoint
 /// This endpoint will be rejected by Rift servers (which require mTLS).
 /// Provided for testing the mTLS rejection path.
 pub fn client_endpoint_no_cert() -> Result<ClientEndpoint, TransportError> {
+    let addr: std::net::SocketAddr = "0.0.0.0:0"
+        .parse()
+        .expect("hardcoded socket address must parse");
     Ok(ClientEndpoint {
-        inner: quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?,
+        inner: quinn::Endpoint::client(addr)?,
         cert_der: None,
         key_der: None,
     })
@@ -294,12 +300,13 @@ mod tests {
 
     use super::*;
 
-    fn gen_cert(cn: &str) -> (Vec<u8>, Vec<u8>) {
-        let cert = rcgen::generate_simple_self_signed(vec![cn.to_string()])
-            .expect("rcgen cert generation failed");
+    fn gen_cert(cn: &str) -> Result<(Vec<u8>, Vec<u8>), TransportError> {
+        let cert = rcgen::generate_simple_self_signed(vec![cn.to_string()]).map_err(|e| {
+            TransportError::Cert(CertError::Malformed(format!("rcgen failed: {e}")))
+        })?;
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.key_pair.serialize_der();
-        (cert_der, key_der)
+        Ok((cert_der, key_der))
     }
 
     // Quinn endpoint construction requires a tokio runtime to be active even
@@ -308,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_endpoint_with_valid_cert_returns_ok() {
-        let (cert, key) = gen_cert("test-server");
+        let (cert, key) = gen_cert("test-server").unwrap();
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let result = server_endpoint(addr, &cert, &key);
         assert!(
@@ -320,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_endpoint_with_valid_cert_returns_ok() {
-        let (cert, key) = gen_cert("test-client");
+        let (cert, key) = gen_cert("test-client").unwrap();
         let result = client_endpoint(&cert, &key);
         assert!(
             result.is_ok(),

@@ -81,6 +81,7 @@ pub enum FsError {
 
 impl FsError {
     /// Map to a POSIX errno value for use in FUSE reply callbacks.
+    #[must_use]
     pub fn to_errno(&self) -> libc::c_int {
         match self {
             Self::NotFound => libc::ENOENT,

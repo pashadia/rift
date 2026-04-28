@@ -1,5 +1,7 @@
 //! Generated protobuf types and message type ID constants.
 
+#![allow(clippy::must_use_candidate)]
+
 // Include prost-generated code (produced by build.rs from proto/ files).
 include!(concat!(env!("OUT_DIR"), "/rift.rs"));
 

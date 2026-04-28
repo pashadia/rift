@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Integration tests for stat_batch operation.
 //!
 //! These tests verify:

@@ -59,7 +59,10 @@ impl TofuState {
 
     fn save_if_dirty(&self) -> Result<()> {
         let snapshot = {
-            let store = self.store.lock().unwrap();
+            let store = self
+                .store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("mutex poisoned: {}", e))?;
             if !store.dirty {
                 return Ok(());
             }
@@ -132,7 +135,10 @@ impl RiftClient<QuicConnection> {
 
         let conn = if let Some(ref tofu) = self.tofu_state {
             let known = {
-                let store = tofu.store.lock().unwrap();
+                let store = tofu
+                    .store
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("mutex poisoned: {}", e))?;
                 store.known.clone()
             };
             let policy = TofuPolicy::new(format!("{}", self.addr), known);
@@ -142,8 +148,13 @@ impl RiftClient<QuicConnection> {
                 .map_err(|e| anyhow::anyhow!("QUIC reconnect to {}: {e}", self.addr))?;
 
             {
-                let mut original = tofu.store.lock().unwrap();
-                let updated = store_arc.lock().unwrap();
+                let mut original = tofu
+                    .store
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("mutex poisoned: {}", e))?;
+                let updated = store_arc
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("mutex poisoned: {}", e))?;
                 original.known = updated.known.clone();
                 if updated.dirty {
                     original.dirty = true;
@@ -407,7 +418,7 @@ impl<C: RiftConnection> RiftClient<C> {
         Self {
             conn,
             root_handle,
-            addr: "127.0.0.1:0".parse().unwrap(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             share_name: String::new(),
             cert: Vec::new(),
             key: Vec::new(),

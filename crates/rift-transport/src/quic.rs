@@ -45,7 +45,9 @@ impl RiftListener for QuicListener {
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {
-        self.endpoint.local_addr().unwrap()
+        self.endpoint
+            .local_addr()
+            .expect("endpoint has a local address")
     }
 }
 

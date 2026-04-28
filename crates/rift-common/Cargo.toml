@@ -23,3 +23,6 @@ scc.workspace = true
 tempfile = "3"
 proptest.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

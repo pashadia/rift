@@ -6,6 +6,7 @@ use rift_protocol::messages::{FileAttrs, FileType};
 /// The `root_hash` is always 32 bytes (blake3). For directories and symlinks,
 /// a constant hash is used since they don't have content.
 /// This is used by the delta sync protocol to identify file versions.
+#[must_use]
 pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs {
     build_attrs_with_symlink_target(meta, root_hash, vec![])
 }
@@ -15,6 +16,7 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
 ///
 /// When the entry is a symlink, `symlink_target` should contain the link target
 /// as raw bytes; for all other file types it should be empty bytes.
+#[must_use]
 pub fn build_attrs_with_symlink_target(
     meta: &std::fs::Metadata,
     root_hash: Blake3Hash,

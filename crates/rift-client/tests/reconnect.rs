@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Integration tests for [`ReconnectingClient`].
 //!
 //! These tests require a real server (from `rift_server`) running on a loopback

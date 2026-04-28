@@ -7,6 +7,7 @@
 /// Compute the BLAKE3 fingerprint of a certificate's raw DER bytes.
 ///
 /// Returns a 64-character lowercase hex string (32 bytes × 2 hex digits).
+#[must_use]
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {
     blake3::hash(cert_der).to_hex().to_string()
 }

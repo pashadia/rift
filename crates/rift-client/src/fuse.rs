@@ -15,6 +15,7 @@ use tracing::instrument;
 const TTL: Duration = Duration::from_secs(1);
 
 /// Convert a proto [`FileAttrs`] to a `fuse3::path::reply::FileAttr`.
+#[must_use]
 pub fn proto_to_fuse3_attr(attrs: &FileAttrs) -> FileAttr {
     let kind = match ProtoFileType::try_from(attrs.file_type) {
         Ok(ProtoFileType::Directory) => Fuse3FileType::Directory,
@@ -66,7 +67,9 @@ impl<V: ShareView> RiftFilesystem<V> {
 impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     #[instrument(skip(self), level = "debug")]
     async fn init(&self, _req: Request) -> Fuse3Result<ReplyInit> {
-        Ok(ReplyInit::new(NonZeroU32::new(16 * 1024 * 1024).unwrap()))
+        Ok(ReplyInit::new(
+            NonZeroU32::new(16 * 1024 * 1024).expect("16 MB is always non-zero"),
+        ))
     }
 
     #[instrument(skip(self), level = "debug")]

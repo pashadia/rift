@@ -31,6 +31,7 @@ pub struct ReconnectingClient {
 }
 
 impl ReconnectingClient {
+    #[must_use]
     pub fn new(client: RiftClient<rift_transport::QuicConnection>) -> Self {
         Self {
             client: Arc::new(Mutex::new(client)),

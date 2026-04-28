@@ -67,9 +67,10 @@ impl InMemoryListener {
     ///   (what `client_conn.peer_fingerprint()` returns).
     /// `client_fingerprint` — the fingerprint clients present to the server
     ///   (what `server_conn.peer_fingerprint()` returns).
+    #[must_use]
     pub fn new(server_fingerprint: &str, client_fingerprint: &str) -> (Self, InMemoryConnector) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let addr = "127.0.0.1:0".parse().unwrap();
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
 
         let listener = Self {
             rx: tokio::sync::Mutex::new(rx),

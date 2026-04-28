@@ -1,5 +1,7 @@
 //! Test utilities for creating temporary directories and test data
 
+#![allow(clippy::must_use_candidate)]
+
 use std::path::PathBuf;
 use tempfile::TempDir;
 

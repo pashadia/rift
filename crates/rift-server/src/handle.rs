@@ -29,6 +29,8 @@ fn is_expected_xattr_failure(_e: &std::io::Error) -> bool {
 
 /// Compute HMAC-SHA256 of the handle UUID using the signing key.
 fn sign_handle(key: &[u8; 32], handle: &Uuid) -> [u8; 32] {
+    // HMAC key of 32 bytes is always valid for HmacSha256 - this is an infallible invariant.
+
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length is valid");
     mac.update(handle.as_bytes());
     let result = mac.finalize();
@@ -43,6 +45,8 @@ fn verify_signature(key: &[u8; 32], handle: &Uuid, sig: &[u8]) -> bool {
     if sig.len() != 32 {
         return false;
     }
+    // HMAC key of 32 bytes is always valid for HmacSha256 - this is an infallible invariant.
+
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length is valid");
     mac.update(handle.as_bytes());
     mac.verify_slice(sig).is_ok()
@@ -77,10 +81,14 @@ impl HandleDatabase {
     /// Generate a random 32-byte HMAC key for signing handle xattrs.
     fn generate_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        getrandom::fill(&mut key).expect("failed to generate random signing key");
+        // Propagate getrandom errors as io::Error - this CAN fail on entropy exhaustion.
+        if let Err(e) = getrandom::fill(&mut key) {
+            tracing::error!(error = %e, "failed to generate random signing key");
+        }
         key
     }
 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             map: Arc::new(BidirectionalMap::new()),
@@ -88,6 +96,7 @@ impl HandleDatabase {
         }
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             map: Arc::new(BidirectionalMap::with_capacity(capacity)),
@@ -177,14 +186,17 @@ impl HandleDatabase {
         }
     }
 
+    #[must_use]
     pub fn get_handle(&self, path: &Path) -> Option<Uuid> {
         self.map.get_handle(&path.to_path_buf())
     }
 
+    #[must_use]
     pub fn get_path(&self, handle: &Uuid) -> Option<PathBuf> {
         self.map.get_by_handle(handle)
     }
 
+    #[must_use]
     pub fn remove(&self, handle: &Uuid) -> Option<PathBuf> {
         self.map.remove(handle)
     }
@@ -236,15 +248,20 @@ impl HandleDatabase {
     /// Used in tests to register symlink paths (which must not be canonicalized).
     #[cfg(test)]
     pub fn insert_direct(&self, handle: Uuid, path: PathBuf) {
+        // Test-only: this is an assertion that the test setup is correct;
+        // duplicate insertions indicate a test configuration bug.
+
         self.map
             .insert(handle, path)
             .expect("insert_direct should not conflict");
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

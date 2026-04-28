@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 /// On Unix: `~/.config/rift/server.{cert,key}`
 /// On Windows: `%APPDATA%/rift/server.{cert,key}`
 /// Fallback: `./rift/server.{cert,key}` if no config dir available
+#[must_use]
 pub fn default_cert_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     let base = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -283,8 +284,7 @@ mod tests {
             get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone())).unwrap();
 
         // Create second time
-        let (cert2, key2) =
-            get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone())).unwrap();
+        let (cert2, key2) = get_or_create_cert(Some(cert_path), Some(key_path)).unwrap();
 
         assert_eq!(cert1, cert2);
         assert_eq!(key1, key2);
