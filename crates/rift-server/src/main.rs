@@ -105,8 +105,15 @@ async fn main() -> Result<()> {
 
     let share_path = server_config.shares[0].path.clone();
 
+    let ctx = rift_server::server::RequestContext {
+        share: share_path,
+        db,
+        handle_db,
+        chunker: server_config.chunker,
+    };
+
     tokio::select! {
-        result = rift_server::server::accept_loop(listener, share_path, db, handle_db, server_config.chunker) => result,
+        result = rift_server::server::accept_loop(listener, ctx) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("\nShutting down.");
             Ok(())

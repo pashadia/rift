@@ -74,9 +74,13 @@ mod helpers {
         let addr = listener.local_addr();
         let db: Arc<rift_server::handler::NoopCache> = Arc::new(rift_server::handler::NoopCache);
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
-        tokio::spawn(rift_server::server::accept_loop(
-            listener, share, db, handle_db, chunker,
-        ));
+        let ctx = rift_server::server::RequestContext {
+            share,
+            db,
+            handle_db,
+            chunker,
+        };
+        tokio::spawn(rift_server::server::accept_loop(listener, ctx));
         addr
     }
 
@@ -2112,13 +2116,13 @@ mod helpers_with_db {
             .expect("server_endpoint failed");
         let addr = listener.local_addr();
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
-        tokio::spawn(rift_server::server::accept_loop(
-            listener,
+        let ctx = rift_server::server::RequestContext {
             share,
             db,
             handle_db,
-            TEST_CHUNKER,
-        ));
+            chunker: TEST_CHUNKER,
+        };
+        tokio::spawn(rift_server::server::accept_loop(listener, ctx));
         addr
     }
 
