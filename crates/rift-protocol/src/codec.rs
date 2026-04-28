@@ -5,7 +5,7 @@
 //! The type byte tells the receiver which protobuf message to decode (or that
 //! the payload is raw bytes for BLOCK_DATA frames at 0xF0+).
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 use thiserror::Error;
 
@@ -41,7 +41,7 @@ pub fn encode_message(type_id: u8, payload: &[u8], buf: &mut BytesMut) -> Result
 ///
 /// Returns `Ok(Some((type_id, payload)))` when a complete frame is available,
 /// `Ok(None)` when more data is needed, or an error on malformed input.
-pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Vec<u8>)>, CodecError> {
+pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Bytes)>, CodecError> {
     // Peek at the buffer without consuming to check if we have enough data.
     let mut peek = &buf[..];
 
@@ -66,7 +66,7 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Vec<u8>)>, Codec
     // We have a complete frame — now consume from the real buffer.
     decode_varint(buf)?.ok_or(CodecError::InvalidVarint)?; // type_id
     decode_varint(buf)?.ok_or(CodecError::InvalidVarint)?; // length
-    let payload = buf.split_to(length).to_vec();
+    let payload = buf.split_to(length).freeze();
 
     Ok(Some((type_id as u8, payload)))
 }
@@ -125,6 +125,7 @@ fn decode_varint(buf: &mut BytesMut) -> Result<Option<u64>, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn test_encode_decode_message() {
@@ -132,7 +133,7 @@ mod tests {
         encode_message(0x01, b"hello world", &mut buf).unwrap();
         let (type_id, payload) = decode_message(&mut buf).unwrap().unwrap();
         assert_eq!(type_id, 0x01);
-        assert_eq!(payload, b"hello world");
+        assert_eq!(&payload[..], b"hello world");
         assert!(buf.is_empty());
     }
 
@@ -142,7 +143,7 @@ mod tests {
         encode_message(0x02, b"", &mut buf).unwrap();
         let (type_id, payload) = decode_message(&mut buf).unwrap().unwrap();
         assert_eq!(type_id, 0x02);
-        assert_eq!(payload, b"");
+        assert_eq!(&payload[..], b"");
     }
 
     #[test]
@@ -222,9 +223,9 @@ mod tests {
         let (t2, p2) = decode_message(&mut buf).unwrap().unwrap();
         let (t3, p3) = decode_message(&mut buf).unwrap().unwrap();
 
-        assert_eq!((t1, p1.as_slice()), (0x01, b"first" as &[u8]));
-        assert_eq!((t2, p2.as_slice()), (0x30, b"second" as &[u8]));
-        assert_eq!((t3, p3.as_slice()), (0xF0, b"third" as &[u8]));
+        assert_eq!((t1, &p1[..]), (0x01, b"first" as &[u8]));
+        assert_eq!((t2, &p2[..]), (0x30, b"second" as &[u8]));
+        assert_eq!((t3, &p3[..]), (0xF0, b"third" as &[u8]));
         assert!(buf.is_empty());
     }
 
@@ -292,11 +293,22 @@ mod tests {
         encode_message(0x01, b"hi", &mut buf).unwrap();
         assert_eq!(&buf[..], &[0x01, 0x02, b'h', b'i']);
     }
+
+    #[test]
+    fn test_decode_message_returns_bytes_not_vec() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"hello", &mut buf).unwrap();
+        let result = decode_message(&mut buf).unwrap().unwrap();
+        // Verify the payload is Bytes (zero-copy from buffer)
+        let (_type_id, payload): (u8, Bytes) = result;
+        assert_eq!(&payload[..], b"hello");
+    }
 }
 
 #[cfg(test)]
 mod proptests {
     use super::*;
+    use bytes::Bytes;
     use proptest::prelude::*;
 
     proptest! {
@@ -309,7 +321,7 @@ mod proptests {
             let (decoded_type, decoded_payload) = decode_message(&mut buf).unwrap().unwrap();
 
             prop_assert_eq!(decoded_type, type_id);
-            prop_assert_eq!(decoded_payload, payload);
+            prop_assert_eq!(&decoded_payload[..], &payload[..]);
         }
 
         #[test]
@@ -328,7 +340,7 @@ mod proptests {
                 decoded.push(frame);
             }
 
-            let expected: Vec<(u8, Vec<u8>)> = messages;
+            let expected: Vec<(u8, Bytes)> = messages.into_iter().map(|(t, p)| (t, Bytes::from(p))).collect();
             prop_assert_eq!(decoded, expected);
         }
     }

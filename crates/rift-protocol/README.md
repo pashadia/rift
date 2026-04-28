@@ -28,11 +28,13 @@ use bytes::BytesMut;
 let mut buf = BytesMut::new();
 
 // Encode a message
-encode_message(b"hello", &mut buf)?;
+encode_message(0x01, b"hello", &mut buf)?;
 
 // Decode a message
-let msg = decode_message(&mut buf)?.unwrap();
-assert_eq!(msg, b"hello");
+if let Some((type_id, payload)) = decode_message(&mut buf)? {
+    assert_eq!(type_id, 0x01);
+    assert_eq!(&payload[..], b"hello");
+}
 ```
 
 **Features:**
