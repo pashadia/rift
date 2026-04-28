@@ -233,15 +233,13 @@ where
         // ------------------------------------------------------------------
         other => {
             debug!("unknown message type 0x{other:02X}");
-            let error = ErrorDetail {
-                code: ErrorCode::ErrorUnsupported as i32,
-                message: format!("unknown message type 0x{other:02X}"),
-                metadata: None,
-            };
-            let _ = stream
-                .send_frame(msg::ERROR_RESPONSE, &error.encode_to_vec())
-                .await;
-            let _ = stream.finish_send().await;
+            // Best-effort: don't fail the stream if error send fails
+            let _ = send_error_response(
+                &mut stream,
+                ErrorCode::ErrorUnsupported,
+                format!("unknown message type 0x{other:02X}"),
+            )
+            .await;
         }
     }
 
@@ -317,6 +315,32 @@ where
     let response = handler().await;
     stream
         .send_frame(response_type, &response.encode_to_vec())
+        .await?;
+    stream.finish_send().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Error response helper
+// ---------------------------------------------------------------------------
+
+/// Send an error response frame on the stream.
+///
+/// Constructs an `ErrorDetail` message and sends it as a single frame.
+/// Returns `Err` if the send itself fails, but callers may use `let _ = `
+/// to ignore send failures (e.g. when the client may have disconnected).
+async fn send_error_response<S: RiftStream>(
+    stream: &mut S,
+    code: ErrorCode,
+    message: String,
+) -> anyhow::Result<()> {
+    let error = ErrorDetail {
+        code: code as i32,
+        message,
+        metadata: None,
+    };
+    stream
+        .send_frame(msg::ERROR_RESPONSE, &error.encode_to_vec())
         .await?;
     stream.finish_send().await?;
     Ok(())
@@ -586,5 +610,32 @@ mod tests {
         // Client should receive at least one response frame
         let (type_id, _resp_payload) = client_stream.recv_frame().await.unwrap().unwrap();
         assert_eq!(type_id, msg::READ_RESPONSE);
+    }
+
+    // ------------------------------------------------------------------
+    // Test 7: send_error_response sends an error frame
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn send_error_response_sends_error_frame() {
+        use rift_transport::connection::InMemoryConnection;
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let result = send_error_response(
+            &mut server_stream,
+            ErrorCode::ErrorUnsupported,
+            "test error".to_string(),
+        )
+        .await;
+        assert!(result.is_ok(), "send_error_response should succeed");
+
+        // Client should receive an ERROR_RESPONSE frame
+        let (type_id, payload) = client_stream.recv_frame().await.unwrap().unwrap();
+        assert_eq!(type_id, msg::ERROR_RESPONSE);
+        let error = ErrorDetail::decode(payload.as_ref()).unwrap();
+        assert_eq!(error.code, ErrorCode::ErrorUnsupported as i32);
+        assert_eq!(error.message, "test error");
     }
 }
