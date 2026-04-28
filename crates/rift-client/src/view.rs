@@ -304,6 +304,38 @@ fn assemble_byte_range(
         }))
 }
 
+fn build_dir_entry(
+    entry: &rift_protocol::messages::ReaddirEntry,
+    attrs: FileAttrs,
+    dir_relative: &Path,
+) -> (DirEntry, std::path::PathBuf, Option<String>) {
+    let child_path = if dir_relative.as_os_str() == "." {
+        std::path::PathBuf::from(&entry.name)
+    } else {
+        dir_relative.join(&entry.name)
+    };
+    let symlink_target = (entry.file_type == FileType::Symlink as i32)
+        .then(|| {
+            if !entry.symlink_target.is_empty() {
+                Some(entry.symlink_target.clone())
+            } else if !attrs.symlink_target.is_empty() {
+                Some(attrs.symlink_target.clone())
+            } else {
+                None
+            }
+        })
+        .flatten();
+    (
+        DirEntry {
+            name: entry.name.clone(),
+            file_type: entry.file_type,
+            attrs,
+        },
+        child_path,
+        symlink_target,
+    )
+}
+
 #[async_trait]
 impl<R: RemoteShare> ShareView for RiftShareView<R> {
     #[instrument(skip(self), fields(path = %path.display()))]
@@ -400,37 +432,9 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 }
                 None => continue,
             };
-
-            let child_path = if dir_relative.as_os_str() == "." {
-                std::path::PathBuf::from(&entry.name)
-            } else {
-                dir_relative.join(&entry.name)
-            };
-
-            // Determine symlink target: prefer ReaddirEntry.symlink_target (cache warming),
-            // fall back to FileAttrs.symlink_target.
-            let symlink_target = if entry.file_type == FileType::Symlink as i32 {
-                if !entry.symlink_target.is_empty() {
-                    Some(entry.symlink_target.clone())
-                } else if !attrs.symlink_target.is_empty() {
-                    Some(attrs.symlink_target.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            results.push((
-                DirEntry {
-                    name: entry.name.clone(),
-                    file_type: entry.file_type,
-                    attrs,
-                },
-                child_path,
-                *child_uuid,
-                symlink_target,
-            ));
+            let (dir_entry, child_path, symlink_target) =
+                build_dir_entry(entry, attrs, &dir_relative);
+            results.push((dir_entry, child_path, *child_uuid, symlink_target));
         }
 
         // Cache handles and symlink targets.
@@ -456,17 +460,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
     ) -> Result<Vec<u8>, FsError> {
         let handle = self.resolve_path(path)?;
 
-        let attrs = self.remote.stat_batch(vec![handle]).await;
-
-        let (file_size, merkle_root) = match attrs {
-            Ok(mut results) => {
-                let attrs = results.remove(0)?;
-                let file_size = attrs.size;
-                if attrs.root_hash.is_empty() {
-                    return Err(FsError::Io);
-                }
-                (file_size, attrs.root_hash)
-            }
+        let (file_size, merkle_root) = match self.stat_file(handle).await {
+            Ok(result) => result,
             Err(_) if !self.no_cache && self.cache.is_some() => {
                 if let Some(data) = self.try_read_from_cache(&handle, offset, length).await {
                     return Ok(data);
@@ -619,6 +614,19 @@ fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_si
 }
 
 impl<R: RemoteShare> RiftShareView<R> {
+    async fn stat_file(&self, handle: Uuid) -> Result<(u64, Vec<u8>), FsError> {
+        let mut results = self
+            .remote
+            .stat_batch(vec![handle])
+            .await
+            .map_err(|_| FsError::Io)?;
+        let attrs = results.remove(0)?;
+        if attrs.root_hash.is_empty() {
+            return Err(FsError::Io);
+        }
+        Ok((attrs.size, attrs.root_hash))
+    }
+
     async fn cache_fetched_chunks(
         &self,
         handle: &Uuid,
@@ -4023,5 +4031,53 @@ mod tests {
         }];
         let starts = vec![0u64, 100];
         assert!(assemble_byte_range(chunks, 0, &starts, 0, 100).is_err());
+    }
+
+    #[test]
+    fn build_dir_entry_regular_file() {
+        let entry = rift_protocol::messages::ReaddirEntry {
+            name: "hello.txt".to_owned(),
+            file_type: FileType::Regular as i32,
+            handle: vec![],
+            symlink_target: String::new(),
+        };
+        let attrs = FileAttrs::default();
+        let (dir_entry, child_path, symlink_target) =
+            build_dir_entry(&entry, attrs, Path::new("."));
+        assert_eq!(dir_entry.name, "hello.txt");
+        assert_eq!(child_path, std::path::PathBuf::from("hello.txt"));
+        assert!(symlink_target.is_none());
+    }
+
+    #[test]
+    fn build_dir_entry_symlink_prefers_entry_target() {
+        let entry = rift_protocol::messages::ReaddirEntry {
+            name: "link".to_owned(),
+            file_type: FileType::Symlink as i32,
+            handle: vec![],
+            symlink_target: "from_entry".to_owned(),
+        };
+        let attrs = FileAttrs {
+            symlink_target: "from_attrs".to_owned(),
+            ..Default::default()
+        };
+        let (_, _, symlink_target) = build_dir_entry(&entry, attrs, Path::new("subdir"));
+        assert_eq!(symlink_target.as_deref(), Some("from_entry"));
+    }
+
+    #[test]
+    fn build_dir_entry_symlink_falls_back_to_attrs() {
+        let entry = rift_protocol::messages::ReaddirEntry {
+            name: "link".to_owned(),
+            file_type: FileType::Symlink as i32,
+            handle: vec![],
+            symlink_target: String::new(),
+        };
+        let attrs = FileAttrs {
+            symlink_target: "from_attrs".to_owned(),
+            ..Default::default()
+        };
+        let (_, _, symlink_target) = build_dir_entry(&entry, attrs, Path::new("."));
+        assert_eq!(symlink_target.as_deref(), Some("from_attrs"));
     }
 }
