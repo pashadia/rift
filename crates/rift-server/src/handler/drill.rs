@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::Path;
 
 use prost::Message as _;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 
 use rift_common::crypto::{Blake3Hash, Chunker, MerkleChild, MerkleTree};
@@ -74,19 +76,25 @@ async fn send_empty_drill_response<S: RiftStream>(stream: &mut S) -> anyhow::Res
 
 /// Build the Merkle tree for a file and cache it in the DB.
 ///
-/// Returns `(root_hash, in_memory_cache)` on success.
+/// Returns `(root_hash, in_memory_cache)` on success, `None` if the file
+/// cannot be read.
 async fn build_and_cache_tree<M: MerkleCache>(
     canonical: &Path,
-    content: &[u8],
     chunker: Chunker,
     db: &M,
-) -> (Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>) {
-    let chunk_boundaries = chunker.chunk(content);
+) -> Option<(Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>)> {
+    let file = tokio::fs::File::open(canonical).await.ok()?;
+    let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
+    let chunk_boundaries = chunker.chunk_stream(reader).await;
 
-    let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
-        .iter()
-        .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
-        .collect();
+    let mut file = tokio::fs::File::open(canonical).await.ok()?;
+    let mut leaf_hashes = Vec::with_capacity(chunk_boundaries.len());
+    for (offset, length) in &chunk_boundaries {
+        let mut buf = vec![0u8; *length];
+        file.seek(SeekFrom::Start(*offset as u64)).await.ok()?;
+        file.read_exact(&mut buf).await.ok()?;
+        leaf_hashes.push(Blake3Hash::new(&buf));
+    }
 
     let merkle = MerkleTree::default();
     let (root, cache, leaf_infos) =
@@ -111,7 +119,7 @@ async fn build_and_cache_tree<M: MerkleCache>(
         }
     }
 
-    (root, cache)
+    Some((root, cache))
 }
 
 /// Handle a `MerkleDrill` request: look up children at a given hash in the file's
@@ -157,11 +165,10 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
             Ok(Some(entry)) => entry.root,
             _ => {
                 // Cache miss — must build the tree
-                let content = match tokio::fs::read(&canonical).await {
-                    Ok(c) => c,
-                    Err(_) => return send_empty_drill_response(stream).await,
+                let (root, cache) = match build_and_cache_tree(&canonical, chunker, db).await {
+                    Some(r) => r,
+                    None => return send_empty_drill_response(stream).await,
                 };
-                let (root, cache) = build_and_cache_tree(&canonical, &content, chunker, db).await;
 
                 // Look up root's children in the in-memory cache
                 let children = match resolve_children(&cache, &canonical, &root, db).await {
@@ -201,12 +208,10 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
     }
 
     // Step 3: Cache miss — read file and build tree
-    let content = match tokio::fs::read(&canonical).await {
-        Ok(c) => c,
-        Err(_) => return send_empty_drill_response(stream).await,
+    let (root, cache) = match build_and_cache_tree(&canonical, chunker, db).await {
+        Some(r) => r,
+        None => return send_empty_drill_response(stream).await,
     };
-
-    let (root, cache) = build_and_cache_tree(&canonical, &content, chunker, db).await;
 
     // Step 4: Look up children at the query hash
     let children = match resolve_children(&cache, &canonical, &query_hash, db).await {

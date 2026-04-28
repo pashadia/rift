@@ -79,61 +79,6 @@ async fn validate_handle<S: RiftStream>(stream: &mut S, req: &ReadRequest) -> an
     Ok(handle)
 }
 
-/// Compute a Blake3 hash for each chunk defined by the given boundaries.
-fn compute_leaf_hashes(chunk_boundaries: &[(usize, usize)], content: &[u8]) -> Vec<Blake3Hash> {
-    chunk_boundaries
-        .iter()
-        .map(|(offset, length)| {
-            let chunk_data = &content[*offset..*offset + length];
-            Blake3Hash::new(chunk_data)
-        })
-        .collect()
-}
-
-/// Select a contiguous slice of chunks from `start` with up to `count` items.
-/// If `count` is 0, all chunks from `start` to the end are selected.
-fn derive_chunks_to_read(
-    chunk_boundaries: &[(usize, usize)],
-    leaf_hashes: &[Blake3Hash],
-    start: usize,
-    count: usize,
-) -> Vec<(usize, usize, usize, Blake3Hash)> {
-    chunk_boundaries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(count)
-        .map(|(i, (offset, length))| {
-            let hash = leaf_hashes[i].clone();
-            (i, *offset, *length, hash)
-        })
-        .collect()
-}
-
-/// Stream BlockHeader + BlockData frames for each chunk in `chunks_to_read`.
-async fn stream_block_frames<S: RiftStream>(
-    stream: &mut S,
-    content: &[u8],
-    chunks_to_read: &[(usize, usize, usize, Blake3Hash)],
-) -> anyhow::Result<()> {
-    for (idx, offset, length, hash) in chunks_to_read {
-        let index = *idx as u32;
-        let chunk_data = &content[*offset..*offset + length];
-        let block_header = BlockHeader {
-            chunk: Some(ChunkInfo {
-                index,
-                length: *length as u64,
-                hash: hash.as_bytes().to_vec(),
-            }),
-        };
-        stream
-            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
-            .await?;
-        stream.send_frame(msg::BLOCK_DATA, chunk_data).await?;
-    }
-    Ok(())
-}
-
 /// Update the Merkle cache with the computed root and leaf hashes.
 async fn update_merkle_cache<M: MerkleCache>(
     db: &M,
@@ -322,6 +267,7 @@ async fn stream_cached_read<S: RiftStream, M: MerkleCache>(
 /// `start_chunk >= chunk_boundaries.len()` is always a protocol error (`ErrorNotFound`),
 /// even for empty files. The client should know the chunk count from stat; requesting
 /// a nonexistent chunk index indicates a bug or desync.
+#[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(share = %share.display()), level = "debug")]
 pub async fn read_response<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
@@ -382,15 +328,15 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     }
 
-    // Cold path: read the entire file, chunk it, and stream it.
-    let content = match tokio::fs::read(&canonical).await {
-        Ok(c) => c,
+    // Cold path: stream chunks incrementally.
+    let file = match tokio::fs::File::open(&canonical).await {
+        Ok(f) => f,
         Err(e) => {
             return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
         }
     };
-
-    let chunk_boundaries = chunker.chunk(&content);
+    let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
+    let chunk_boundaries = chunker.chunk_stream(reader).await;
 
     if req.start_chunk as usize >= chunk_boundaries.len() {
         return send_read_error(stream, ErrorCode::ErrorNotFound).await;
@@ -401,18 +347,51 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     } else {
         req.chunk_count as usize
     };
+    let end = (start + count).min(chunk_boundaries.len());
 
-    let leaf_hashes = compute_leaf_hashes(&chunk_boundaries, &content);
-    let chunks_to_read = derive_chunks_to_read(&chunk_boundaries, &leaf_hashes, start, count);
-    let chunk_count = chunks_to_read.len() as u32;
+    // Re-open file and read each chunk individually.
+    let mut file = match tokio::fs::File::open(&canonical).await {
+        Ok(f) => f,
+        Err(e) => {
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
+        }
+    };
 
+    let chunk_count = (end - start) as u32;
     let response = ReadResponse {
         result: Some(read_response::Result::Ok(ReadSuccess { chunk_count })),
     };
     stream
         .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
         .await?;
-    stream_block_frames(stream, &content, &chunks_to_read).await?;
+
+    let mut leaf_hashes = Vec::with_capacity(chunk_boundaries.len());
+
+    for (i, (offset, length)) in chunk_boundaries.iter().enumerate() {
+        let mut buf = vec![0u8; *length];
+        if let Err(e) = file.seek(SeekFrom::Start(*offset as u64)).await {
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
+        }
+        if let Err(e) = file.read_exact(&mut buf).await {
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
+        }
+        let hash = Blake3Hash::new(&buf);
+        leaf_hashes.push(hash.clone());
+
+        if i >= start && i < end {
+            let block_header = BlockHeader {
+                chunk: Some(ChunkInfo {
+                    index: i as u32,
+                    length: *length as u64,
+                    hash: hash.as_bytes().to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await?;
+            stream.send_frame(msg::BLOCK_DATA, &buf).await?;
+        }
+    }
 
     let merkle = MerkleTree::default();
     let root = merkle.build(&leaf_hashes);
@@ -805,6 +784,190 @@ mod tests {
             new_content.as_slice(),
             "fallback must return new content"
         );
+    }
+
+    /// Cold path streaming must produce byte-identical wire output to the warm path.
+    #[tokio::test]
+    async fn read_response_cold_path_streams_individual_chunks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("cold_stream.txt");
+        let content: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        // Warm path: pre-populate cache with real Database
+        let db = Database::open_in_memory().await.unwrap();
+        let file_content = std::fs::read(&file).unwrap();
+        let chunker = Chunker::default();
+        let chunk_boundaries = chunker.chunk(&file_content);
+        let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+            .iter()
+            .map(|(offset, length)| Blake3Hash::new(&file_content[*offset..*offset + *length]))
+            .collect();
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+        let meta = std::fs::metadata(&canonical).unwrap();
+        let mtime_ns = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        let (client_conn_warm, server_conn_warm) = InMemoryConnection::pair();
+        let mut client_stream_warm = client_conn_warm.open_stream().await.unwrap();
+        let mut server_stream_warm = server_conn_warm.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream_warm,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let warm_frames = collect_frames(&mut client_stream_warm).await;
+
+        // Cold path: NoopCache forces streaming cold path
+        let (client_conn_cold, server_conn_cold) = InMemoryConnection::pair();
+        let mut client_stream_cold = client_conn_cold.open_stream().await.unwrap();
+        let mut server_stream_cold = server_conn_cold.accept_stream().await.unwrap();
+
+        read_response(
+            &mut server_stream_cold,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let cold_frames = collect_frames(&mut client_stream_cold).await;
+
+        assert_eq!(
+            warm_frames.len(),
+            cold_frames.len(),
+            "warm and cold paths must produce same number of frames"
+        );
+        for (i, ((warm_type, warm_data), (cold_type, cold_data))) in
+            warm_frames.iter().zip(cold_frames.iter()).enumerate()
+        {
+            assert_eq!(
+                warm_type, cold_type,
+                "frame {i} type mismatch: warm={warm_type}, cold={cold_type}"
+            );
+            assert_eq!(warm_data, cold_data, "frame {i} data mismatch");
+        }
+    }
+
+    /// Cold path streaming with a partial read (start > 0, count > 0).
+    #[tokio::test]
+    async fn read_response_cold_path_partial_read_streams_correctly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("cold_partial.txt");
+        let content: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+        let file_content = std::fs::read(&file).unwrap();
+        let chunker = Chunker::default();
+        let chunk_boundaries = chunker.chunk(&file_content);
+        let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+            .iter()
+            .map(|(offset, length)| Blake3Hash::new(&file_content[*offset..*offset + *length]))
+            .collect();
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+        let meta = std::fs::metadata(&canonical).unwrap();
+        let mtime_ns = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        let (client_conn_warm, server_conn_warm) = InMemoryConnection::pair();
+        let mut client_stream_warm = client_conn_warm.open_stream().await.unwrap();
+        let mut server_stream_warm = server_conn_warm.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 1,
+            chunk_count: 2,
+        };
+
+        read_response(
+            &mut server_stream_warm,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let warm_frames = collect_frames(&mut client_stream_warm).await;
+
+        // Cold path
+        let (client_conn_cold, server_conn_cold) = InMemoryConnection::pair();
+        let mut client_stream_cold = client_conn_cold.open_stream().await.unwrap();
+        let mut server_stream_cold = server_conn_cold.accept_stream().await.unwrap();
+
+        read_response(
+            &mut server_stream_cold,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let cold_frames = collect_frames(&mut client_stream_cold).await;
+
+        assert_eq!(
+            warm_frames.len(),
+            cold_frames.len(),
+            "partial warm and cold paths must produce same number of frames"
+        );
+        for (i, ((warm_type, warm_data), (cold_type, cold_data))) in
+            warm_frames.iter().zip(cold_frames.iter()).enumerate()
+        {
+            assert_eq!(warm_type, cold_type, "partial frame {i} type mismatch");
+            assert_eq!(warm_data, cold_data, "partial frame {i} data mismatch");
+        }
     }
 
     #[tokio::test]
