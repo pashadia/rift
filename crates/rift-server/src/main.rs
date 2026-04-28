@@ -31,6 +31,10 @@ struct Args {
     /// Path to TOML configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Path to the Merkle cache database.
+    #[arg(long)]
+    db_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -67,6 +71,7 @@ async fn main() -> Result<()> {
             }
             config.cert_path = args.cert.clone();
             config.key_path = args.key.clone();
+            config.db_path = args.db_path.clone();
             config
         }
     };
@@ -100,7 +105,14 @@ async fn main() -> Result<()> {
 
     let listener = rift_transport::server_endpoint(listen_addr, &cert_der, &key_der)?;
 
-    let db: Arc<rift_server::handler::NoopCache> = Arc::new(rift_server::handler::NoopCache);
+    let db_path = server_config.db_path.clone().unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("rift")
+            .join("merkle_cache.db")
+    });
+    let db: Arc<rift_server::metadata::db::Database> =
+        Arc::new(rift_server::metadata::db::Database::open(&db_path).await?);
     let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
 
     let share_path = server_config.shares[0].path.clone();

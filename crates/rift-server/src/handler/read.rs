@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
 
@@ -6,7 +7,7 @@ use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 
-use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleTree};
+use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleChild, MerkleTree};
 use rift_protocol::messages::{
     msg, read_response, BlockHeader, ChunkInfo, ErrorCode, ReadRequest, ReadResponse, ReadSuccess,
     TransferComplete,
@@ -79,12 +80,13 @@ async fn validate_handle<S: RiftStream>(stream: &mut S, req: &ReadRequest) -> an
     Ok(handle)
 }
 
-/// Update the Merkle cache with the computed root and leaf hashes.
-async fn update_merkle_cache<M: MerkleCache>(
+/// Update the Merkle cache with the computed root, tree nodes, and leaf info.
+async fn cache_merkle_tree<M: MerkleCache>(
     db: &M,
     canonical: &Path,
     root: &Blake3Hash,
-    leaf_hashes: &[Blake3Hash],
+    cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
+    leaf_infos: &[LeafInfo],
 ) -> anyhow::Result<()> {
     let file_meta = tokio::fs::metadata(canonical).await?;
     let mtime_ns = match file_meta.modified() {
@@ -95,7 +97,7 @@ async fn update_merkle_cache<M: MerkleCache>(
         Err(_) => 0,
     };
     let file_size = file_meta.len();
-    db.put_merkle(canonical, mtime_ns, file_size, root, leaf_hashes)
+    db.put_tree(canonical, mtime_ns, file_size, root, cache, leaf_infos)
         .await?;
     Ok(())
 }
@@ -394,9 +396,10 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     }
 
     let merkle = MerkleTree::default();
-    let root = merkle.build(&leaf_hashes);
-    if let Err(e) = update_merkle_cache(db, &canonical, &root, &leaf_hashes).await {
-        tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle root");
+    let (root, cache, leaf_infos) =
+        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+    if let Err(e) = cache_merkle_tree(db, &canonical, &root, &cache, &leaf_infos).await {
+        tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
     }
     let transfer_complete = TransferComplete {
         merkle_root: root.as_bytes().to_vec(),
@@ -968,6 +971,79 @@ mod tests {
             assert_eq!(warm_type, cold_type, "partial frame {i} type mismatch");
             assert_eq!(warm_data, cold_data, "partial frame {i} data mismatch");
         }
+    }
+
+    /// After a cold READ, the database must have leaf_infos so the warm
+    /// path works on the next request.  Regression for rift-5v10.
+    #[tokio::test]
+    async fn cold_read_populates_leaf_info_for_warm_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("cold_warm.txt");
+        let content = b"hello world warm path after cold";
+        std::fs::write(&file, content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        let db = Database::open_in_memory().await.unwrap();
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        // First read — cold path
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let frames = collect_frames(&mut client_stream).await;
+        assert!(!frames.is_empty());
+
+        // After cold read, the cache should have merkle entry.
+        assert!(
+            db.get_merkle(&canonical).await.unwrap().is_some(),
+            "merkle entry must be cached after cold read"
+        );
+
+        // After cold read, leaf info must ALSO be cached (this is the bug).
+        assert!(
+            db.get_all_leaf_info(&canonical).await.unwrap().is_some(),
+            "leaf info must be cached after cold read for warm path to work"
+        );
+
+        // Second read — should now hit the warm path.
+        let (client_conn2, server_conn2) = InMemoryConnection::pair();
+        let mut client_stream2 = client_conn2.open_stream().await.unwrap();
+        let mut server_stream2 = server_conn2.accept_stream().await.unwrap();
+
+        read_response(
+            &mut server_stream2,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let frames2 = collect_frames(&mut client_stream2).await;
+        assert!(!frames2.is_empty());
     }
 
     #[tokio::test]
