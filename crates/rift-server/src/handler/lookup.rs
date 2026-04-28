@@ -220,7 +220,7 @@ async fn build_symlink_entry(
     };
 
     let root_hash = sentinel_hash_for_non_file(FileType::Symlink);
-    let symlink_target_str = target.to_string_lossy().into_owned();
+    let symlink_target_bytes = target.to_string_lossy().into_owned().into_bytes();
 
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
@@ -228,7 +228,7 @@ async fn build_symlink_entry(
             attrs: Some(build_attrs_with_symlink_target(
                 meta,
                 root_hash,
-                symlink_target_str,
+                symlink_target_bytes,
             )),
         })),
     }
@@ -252,11 +252,7 @@ async fn build_regular_entry<M: MerkleCache>(
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
             handle,
-            attrs: Some(build_attrs_with_symlink_target(
-                meta,
-                root_hash,
-                String::new(),
-            )),
+            attrs: Some(build_attrs_with_symlink_target(meta, root_hash, vec![])),
         })),
     }
 }
@@ -393,7 +389,7 @@ mod tests {
 
         // 2. symlink_target must be set and match the expected target
         assert_eq!(
-            attrs.symlink_target, "target.txt",
+            attrs.symlink_target, b"target.txt",
             "symlink_target must match the link target"
         );
 
@@ -607,7 +603,7 @@ mod tests {
             "after file→symlink swap, lookup must return FileType::Symlink"
         );
         assert_eq!(
-            attrs2.symlink_target, "target.txt",
+            attrs2.symlink_target, b"target.txt",
             "symlink_target must be the link target"
         );
     }

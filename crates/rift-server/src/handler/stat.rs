@@ -87,12 +87,12 @@ fn async_stat<'a, M: MerkleCache>(
             }
         };
 
-        // For symlinks, include the target path.
+        // For symlinks, include the target path as raw bytes.
         let symlink_target = if meta.is_symlink() {
             tokio::fs::read_link(&resolved.canonical)
                 .await
                 .ok()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| p.to_string_lossy().into_owned().into_bytes())
         } else {
             None
         };
@@ -209,7 +209,7 @@ mod tests {
                     attrs.file_type
                 );
                 assert_eq!(
-                    attrs.symlink_target, "target.txt",
+                    attrs.symlink_target, b"target.txt",
                     "symlink target should be 'target.txt'"
                 );
             }

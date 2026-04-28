@@ -999,7 +999,7 @@ async fn readdir_and_lookup_return_consistent_handles_for_symlink() {
         "lookup symlink must have FileType::Symlink"
     );
     assert_eq!(
-        attrs.symlink_target, "target_file.txt",
+        attrs.symlink_target, b"target_file.txt",
         "lookup symlink must include symlink_target"
     );
 }
@@ -1139,7 +1139,7 @@ async fn readdir_and_lookup_return_consistent_handles_for_nested_symlink() {
         "lookup double_link must have FileType::Symlink"
     );
     assert_eq!(
-        attrs.symlink_target, "link.txt",
+        attrs.symlink_target, b"link.txt",
         "lookup double_link must report immediate target, not final target"
     );
 }

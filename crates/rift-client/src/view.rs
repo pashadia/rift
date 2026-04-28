@@ -114,8 +114,9 @@ impl<R: RemoteShare> RiftShareView<R> {
     /// Cache symlink target if this entry is a symlink with a non-empty target.
     async fn cache_symlink_target_if_present(&self, path: &Path, attrs: &FileAttrs) {
         if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
+            let target = String::from_utf8_lossy(&attrs.symlink_target).into_owned();
             self.handles
-                .insert_symlink_target(path.to_path_buf(), attrs.symlink_target.clone())
+                .insert_symlink_target(path.to_path_buf(), target)
                 .await;
         }
     }
@@ -317,7 +318,7 @@ fn build_dir_entry(
     let symlink_target = (entry.file_type == FileType::Symlink as i32)
         .then(|| {
             if !attrs.symlink_target.is_empty() {
-                Some(attrs.symlink_target.clone())
+                Some(String::from_utf8_lossy(&attrs.symlink_target).into_owned())
             } else {
                 None
             }
@@ -542,7 +543,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Err(FsError::Io);
         }
 
-        let target = attrs.symlink_target;
+        let target = String::from_utf8_lossy(&attrs.symlink_target).into_owned();
         if target.is_empty() {
             return Err(FsError::Io);
         }
@@ -3361,7 +3362,7 @@ mod tests {
         remote
             .set_stat_batch(Ok(vec![Ok(FileAttrs {
                 file_type: FileType::Symlink as i32,
-                symlink_target: "../../foo".to_string(),
+                symlink_target: b"../../foo".to_vec(),
                 ..make_file_attrs(10, [0x01; 32])
             })]))
             .await;
@@ -3396,7 +3397,7 @@ mod tests {
         remote
             .set_stat_batch(Ok(vec![Ok(FileAttrs {
                 file_type: FileType::Symlink as i32,
-                symlink_target: "/usr/bin/python3".to_string(),
+                symlink_target: b"/usr/bin/python3".to_vec(),
                 ..make_file_attrs(0, [0x01; 32])
             })]))
             .await;
@@ -3418,7 +3419,7 @@ mod tests {
         let child_uuid = Uuid::now_v7();
         let link_attrs = FileAttrs {
             file_type: FileType::Symlink as i32,
-            symlink_target: "/usr/bin/python3".to_string(),
+            symlink_target: b"/usr/bin/python3".to_vec(),
             ..make_file_attrs(0, [0x01; 32])
         };
 
@@ -3494,7 +3495,7 @@ mod tests {
         remote
             .set_stat_batch(Ok(vec![Ok(FileAttrs {
                 file_type: FileType::Symlink as i32,
-                symlink_target: "../../foo".to_string(),
+                symlink_target: b"../../foo".to_vec(),
                 ..make_file_attrs(10, [0x01; 32])
             })]))
             .await;
@@ -3505,7 +3506,7 @@ mod tests {
             .await
             .expect("getattr should succeed");
         assert_eq!(attrs.file_type, FileType::Symlink as i32);
-        assert_eq!(attrs.symlink_target, "../../foo");
+        assert_eq!(attrs.symlink_target, b"../../foo");
 
         // Step 2: call readlink — should return the cached target
         let target = view
@@ -3546,7 +3547,7 @@ mod tests {
         remote
             .set_stat_batch(Ok(vec![Ok(FileAttrs {
                 file_type: FileType::Symlink as i32,
-                symlink_target: "../../foo".to_string(),
+                symlink_target: b"../../foo".to_vec(),
                 size: 10,
                 mode: 0o120777, // symlink mode with S_IFLNK
                 uid: 1000,
@@ -3566,7 +3567,7 @@ mod tests {
         let entry = &entries[0];
         assert_eq!(entry.name, "my_link");
         assert_eq!(entry.file_type, FileType::Symlink as i32);
-        assert_eq!(entry.attrs.symlink_target, "../../foo");
+        assert_eq!(entry.attrs.symlink_target, b"../../foo");
 
         // The key assertions: attrs must come from stat_batch, NOT defaults
         assert_eq!(
@@ -3624,7 +3625,7 @@ mod tests {
             .set_stat_batch(Ok(vec![
                 Ok(FileAttrs {
                     file_type: FileType::Symlink as i32,
-                    symlink_target: "../../foo".to_string(),
+                    symlink_target: b"../../foo".to_vec(),
                     uid: 1000,
                     gid: 1000,
                     mode: 0o120777,
@@ -3636,7 +3637,7 @@ mod tests {
                 }),
                 Ok(FileAttrs {
                     file_type: FileType::Symlink as i32,
-                    symlink_target: "/usr/bin/python3".to_string(),
+                    symlink_target: b"/usr/bin/python3".to_vec(),
                     uid: 1000,
                     gid: 1000,
                     mode: 0o120777,
@@ -3658,13 +3659,13 @@ mod tests {
         // Verify symlink attrs come from stat_batch
         assert_eq!(entries[0].name, "link1");
         assert_eq!(entries[0].file_type, FileType::Symlink as i32);
-        assert_eq!(entries[0].attrs.symlink_target, "../../foo");
+        assert_eq!(entries[0].attrs.symlink_target, b"../../foo");
         assert_eq!(entries[0].attrs.uid, 1000);
         assert_eq!(entries[0].attrs.gid, 1000);
 
         assert_eq!(entries[1].name, "link2");
         assert_eq!(entries[1].file_type, FileType::Symlink as i32);
-        assert_eq!(entries[1].attrs.symlink_target, "/usr/bin/python3");
+        assert_eq!(entries[1].attrs.symlink_target, b"/usr/bin/python3");
         assert_eq!(entries[1].attrs.uid, 1000);
         assert_eq!(entries[1].attrs.gid, 1000);
 
@@ -3724,7 +3725,7 @@ mod tests {
         // stat_batch must be called for both the symlink and the regular file
         let link_attrs = FileAttrs {
             file_type: FileType::Symlink as i32,
-            symlink_target: "../../foo".to_string(),
+            symlink_target: b"../../foo".to_vec(),
             uid: 1000,
             gid: 1000,
             mode: 0o120777,
@@ -3744,7 +3745,7 @@ mod tests {
         // Verify both entries have correct data
         let link_entry = entries.iter().find(|e| e.name == "my_link").unwrap();
         assert_eq!(link_entry.file_type, FileType::Symlink as i32);
-        assert_eq!(link_entry.attrs.symlink_target, "../../foo");
+        assert_eq!(link_entry.attrs.symlink_target, b"../../foo");
         assert_eq!(link_entry.attrs.uid, 1000);
         assert_eq!(link_entry.attrs.gid, 1000);
 
@@ -4006,7 +4007,7 @@ mod tests {
             handle: vec![],
         };
         let attrs = FileAttrs {
-            symlink_target: "../../foo".to_owned(),
+            symlink_target: b"../../foo".to_vec(),
             ..Default::default()
         };
         let (_, _, symlink_target) = build_dir_entry(&entry, attrs, Path::new("subdir"));

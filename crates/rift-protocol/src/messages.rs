@@ -210,7 +210,7 @@ mod tests {
                     gid: 1000,
                     nlinks: 1,
                     root_hash: vec![],
-                    symlink_target: String::new(),
+                    symlink_target: vec![],
                 }),
             })),
         };
@@ -525,7 +525,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
                 root_hash: vec![],
-                symlink_target: String::new(),
+                symlink_target: vec![],
             }),
             changed_chunks: vec![ChunkInfo {
                 index: 3,
@@ -571,7 +571,7 @@ mod tests {
                     gid: 1000,
                     nlinks: 2,
                     root_hash: vec![],
-                    symlink_target: String::new(),
+                    symlink_target: vec![],
                 }),
             })),
         };
@@ -791,7 +791,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
                 root_hash: vec![],
-                symlink_target: String::new(),
+                symlink_target: vec![],
             })),
         };
         let encoded = msg.encode_to_vec();
@@ -931,7 +931,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 1,
                 root_hash: vec![],
-                symlink_target: String::new(),
+                symlink_target: vec![],
             }),
             root_hash: vec![0xAA; 32],
             sequence: 7,
@@ -990,7 +990,7 @@ mod tests {
                 gid: 1000,
                 nlinks: 2,
                 root_hash: vec![],
-                symlink_target: String::new(),
+                symlink_target: vec![],
             }),
             sequence: 5,
         };
@@ -1046,12 +1046,12 @@ mod tests {
             gid: 1000,
             nlinks: 1,
             root_hash: vec![],
-            symlink_target: "/usr/bin/python3".to_string(),
+            symlink_target: b"/usr/bin/python3".to_vec(),
         };
         let encoded = msg.encode_to_vec();
         let decoded = FileAttrs::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.file_type, FileType::Symlink as i32);
-        assert_eq!(decoded.symlink_target, "/usr/bin/python3");
+        assert_eq!(decoded.symlink_target, b"/usr/bin/python3");
     }
 
     // --- Type ID constants sanity check ---
