@@ -27,6 +27,7 @@ tokio-rusqlite = "0.7"
 uuid = { workspace = true }
 scc.workspace = true
 tempfile.workspace = true
+bytes.workspace = true
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }

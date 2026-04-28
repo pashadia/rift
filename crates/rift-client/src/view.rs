@@ -765,6 +765,7 @@ mod tests {
     use super::*;
     use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
     use rift_protocol::messages::{FileType, ReaddirEntry};
     use std::collections::HashMap;
@@ -952,7 +953,7 @@ mod tests {
                 index: i as u32,
                 length: d.len() as u64,
                 hash: chunk_hashes[i],
-                data: d.clone(),
+                data: Bytes::from(d.clone()),
             })
             .collect();
 
@@ -1147,7 +1148,7 @@ mod tests {
                     index: 0,
                     length: content.len() as u64,
                     hash: chunk_hash,
-                    data: content.to_vec(),
+                    data: Bytes::from(&content[..]),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -1225,7 +1226,7 @@ mod tests {
                     index: 1,
                     length: 200,
                     hash: chunk_hashes[1],
-                    data: chunk1_data,
+                    data: Bytes::from(chunk1_data),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -1326,7 +1327,7 @@ mod tests {
                     index: 1,
                     length: 200,
                     hash: chunk_hashes[1],
-                    data: chunk1_data.clone(),
+                    data: Bytes::from(chunk1_data.clone()),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -1410,13 +1411,13 @@ mod tests {
                         index: 0,
                         length: 100,
                         hash: chunk_hashes[0],
-                        data: vec![0xAAu8; 100],
+                        data: Bytes::from(vec![0xAAu8; 100]),
                     },
                     ChunkData {
                         index: 1,
                         length: 200,
                         hash: chunk_hashes[1],
-                        data: chunk1_data,
+                        data: Bytes::from(chunk1_data),
                     },
                 ],
                 merkle_root: root_hash.to_vec(),
@@ -1597,7 +1598,7 @@ mod tests {
                     index: 1,
                     length: 200,
                     hash: chunk_hashes[1],
-                    data: chunk1_data,
+                    data: Bytes::from(chunk1_data),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -1686,7 +1687,7 @@ mod tests {
                     index: 1,
                     length: 200,
                     hash: chunk_hashes[1],
-                    data: chunk1_data,
+                    data: Bytes::from(chunk1_data),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -1831,7 +1832,7 @@ mod tests {
                     index: 1,
                     length: 200,
                     hash: chunk_hashes[1],
-                    data: chunk1_data.clone(),
+                    data: Bytes::from(chunk1_data.clone()),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -2443,7 +2444,7 @@ mod tests {
                 index: i,
                 length: chunk_size,
                 hash: *leaf_hashes[i as usize].as_bytes(),
-                data: vec![i as u8; chunk_size as usize],
+                data: Bytes::from(vec![i as u8; chunk_size as usize]),
             });
         }
 
@@ -2526,7 +2527,7 @@ mod tests {
                     index: 0,
                     length: 100,
                     hash: wrong_hash,
-                    data: wrong_data,
+                    data: Bytes::from(wrong_data),
                 }],
                 merkle_root: root_hash_val.as_bytes().to_vec(),
             }))
@@ -2585,7 +2586,7 @@ mod tests {
                     index: 0,
                     length: 100,
                     hash: *chunk0_hash.as_bytes(),
-                    data: chunk0_data,
+                    data: Bytes::from(chunk0_data),
                 }],
                 merkle_root: wrong_root.to_vec(),
             }))
@@ -2643,7 +2644,7 @@ mod tests {
                     index: 0,
                     length: 200, // Wrong!
                     hash: *chunk0_hash.as_bytes(),
-                    data: chunk0_data,
+                    data: Bytes::from(chunk0_data),
                 }],
                 merkle_root: root_hash_val.as_bytes().to_vec(),
             }))
@@ -2707,7 +2708,7 @@ mod tests {
                     index: 0,
                     length: content.len() as u64,
                     hash: chunk_hash,
-                    data: content.to_vec(),
+                    data: Bytes::from(&content[..]),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -2783,7 +2784,7 @@ mod tests {
                     index: 0,
                     length: content.len() as u64,
                     hash: chunk_hash,
-                    data: content.to_vec(),
+                    data: Bytes::from(&content[..]),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -2819,7 +2820,7 @@ mod tests {
                     index: 0,
                     length: content.len() as u64,
                     hash: chunk_hash,
-                    data: content.to_vec(),
+                    data: Bytes::from(&content[..]),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -3137,13 +3138,13 @@ mod tests {
                         index: 1,
                         length: 200,
                         hash: chunk_hashes[1],
-                        data: chunk1_data.clone(),
+                        data: Bytes::from(chunk1_data.clone()),
                     },
                     ChunkData {
                         index: 0,
                         length: 100,
                         hash: chunk_hashes[0],
-                        data: chunk0_data.clone(),
+                        data: Bytes::from(chunk0_data.clone()),
                     },
                 ],
                 merkle_root: root_hash.to_vec(),
@@ -3260,7 +3261,7 @@ mod tests {
                     index: 1,
                     length: 200,
                     hash: chunk_hashes[1],
-                    data: chunk1_data.clone(),
+                    data: Bytes::from(chunk1_data.clone()),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
@@ -3859,7 +3860,7 @@ mod tests {
             index: 0,
             length: data.len() as u64,
             hash,
-            data,
+            data: Bytes::from(data),
         }];
         // Use the actual merkle root derived from the root hash
         let merkle_root = root_hash.as_bytes().to_vec();
@@ -3875,7 +3876,7 @@ mod tests {
             index: 0,
             length: data.len() as u64,
             hash: bad_hash,
-            data,
+            data: Bytes::from(data),
         }];
         let merkle_root = root_hash.as_bytes().to_vec();
         assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
@@ -3890,7 +3891,7 @@ mod tests {
             index: 0,
             length: 9999, // wrong length
             hash,
-            data,
+            data: Bytes::from(data),
         }];
         let merkle_root = root_hash.as_bytes().to_vec();
         assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
@@ -3906,7 +3907,7 @@ mod tests {
             index: 0,
             length: data.len() as u64,
             hash,
-            data,
+            data: Bytes::from(data),
         }];
         // merkle_root doesn't match root_hash
         let merkle_root = wrong_root.as_bytes().to_vec();
@@ -3921,7 +3922,7 @@ mod tests {
             index: 0,
             length: 100,
             hash,
-            data: data.clone(),
+            data: Bytes::from(data.clone()),
         }];
         let starts = vec![0u64, 100];
         let result = assemble_byte_range(chunks, 0, &starts, 0, 50).unwrap();
@@ -3936,7 +3937,7 @@ mod tests {
             index: 0,
             length: 100,
             hash,
-            data: data.clone(),
+            data: Bytes::from(data.clone()),
         }];
         let starts = vec![0u64, 100];
         let result = assemble_byte_range(chunks, 0, &starts, 10, 30).unwrap();
@@ -3955,13 +3956,13 @@ mod tests {
                 index: 0,
                 length: 64,
                 hash: h0,
-                data: chunk0.clone(),
+                data: Bytes::from(chunk0.clone()),
             },
             crate::client::ChunkData {
                 index: 1,
                 length: 64,
                 hash: h1,
-                data: chunk1.clone(),
+                data: Bytes::from(chunk1.clone()),
             },
         ];
         let starts = vec![0u64, 64, 128];
@@ -3980,7 +3981,7 @@ mod tests {
             index: 5,
             length: 100,
             hash,
-            data,
+            data: Bytes::from(data),
         }];
         let starts = vec![0u64, 100];
         assert!(assemble_byte_range(chunks, 0, &starts, 0, 100).is_err());

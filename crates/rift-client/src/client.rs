@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use bytes::Bytes;
 use prost::Message as _;
 use tracing::instrument;
 use uuid::Uuid;
@@ -211,7 +212,7 @@ pub struct ChunkData {
     pub index: u32,
     pub length: u64,
     pub hash: [u8; 32],
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// Type alias for a RiftClient backed by a real QUIC connection.
@@ -647,7 +648,7 @@ impl<C: RiftConnection> RiftClient<C> {
                 index,
                 length,
                 hash,
-                data: data_payload.to_vec(),
+                data: data_payload,
             });
         }
 
@@ -1408,5 +1409,31 @@ mod tests {
             msg::STAT_REQUEST,
             "first recorded frame must be STAT_REQUEST"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Group F: ChunkData Bytes type (rift-b0er.2.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chunk_data_data_field_is_bytes() {
+        use bytes::Bytes;
+
+        // This test verifies that ChunkData.data is of type Bytes.
+        // It should compile and pass after changing Vec<u8> to Bytes.
+        let chunk = ChunkData {
+            index: 0,
+            length: 3,
+            hash: [1u8; 32],
+            data: Bytes::from(vec![1u8, 2, 3]),
+        };
+
+        // Verify the data is accessible as Bytes
+        assert_eq!(chunk.data.len(), 3);
+        assert_eq!(&chunk.data[..], &[1u8, 2, 3]);
+
+        // Verify Bytes can be cloned cheaply (reference-counted)
+        let data_clone = chunk.data.clone();
+        assert_eq!(data_clone, chunk.data);
     }
 }
