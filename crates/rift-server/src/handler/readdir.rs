@@ -137,14 +137,6 @@ async fn process_symlink_dir_entry(
     share_canonical: &Path,
     handle_db: &HandleDatabase,
 ) -> Option<ReaddirEntry> {
-    let target = match fs::read_link(entry_path).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(path = %entry_path.display(), error = %e, "readdir: failed to read symlink target");
-            return None;
-        }
-    };
-    // broken symlink / canonicalize failure stays silent — it's expected filtering.
     verify_symlink_containment(entry_path, share_canonical).await?;
 
     let uuid = handle_db
@@ -157,7 +149,6 @@ async fn process_symlink_dir_entry(
         name: name.to_owned(),
         file_type: FileType::Symlink as i32,
         handle,
-        symlink_target: target.to_string_lossy().into_owned(),
     })
 }
 
@@ -185,7 +176,6 @@ async fn process_regular_dir_entry(
         name: name.to_owned(),
         file_type: proto_type,
         handle,
-        symlink_target: String::new(),
     })
 }
 
@@ -305,8 +295,8 @@ mod tests {
 
     /// Symlinks within the share must:
     ///   1. Report `FileType::Symlink`.
-    ///   2. Include the symlink target in `symlink_target`.
-    ///   3. Use the symlink's OWN path (not the canonical target) for the handle.
+    ///   2. Use the symlink's OWN path (not the canonical target) for the handle.
+    ///   (The symlink target string is provided via stat_batch/FileAttrs, not ReaddirEntry.)
     #[tokio::test]
     async fn readdir_response_symlink_uses_own_path_and_includes_target() {
         let tmp = TempDir::new().unwrap();
@@ -346,13 +336,7 @@ mod tests {
             "link.txt must have FileType::Symlink"
         );
 
-        // 2. symlink_target must be set and match the expected target
-        assert_eq!(
-            link_entry.symlink_target, "target.txt",
-            "symlink_target must match the link target"
-        );
-
-        // 3. The handle must have been created from the symlink's own path,
+        // The handle must have been created from the symlink's own path,
         //    not from the canonical target path. Look up the handle in the
         //    database and verify it resolves back to the symlink's own path
         //    (not the resolved target).
@@ -369,9 +353,9 @@ mod tests {
     }
 
     /// When a directory contains multiple symlinks, every one must report the
-    /// correct `file_type` and `symlink_target`. This also serves as a regression
-    /// guard for the share_canonical hoist: if the hoist were broken, entries
-    /// could silently vanish or report wrong metadata.
+    /// correct `file_type`. This also serves as a regression guard for the
+    /// share_canonical hoist: if the hoist were broken, entries could silently
+    /// vanish or report wrong metadata.
     #[tokio::test]
     async fn readdir_response_multiple_symlinks_all_consistent() {
         let tmp = TempDir::new().unwrap();
@@ -411,7 +395,7 @@ mod tests {
 
         for i in 0..3 {
             let link_name = format!("link{i}.txt");
-            let target_name = format!("file{i}.txt");
+            let _target_name = format!("file{i}.txt");
             let entry = success
                 .entries
                 .iter()
@@ -421,10 +405,6 @@ mod tests {
                 entry.file_type,
                 FileType::Symlink as i32,
                 "{link_name} must have FileType::Symlink"
-            );
-            assert_eq!(
-                entry.symlink_target, target_name,
-                "{link_name} symlink_target must be {target_name}"
             );
         }
     }

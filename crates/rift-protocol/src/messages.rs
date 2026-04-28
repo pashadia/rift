@@ -276,13 +276,11 @@ mod tests {
                         name: "foo.txt".to_string(),
                         file_type: FileType::Regular as i32,
                         handle: b"foo-handle".to_vec(),
-                        symlink_target: String::new(),
                     },
                     ReaddirEntry {
                         name: "bar".to_string(),
                         file_type: FileType::Directory as i32,
                         handle: b"bar-handle".to_vec(),
-                        symlink_target: String::new(),
                     },
                 ],
                 has_more: false,
@@ -1052,21 +1050,6 @@ mod tests {
         };
         let encoded = msg.encode_to_vec();
         let decoded = FileAttrs::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.file_type, FileType::Symlink as i32);
-        assert_eq!(decoded.symlink_target, "/usr/bin/python3");
-    }
-
-    #[test]
-    fn readdir_entry_symlink_target_round_trip() {
-        let msg = ReaddirEntry {
-            name: "python".to_string(),
-            file_type: FileType::Symlink as i32,
-            handle: b"symlink-handle".to_vec(),
-            symlink_target: "/usr/bin/python3".to_string(),
-        };
-        let encoded = msg.encode_to_vec();
-        let decoded = ReaddirEntry::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.name, "python");
         assert_eq!(decoded.file_type, FileType::Symlink as i32);
         assert_eq!(decoded.symlink_target, "/usr/bin/python3");
     }

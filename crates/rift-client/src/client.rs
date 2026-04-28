@@ -1163,13 +1163,11 @@ mod tests {
                             name: "alpha.txt".to_string(),
                             file_type: FileType::Regular as i32,
                             handle: vec![1u8; 16],
-                            symlink_target: String::new(),
                         },
                         ReaddirEntry {
                             name: "beta.txt".to_string(),
                             file_type: FileType::Regular as i32,
                             handle: vec![2u8; 16],
-                            symlink_target: String::new(),
                         },
                     ],
                     has_more: false,

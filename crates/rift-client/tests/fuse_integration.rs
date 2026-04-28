@@ -75,7 +75,6 @@ impl MockRemoteShare {
             name: name.to_string(),
             file_type: file_type as i32,
             handle: handle.as_bytes().to_vec(),
-            symlink_target: String::new(),
         }
     }
 }

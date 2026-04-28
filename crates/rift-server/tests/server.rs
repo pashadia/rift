@@ -953,20 +953,14 @@ async fn readdir_and_lookup_return_consistent_handles_for_symlink() {
         FileType::Symlink as i32,
         "link_file.txt must have FileType::Symlink"
     );
-    assert_eq!(
-        link_entry.symlink_target, "target_file.txt",
-        "symlink_target must be set for symlinks"
-    );
+    // symlink_target is no longer in ReaddirEntry;
+    // it comes from stat_batch (FileAttrs) instead
 
     // Target must report Regular type with empty symlink_target
     assert_eq!(
         target_entry.file_type,
         FileType::Regular as i32,
         "target_file.txt must have FileType::Regular"
-    );
-    assert_eq!(
-        target_entry.symlink_target, "",
-        "symlink_target must be empty for regular files"
     );
 
     let link_handle = link_entry.handle.clone();
@@ -1088,26 +1082,19 @@ async fn readdir_and_lookup_return_consistent_handles_for_nested_symlink() {
         "target and double_link must have different handles"
     );
 
-    // double_link.txt reports symlink_target = "link.txt" (immediate target, not final)
+    // double_link.txt is FileType::Symlink; symlink_target
+    // comes from stat_batch, not ReaddirEntry
     assert_eq!(
         double_link_entry.file_type,
         FileType::Symlink as i32,
         "double_link.txt must have FileType::Symlink"
     );
-    assert_eq!(
-        double_link_entry.symlink_target, "link.txt",
-        "double_link.txt must report immediate target, not final target"
-    );
 
-    // link.txt reports symlink_target = "target.txt"
+    // link.txt is FileType::Symlink
     assert_eq!(
         link_entry.file_type,
         FileType::Symlink as i32,
         "link.txt must have FileType::Symlink"
-    );
-    assert_eq!(
-        link_entry.symlink_target, "target.txt",
-        "link.txt must report its immediate target"
     );
 
     // target.txt reports FileType::Regular (not Symlink)

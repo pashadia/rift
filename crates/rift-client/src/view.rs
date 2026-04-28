@@ -316,9 +316,7 @@ fn build_dir_entry(
     };
     let symlink_target = (entry.file_type == FileType::Symlink as i32)
         .then(|| {
-            if !entry.symlink_target.is_empty() {
-                Some(entry.symlink_target.clone())
-            } else if !attrs.symlink_target.is_empty() {
+            if !attrs.symlink_target.is_empty() {
                 Some(attrs.symlink_target.clone())
             } else {
                 None
@@ -1027,13 +1025,11 @@ mod tests {
                     name: "file1.txt".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: file1_uuid.as_bytes().to_vec(),
-                    symlink_target: String::new(),
                 },
                 ReaddirEntry {
                     name: "file2.txt".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: file2_uuid.as_bytes().to_vec(),
-                    symlink_target: String::new(),
                 },
             ]))
             .await;
@@ -1080,13 +1076,11 @@ mod tests {
                     name: "link.h".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: shared_uuid.as_bytes().to_vec(),
-                    symlink_target: String::new(),
                 },
                 ReaddirEntry {
                     name: "target.h".to_string(),
                     file_type: rift_protocol::messages::FileType::Regular as i32,
                     handle: shared_uuid.as_bytes().to_vec(),
-                    symlink_target: String::new(),
                 },
             ]))
             .await;
@@ -3361,7 +3355,6 @@ mod tests {
                 name: "my_link".to_string(),
                 file_type: FileType::Symlink as i32,
                 handle: link_uuid.as_bytes().to_vec(),
-                symlink_target: "../../foo".to_string(),
             }]))
             .await;
 
@@ -3382,74 +3375,36 @@ mod tests {
         assert_eq!(target, "../../foo");
     }
 
-    /// When readdir provides symlink_target in the ReaddirEntry but NOT in FileAttrs,
-    /// the ReaddirEntry target should still be cached.
+    /// symlink targets are sourced exclusively from FileAttrs (stat_batch),
+    /// since ReaddirEntry no longer carries symlink_target.
     #[tokio::test]
-    async fn readdir_symlink_target_from_entry_not_attrs() {
+    async fn readdir_symlink_target_from_stat_attrs() {
         let root = Uuid::now_v7();
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote.clone(), root);
 
         let link_uuid = Uuid::now_v7();
 
-        // ReaddirEntry has symlink_target, but stat attrs has empty symlink_target
         remote
             .set_readdir(Ok(vec![ReaddirEntry {
                 name: "shortcut".to_string(),
                 file_type: FileType::Symlink as i32,
                 handle: link_uuid.as_bytes().to_vec(),
-                symlink_target: "/usr/bin/python3".to_string(),
             }]))
             .await;
 
         remote
             .set_stat_batch(Ok(vec![Ok(FileAttrs {
                 file_type: FileType::Symlink as i32,
-                symlink_target: String::new(), // empty in attrs
+                symlink_target: "/usr/bin/python3".to_string(),
                 ..make_file_attrs(0, [0x01; 32])
             })]))
             .await;
 
         let _entries = view.readdir(Path::new(".")).await.unwrap();
 
-        // readlink should return the target from ReaddirEntry
         let target = view.readlink(Path::new("shortcut")).await.unwrap();
         assert_eq!(target, "/usr/bin/python3");
-    }
-
-    /// When ReaddirEntry.symlink_target is empty but FileAttrs.symlink_target is set,
-    /// the attrs target should be used as fallback.
-    #[tokio::test]
-    async fn readdir_symlink_target_fallback_to_attrs() {
-        let root = Uuid::now_v7();
-        let remote = Arc::new(MockRemote::new());
-        let view = RiftShareView::new(remote.clone(), root);
-
-        let link_uuid = Uuid::now_v7();
-
-        // ReaddirEntry has empty symlink_target, but stat attrs has it
-        remote
-            .set_readdir(Ok(vec![ReaddirEntry {
-                name: "fallback_link".to_string(),
-                file_type: FileType::Symlink as i32,
-                handle: link_uuid.as_bytes().to_vec(),
-                symlink_target: String::new(), // empty in entry
-            }]))
-            .await;
-
-        remote
-            .set_stat_batch(Ok(vec![Ok(FileAttrs {
-                file_type: FileType::Symlink as i32,
-                symlink_target: "/etc/alternatives/java".to_string(),
-                ..make_file_attrs(0, [0x01; 32])
-            })]))
-            .await;
-
-        let _entries = view.readdir(Path::new(".")).await.unwrap();
-
-        // readlink should return the target from FileAttrs (fallback)
-        let target = view.readlink(Path::new("fallback_link")).await.unwrap();
-        assert_eq!(target, "/etc/alternatives/java");
     }
 
     /// lookup with a symlink should cache the target from FileAttrs,
@@ -3580,7 +3535,6 @@ mod tests {
                 name: "my_link".to_string(),
                 file_type: FileType::Symlink as i32,
                 handle: link_uuid.as_bytes().to_vec(),
-                symlink_target: "../../foo".to_string(),
             }]))
             .await;
 
@@ -3656,13 +3610,11 @@ mod tests {
                     name: "link1".to_string(),
                     file_type: FileType::Symlink as i32,
                     handle: link1_uuid.as_bytes().to_vec(),
-                    symlink_target: "../../foo".to_string(),
                 },
                 ReaddirEntry {
                     name: "link2".to_string(),
                     file_type: FileType::Symlink as i32,
                     handle: link2_uuid.as_bytes().to_vec(),
-                    symlink_target: "/usr/bin/python3".to_string(),
                 },
             ]))
             .await;
@@ -3760,13 +3712,11 @@ mod tests {
                     name: "my_link".to_string(),
                     file_type: FileType::Symlink as i32,
                     handle: link_uuid.as_bytes().to_vec(),
-                    symlink_target: "../../foo".to_string(),
                 },
                 ReaddirEntry {
                     name: "regular.txt".to_string(),
                     file_type: FileType::Regular as i32,
                     handle: file_uuid.as_bytes().to_vec(),
-                    symlink_target: String::new(),
                 },
             ]))
             .await;
@@ -4039,7 +3989,6 @@ mod tests {
             name: "hello.txt".to_owned(),
             file_type: FileType::Regular as i32,
             handle: vec![],
-            symlink_target: String::new(),
         };
         let attrs = FileAttrs::default();
         let (dir_entry, child_path, symlink_target) =
@@ -4050,34 +3999,17 @@ mod tests {
     }
 
     #[test]
-    fn build_dir_entry_symlink_prefers_entry_target() {
+    fn build_dir_entry_symlink_uses_attrs_target() {
         let entry = rift_protocol::messages::ReaddirEntry {
             name: "link".to_owned(),
             file_type: FileType::Symlink as i32,
             handle: vec![],
-            symlink_target: "from_entry".to_owned(),
         };
         let attrs = FileAttrs {
-            symlink_target: "from_attrs".to_owned(),
+            symlink_target: "../../foo".to_owned(),
             ..Default::default()
         };
         let (_, _, symlink_target) = build_dir_entry(&entry, attrs, Path::new("subdir"));
-        assert_eq!(symlink_target.as_deref(), Some("from_entry"));
-    }
-
-    #[test]
-    fn build_dir_entry_symlink_falls_back_to_attrs() {
-        let entry = rift_protocol::messages::ReaddirEntry {
-            name: "link".to_owned(),
-            file_type: FileType::Symlink as i32,
-            handle: vec![],
-            symlink_target: String::new(),
-        };
-        let attrs = FileAttrs {
-            symlink_target: "from_attrs".to_owned(),
-            ..Default::default()
-        };
-        let (_, _, symlink_target) = build_dir_entry(&entry, attrs, Path::new("."));
-        assert_eq!(symlink_target.as_deref(), Some("from_attrs"));
+        assert_eq!(symlink_target.as_deref(), Some("../../foo"));
     }
 }
