@@ -10,6 +10,8 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    /// Path to the Merkle cache database. Defaults to platform data dir.
+    pub db_path: Option<PathBuf>,
     /// Chunker parameters for content-addressed chunking.
     /// Defaults to production parameters (32/128/512 KB).
     #[serde(default)]
@@ -24,6 +26,7 @@ impl Default for ServerConfig {
             listen_addr: "0.0.0.0:4433".to_string(),
             cert_path: None,
             key_path: None,
+            db_path: None,
             chunker: Chunker::default(),
             shares: Vec::new(),
         }
@@ -159,5 +162,25 @@ mod tests {
     #[test]
     fn test_access_level_default_is_read_write() {
         assert_eq!(AccessLevel::default(), AccessLevel::ReadWrite);
+    }
+
+    #[test]
+    fn test_server_config_default_db_path_is_none() {
+        let config = ServerConfig::default();
+        assert!(config.db_path.is_none());
+    }
+
+    #[test]
+    fn test_server_config_deserialize_with_db_path() {
+        let toml = r#"
+            listen_addr = "127.0.0.1:4433"
+            db_path = "/var/lib/rift/cache.db"
+        "#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.listen_addr, "127.0.0.1:4433");
+        assert_eq!(
+            config.db_path,
+            Some(PathBuf::from("/var/lib/rift/cache.db"))
+        );
     }
 }
