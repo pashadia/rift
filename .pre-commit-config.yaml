@@ -10,7 +10,7 @@ repos:
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets -- -D warnings
+        entry: cargo clippy --all-targets -- -D warnings -W clippy::too_many_lines -W clippy::excessive_nesting
         language: system
         stages: [pre-commit]
         pass_filenames: false
