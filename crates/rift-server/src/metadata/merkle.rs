@@ -195,6 +195,10 @@ impl Database {
         }
 
         let root_bytes = root.as_bytes().to_vec();
+        let merkle = MerkleTree::default();
+        let leaf_hashes_for_cache: Vec<Blake3Hash> =
+            leaf_infos.iter().map(|info| info.hash.clone()).collect();
+        let serialized_leaves = merkle.serialize_leaves(&leaf_hashes_for_cache);
 
         self.call(move |conn: &mut rusqlite::Connection| {
             let tx = conn.transaction()?;
@@ -234,7 +238,7 @@ impl Database {
 
                 tx.execute(
                     "INSERT OR REPLACE INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, "".as_bytes(), now],
+                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, now],
                 )?;
             }
 
@@ -283,6 +287,76 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Look up all leaf metadata for a file, ordered by chunk index.
+    ///
+    /// Returns `None` if no leaf info exists for the path.
+    pub async fn get_all_leaf_info(&self, path: &Path) -> SqliteResult<Option<Vec<LeafInfo>>> {
+        let path_str = path.to_string_lossy().to_string();
+
+        let result = self
+            .call(move |conn: &mut rusqlite::Connection| {
+                let mut stmt = conn.prepare(
+                    "SELECT chunk_hash, chunk_offset, chunk_length, chunk_index
+                     FROM merkle_leaf_info
+                     WHERE file_path = ?1
+                     ORDER BY chunk_index ASC",
+                )?;
+                let rows = stmt.query_map([path_str], |row| {
+                    let hash_bytes: Vec<u8> = row.get(0)?;
+                    let offset: i64 = row.get(1)?;
+                    let length: i64 = row.get(2)?;
+                    let chunk_index: i64 = row.get(3)?;
+                    let hash = match Blake3Hash::from_slice(&hash_bytes) {
+                        Ok(h) => h,
+                        Err(_) => return Err(rusqlite::Error::IntegralValueOutOfRange(0, 0)),
+                    };
+                    Ok(LeafInfo {
+                        hash,
+                        offset: offset as u64,
+                        length: length as u64,
+                        chunk_index: chunk_index as u32,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await;
+
+        match result {
+            Ok(infos) => {
+                if infos.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(infos))
+                }
+            }
+            Err(e) => {
+                if is_no_rows(&e) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Delete all cached Merkle data for a file.
+    pub async fn delete_merkle(&self, path: &Path) -> SqliteResult<()> {
+        let path_str = path.to_string_lossy().to_string();
+        self.call(move |conn: &mut rusqlite::Connection| {
+            conn.execute("DELETE FROM merkle_cache WHERE file_path = ?1", [&path_str])?;
+            conn.execute(
+                "DELETE FROM merkle_tree_nodes WHERE file_path = ?1",
+                [&path_str],
+            )?;
+            conn.execute(
+                "DELETE FROM merkle_leaf_info WHERE file_path = ?1",
+                [&path_str],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Look up leaf metadata by chunk hash.
