@@ -152,6 +152,27 @@ where
 // Per-stream dispatch
 // ---------------------------------------------------------------------------
 
+/// The first frame received on a new stream.
+struct IncomingRequest {
+    type_id: u8,
+    payload: bytes::Bytes,
+}
+
+/// Receive the first frame from a stream, or return Ok(None) for empty streams.
+async fn recv_request<S: RiftStream>(stream: &mut S) -> anyhow::Result<Option<IncomingRequest>> {
+    match stream.recv_frame().await {
+        Ok(Some((type_id, payload))) => Ok(Some(IncomingRequest { type_id, payload })),
+        Ok(None) => {
+            debug!("empty stream — ignoring");
+            Ok(None)
+        }
+        Err(e) => {
+            debug!(error = %e, "recv_frame failed");
+            Err(e.into())
+        }
+    }
+}
+
 #[instrument(skip_all, fields(share = %ctx.share.display()), err)]
 async fn handle_stream<S, M: MerkleCache>(
     mut stream: S,
@@ -160,47 +181,59 @@ async fn handle_stream<S, M: MerkleCache>(
 where
     S: RiftStream,
 {
-    let (type_id, payload) = match stream.recv_frame().await {
-        Ok(Some(f)) => f,
-        Ok(None) => {
-            debug!("empty stream — ignoring");
-            return Ok(());
-        }
-        Err(e) => {
-            debug!(error = %e, "recv_frame failed");
-            return Err(e.into());
-        }
+    let request = match recv_request(&mut stream).await? {
+        Some(r) => r,
+        None => return Ok(()),
     };
 
     debug!(
-        type_id = type_id,
-        payload_len = payload.len(),
+        type_id = request.type_id,
+        payload_len = request.payload.len(),
         "received request"
     );
 
-    match type_id {
+    dispatch_request(&mut stream, request, &ctx).await
+}
+
+/// Dispatch an incoming request to the appropriate handler.
+#[instrument(skip_all, fields(share = %ctx.share.display()), err)]
+async fn dispatch_request<S, M: MerkleCache>(
+    stream: &mut S,
+    request: IncomingRequest,
+    ctx: &RequestContext<M>,
+) -> anyhow::Result<()>
+where
+    S: RiftStream,
+{
+    match request.type_id {
         // ------------------------------------------------------------------
         // Handshake
         // ------------------------------------------------------------------
         msg::RIFT_HELLO => {
-            let hello = RiftHello::decode(payload.as_ref())?;
-            handle_handshake(&mut stream, &ctx, hello).await?;
+            let hello = RiftHello::decode(request.payload.as_ref())?;
+            handle_handshake(stream, ctx, hello).await?;
         }
 
         // ------------------------------------------------------------------
         // Metadata operations (with optional Merkle cache)
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
-            dispatch_simple(&mut stream, msg::STAT_RESPONSE, || {
-                handler::stat_response(&payload, &ctx.share, ctx.db(), &ctx.handle_db, ctx.chunker)
+            dispatch_simple(stream, msg::STAT_RESPONSE, || {
+                handler::stat_response(
+                    &request.payload,
+                    &ctx.share,
+                    ctx.db(),
+                    &ctx.handle_db,
+                    ctx.chunker,
+                )
             })
             .await?;
         }
 
         msg::LOOKUP_REQUEST => {
-            dispatch_simple(&mut stream, msg::LOOKUP_RESPONSE, || {
+            dispatch_simple(stream, msg::LOOKUP_RESPONSE, || {
                 handler::lookup_response(
-                    &payload,
+                    &request.payload,
                     &ctx.share,
                     ctx.db(),
                     &ctx.handle_db,
@@ -211,8 +244,8 @@ where
         }
 
         msg::READDIR_REQUEST => {
-            dispatch_simple(&mut stream, msg::READDIR_RESPONSE, || {
-                handler::readdir_response(&payload, &ctx.share, &ctx.handle_db)
+            dispatch_simple(stream, msg::READDIR_RESPONSE, || {
+                handler::readdir_response(&request.payload, &ctx.share, &ctx.handle_db)
             })
             .await?;
         }
@@ -221,11 +254,11 @@ where
         // Data operations
         // ------------------------------------------------------------------
         msg::READ_REQUEST => {
-            handle_read_request(&mut stream, &payload, &ctx).await?;
+            handle_read_request(stream, &request.payload, ctx).await?;
         }
 
         msg::MERKLE_DRILL => {
-            handle_merkle_drill_request(&mut stream, &payload, &ctx).await?;
+            handle_merkle_drill_request(stream, &request.payload, ctx).await?;
         }
 
         // ------------------------------------------------------------------
@@ -235,14 +268,13 @@ where
             debug!("unknown message type 0x{other:02X}");
             // Best-effort: don't fail the stream if error send fails
             let _ = send_error_response(
-                &mut stream,
+                stream,
                 ErrorCode::ErrorUnsupported,
                 format!("unknown message type 0x{other:02X}"),
             )
             .await;
         }
     }
-
     Ok(())
 }
 
@@ -637,5 +669,48 @@ mod tests {
         let error = ErrorDetail::decode(payload.as_ref()).unwrap();
         assert_eq!(error.code, ErrorCode::ErrorUnsupported as i32);
         assert_eq!(error.message, "test error");
+    }
+
+    // ------------------------------------------------------------------
+    // Test 8: recv_request returns Some for a valid frame
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn recv_request_returns_some_for_valid_frame() {
+        use rift_transport::connection::InMemoryConnection;
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        // Client sends a frame
+        client_stream.send_frame(0x42, b"hello").await.unwrap();
+        client_stream.finish_send().await.unwrap();
+
+        let request = recv_request(&mut server_stream).await.unwrap();
+        assert!(request.is_some(), "recv_request should return Some");
+        let req = request.unwrap();
+        assert_eq!(req.type_id, 0x42);
+        assert_eq!(&req.payload[..], b"hello");
+    }
+
+    // ------------------------------------------------------------------
+    // Test 9: recv_request returns None for an empty stream
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn recv_request_returns_none_for_empty_stream() {
+        use rift_transport::connection::InMemoryConnection;
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        // Client finishes without sending any frames
+        client_stream.finish_send().await.unwrap();
+
+        let request = recv_request(&mut server_stream).await.unwrap();
+        assert!(
+            request.is_none(),
+            "recv_request should return None for empty stream"
+        );
     }
 }
