@@ -1,0 +1,45 @@
+# Sequential read benchmark — tests Rift's streaming throughput at
+# different block sizes.  All jobs read the same pre-created file
+# (benchfile) so no write path is exercised.
+#
+# Expects: ${DIRECTORY} and ${FILENAME} to be substituted by the
+# runner script before fio parses this file.
+
+[seq-read-1m]
+description=Sequential 1 MiB block read
+directory=${DIRECTORY}
+filename=${FILENAME}
+rw=read
+bs=1m
+size=${SIZE}
+ioengine=psync
+iodepth=1
+numjobs=1
+runtime=${RUNTIME}
+time_based=1
+
+[seq-read-64k]
+description=Sequential 64 KiB block read
+directory=${DIRECTORY}
+filename=${FILENAME}
+rw=read
+bs=64k
+size=${SIZE}
+ioengine=psync
+iodepth=1
+numjobs=1
+runtime=${RUNTIME}
+time_based=1
+
+[seq-read-4k]
+description=Sequential 4 KiB block read
+directory=${DIRECTORY}
+filename=${FILENAME}
+rw=read
+bs=4k
+size=${SIZE}
+ioengine=psync
+iodepth=1
+numjobs=1
+runtime=${RUNTIME}
+time_based=1

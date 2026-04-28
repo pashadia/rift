@@ -23,6 +23,9 @@ Thumbs.db
 
 .worktrees/
 
+# Benchmark results
+bench-results/
+
 # Mutants
 mutants.out*
 

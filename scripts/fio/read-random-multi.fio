@@ -1,0 +1,20 @@
+# Concurrent random readers — N jobs each doing independent random 4K
+# reads.  The most hostile workload for a chunked cache: every request
+# may target a different chunk, stressing parallel fetch and cache
+# eviction.
+#
+# Expects: ${DIRECTORY}, ${FILENAME}, ${SIZE}, ${RUNTIME}, ${NUMJOBS}
+
+[concurrent-randread]
+description=Concurrent random 4 KiB readers
+directory=${DIRECTORY}
+filename=${FILENAME}
+rw=randread
+bs=4k
+size=${SIZE}
+ioengine=psync
+iodepth=1
+numjobs=${NUMJOBS}
+runtime=${RUNTIME}
+time_based=1
+group_reporting=1

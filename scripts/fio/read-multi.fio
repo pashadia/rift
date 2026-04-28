@@ -1,0 +1,19 @@
+# Multi-reader benchmark — N concurrent sequential readers hitting the
+# same file.  Measures whether the server scales across parallel QUIC
+# streams and whether the FUSE mount handles concurrent requests.
+#
+# Expects: ${DIRECTORY}, ${FILENAME}, ${SIZE}, ${RUNTIME}
+
+[multi-reader]
+description=Concurrent sequential readers
+directory=${DIRECTORY}
+filename=${FILENAME}
+rw=read
+bs=1m
+size=${SIZE}
+ioengine=psync
+iodepth=1
+numjobs=${NUMJOBS}
+runtime=${RUNTIME}
+time_based=1
+group_reporting=1

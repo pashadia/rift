@@ -1,0 +1,11 @@
+# Small-file read benchmark — exercises readdir + open + read + close
+# for many tiny files, rather than streaming a single large file.
+# This stresses the metadata path more than the data path.
+#
+# NOTE: This suite uses a shell-based benchmark instead of fio because
+# fio has compatibility issues with FUSE mounts (ENOSYS on open, file
+# size detection).  The runner script handles it specially via
+# run_small_files_suite().
+
+# This file is intentionally left as documentation only.
+# The actual benchmark is run by scripts/bench-read.sh.
