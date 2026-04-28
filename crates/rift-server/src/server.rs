@@ -33,6 +33,43 @@ use rift_transport::{
 use crate::{handle::HandleDatabase, handler, handler::merkle_cache_trait::MerkleCache};
 
 // ---------------------------------------------------------------------------
+// RequestContext
+// ---------------------------------------------------------------------------
+
+/// Shared context carried by every stream handler.
+///
+/// Bundles the four dependency parameters (`share`, `db`, `handle_db`,
+/// `chunker`) that were previously threaded through `accept_loop`,
+/// `serve_connection`, and `handle_stream` as separate arguments.
+pub struct RequestContext<M: MerkleCache> {
+    pub share: PathBuf,
+    pub db: Arc<M>,
+    pub handle_db: Arc<HandleDatabase>,
+    pub chunker: Chunker,
+}
+
+impl<M: MerkleCache> RequestContext<M> {
+    /// Returns a reference to the inner Merkle cache.
+    ///
+    /// This is a convenience accessor that replaces the previous
+    /// `db.as_ref()` calls at handler call sites.
+    pub fn db(&self) -> &M {
+        self.db.as_ref()
+    }
+}
+
+impl<M: MerkleCache> Clone for RequestContext<M> {
+    fn clone(&self) -> Self {
+        Self {
+            share: self.share.clone(),
+            db: self.db.clone(),
+            handle_db: self.handle_db.clone(),
+            chunker: self.chunker,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -42,13 +79,10 @@ use crate::{handle::HandleDatabase, handler, handler::merkle_cache_trait::Merkle
 /// to disable caching (root hashes will still be computed on-demand).
 ///
 /// Generic over any [`RiftListener`] to allow testing with in-memory transports.
-#[instrument(skip(listener, db, handle_db), fields(share = %share.display(), listen_addr = %listener.local_addr()))]
+#[instrument(skip(listener, ctx), fields(share = %ctx.share.display(), listen_addr = %listener.local_addr()))]
 pub async fn accept_loop<L, M: MerkleCache + 'static>(
     listener: L,
-    share: PathBuf,
-    db: Arc<M>,
-    handle_db: Arc<HandleDatabase>,
-    chunker: Chunker,
+    ctx: RequestContext<M>,
 ) -> anyhow::Result<()>
 where
     L: RiftListener,
@@ -58,15 +92,12 @@ where
     loop {
         match listener.accept().await {
             Ok(conn) => {
-                let share = share.clone();
-                let db = db.clone();
-                let handle_db = handle_db.clone();
+                let ctx = ctx.clone();
                 let peer = conn.peer_fingerprint().to_string();
                 let conn_span = debug_span!("server.connection", peer = %peer);
-                let chunker = chunker;
                 tokio::spawn(
                     async move {
-                        serve_connection(conn, share, db, handle_db, chunker).await;
+                        serve_connection(conn, ctx).await;
                     }
                     .instrument(conn_span),
                 );
@@ -84,14 +115,9 @@ where
 // Per-connection loop
 // ---------------------------------------------------------------------------
 
-#[instrument(skip(conn, share, db, handle_db, chunker), fields(share = %share.display(), peer = %conn.peer_fingerprint()))]
-async fn serve_connection<C, M: MerkleCache + 'static>(
-    conn: C,
-    share: PathBuf,
-    db: Arc<M>,
-    handle_db: Arc<HandleDatabase>,
-    chunker: Chunker,
-) where
+#[instrument(skip(conn, ctx), fields(share = %ctx.share.display(), peer = %conn.peer_fingerprint()))]
+async fn serve_connection<C, M: MerkleCache + 'static>(conn: C, ctx: RequestContext<M>)
+where
     C: RiftConnection,
     C::Stream: 'static,
 {
@@ -103,14 +129,11 @@ async fn serve_connection<C, M: MerkleCache + 'static>(
     loop {
         match conn.accept_stream().await {
             Ok(stream) => {
-                let share = share.clone();
-                let db = db.clone();
-                let handle_db = handle_db.clone();
-                let chunker = chunker;
-                let stream_span = debug_span!("server.stream", share = %share.display());
+                let ctx = ctx.clone();
+                let stream_span = debug_span!("server.stream", share = %ctx.share.display());
                 tokio::spawn(
                     async move {
-                        if let Err(e) = handle_stream(stream, share, db, handle_db, chunker).await {
+                        if let Err(e) = handle_stream(stream, ctx).await {
                             debug!("stream error: {}", e);
                         }
                     }
@@ -129,13 +152,10 @@ async fn serve_connection<C, M: MerkleCache + 'static>(
 // Per-stream dispatch
 // ---------------------------------------------------------------------------
 
-#[instrument(skip_all, fields(share = %share.display()), err)]
+#[instrument(skip_all, fields(share = %ctx.share.display()), err)]
 async fn handle_stream<S, M: MerkleCache>(
     mut stream: S,
-    share: PathBuf,
-    db: Arc<M>,
-    handle_db: Arc<HandleDatabase>,
-    chunker: Chunker,
+    ctx: RequestContext<M>,
 ) -> anyhow::Result<()>
 where
     S: RiftStream,
@@ -174,7 +194,7 @@ where
             }
 
             // Get or create handle for the share root
-            let root_handle = match handle_db.get_or_create_handle(&share).await {
+            let root_handle = match ctx.handle_db.get_or_create_handle(&ctx.share).await {
                 Ok(uuid) => uuid.as_bytes().to_vec(),
                 Err(_) => {
                     anyhow::bail!("failed to get root handle for share");
@@ -201,9 +221,9 @@ where
         // Metadata operations (with optional Merkle cache)
         // ------------------------------------------------------------------
         msg::STAT_REQUEST => {
-            let db_ref = db.as_ref();
             let response =
-                handler::stat_response(&payload, &share, db_ref, &handle_db, chunker).await;
+                handler::stat_response(&payload, &ctx.share, ctx.db(), &ctx.handle_db, ctx.chunker)
+                    .await;
             stream
                 .send_frame(msg::STAT_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -211,9 +231,14 @@ where
         }
 
         msg::LOOKUP_REQUEST => {
-            let db_ref = db.as_ref();
-            let response =
-                handler::lookup_response(&payload, &share, db_ref, &handle_db, chunker).await;
+            let response = handler::lookup_response(
+                &payload,
+                &ctx.share,
+                ctx.db(),
+                &ctx.handle_db,
+                ctx.chunker,
+            )
+            .await;
             stream
                 .send_frame(msg::LOOKUP_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -221,7 +246,7 @@ where
         }
 
         msg::READDIR_REQUEST => {
-            let response = handler::readdir_response(&payload, &share, &handle_db).await;
+            let response = handler::readdir_response(&payload, &ctx.share, &ctx.handle_db).await;
             stream
                 .send_frame(msg::READDIR_RESPONSE, &response.encode_to_vec())
                 .await?;
@@ -232,21 +257,26 @@ where
         // Data operations
         // ------------------------------------------------------------------
         msg::READ_REQUEST => {
-            let db_ref = db.as_ref();
-            handler::read_response(&mut stream, &payload, &share, db_ref, &handle_db, chunker)
-                .await
-                .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
+            handler::read_response(
+                &mut stream,
+                &payload,
+                &ctx.share,
+                ctx.db(),
+                &ctx.handle_db,
+                ctx.chunker,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("read failed: {}", e))?;
         }
 
         msg::MERKLE_DRILL => {
-            let db_ref = db.as_ref();
             handler::merkle_drill_response(
                 &mut stream,
                 &payload,
-                &share,
-                db_ref,
-                &handle_db,
-                chunker,
+                &ctx.share,
+                ctx.db(),
+                &ctx.handle_db,
+                ctx.chunker,
             )
             .await
             .map_err(|e| anyhow::anyhow!("merkle_drill failed: {}", e))?;
@@ -305,13 +335,13 @@ mod tests {
         let (listener, connector) = InMemoryListener::new("test-server-fp", "test-client-fp");
         let db: Arc<NoopCache> = Arc::new(NoopCache);
         let handle_db = Arc::new(HandleDatabase::new());
-        let handle = tokio::spawn(accept_loop(
-            listener,
+        let ctx = RequestContext {
             share,
             db,
             handle_db,
-            Chunker::default(),
-        ));
+            chunker: Chunker::default(),
+        };
+        let handle = tokio::spawn(accept_loop(listener, ctx));
         (handle, connector)
     }
 

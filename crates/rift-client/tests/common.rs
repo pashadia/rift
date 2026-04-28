@@ -40,9 +40,13 @@ pub async fn start_server(share: PathBuf) -> SocketAddr {
         let db: Arc<rift_server::handler::NoopCache> = Arc::new(rift_server::handler::NoopCache);
         let handle_db = Arc::new(rift_server::handle::HandleDatabase::new());
         let chunker = rift_common::crypto::Chunker::new(64, 256, 1024);
-        rt.block_on(async {
-            rift_server::server::accept_loop(listener, share, db, handle_db, chunker).await
-        })
+        let ctx = rift_server::server::RequestContext {
+            share,
+            db,
+            handle_db,
+            chunker,
+        };
+        rt.block_on(async { rift_server::server::accept_loop(listener, ctx).await })
     });
 
     // Wait for server to be ready
