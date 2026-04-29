@@ -55,6 +55,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Key material zeroization
 zeroize = { version = "1", features = ["derive"] }
+arc-swap = "1"
 
 # QUIC and TLS
 quinn = "0.11"

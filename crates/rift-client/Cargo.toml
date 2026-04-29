@@ -29,6 +29,7 @@ scc.workspace = true
 tempfile.workspace = true
 bytes.workspace = true
 zeroize.workspace = true
+arc-swap.workspace = true
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
