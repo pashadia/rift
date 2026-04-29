@@ -1319,6 +1319,42 @@ mod merkle_offset_tests {
 mod verify_node_tests {
     use super::*;
 
+    fn test_hashes(count: usize) -> Vec<Blake3Hash> {
+        (0..count).map(|i| Blake3Hash::new(&[i as u8])).collect()
+    }
+
+    fn extract_hashes(children: &[MerkleChild]) -> Vec<Blake3Hash> {
+        children
+            .iter()
+            .map(|c| match c {
+                MerkleChild::Leaf { hash, .. } | MerkleChild::Subtree(hash) => hash.clone(),
+            })
+            .collect()
+    }
+
+    fn assert_full_drill(
+        root: &Blake3Hash,
+        cache: &std::collections::HashMap<Blake3Hash, Vec<MerkleChild>>,
+    ) {
+        let root_children = &cache[root];
+        assert!(
+            MerkleTree::verify_node(root, &extract_hashes(root_children)),
+            "root verification should pass"
+        );
+        for child in root_children {
+            let MerkleChild::Subtree(parent_hash) = child else {
+                continue;
+            };
+            let children = cache
+                .get(parent_hash)
+                .expect("every subtree child should be in the cache");
+            assert!(
+                MerkleTree::verify_node(parent_hash, &extract_hashes(children)),
+                "intermediate node {parent_hash:?} verification should pass"
+            );
+        }
+    }
+
     // Test 1: Single leaf — root == leaf hash (identity), verify_node returns true
     #[test]
     fn verify_node_single_leaf_identity() {
@@ -1341,7 +1377,7 @@ mod verify_node_tests {
     #[test]
     fn verify_node_64_leaves_one_fanout_group() {
         let tree = MerkleTree::new(64);
-        let leaves: Vec<Blake3Hash> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves = test_hashes(64);
         let root = tree.build(&leaves);
         // The root is the hash of all 64 children
         assert!(MerkleTree::verify_node(&root, &leaves));
@@ -1351,7 +1387,7 @@ mod verify_node_tests {
     #[test]
     fn verify_node_65_leaves_two_groups() {
         let tree = MerkleTree::new(64);
-        let leaves: Vec<Blake3Hash> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves = test_hashes(65);
         let root = tree.build(&leaves);
 
         // Level 1 has 2 intermediate nodes
@@ -1418,7 +1454,7 @@ mod verify_node_tests {
     #[test]
     fn verify_node_single_child_intermediate_node() {
         let tree = MerkleTree::new(64);
-        let leaves: Vec<Blake3Hash> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves = test_hashes(65);
         let (_root, cache) = tree.build_with_cache(&leaves);
 
         // Find the intermediate node that has exactly 1 child.
@@ -1427,10 +1463,10 @@ mod verify_node_tests {
             .find(|(_, children)| children.len() == 1)
             .expect("there should be an intermediate node with exactly 1 child");
         let single_child_parent = parent.clone();
-        let single_child_hash = match &children[0] {
-            MerkleChild::Leaf { hash, .. } => hash.clone(),
-            MerkleChild::Subtree(hash) => hash.clone(),
-        };
+        let single_child_hash = extract_hashes(children)
+            .into_iter()
+            .next()
+            .expect("single-child node should have exactly one child");
 
         // This assertion should FAIL because build_with_cache hashes a single child,
         // but verify_node expects identity (parent == child) for single children.
@@ -1448,99 +1484,27 @@ mod verify_node_tests {
     #[test]
     fn verify_node_65_leaves_full_drill() {
         let tree = MerkleTree::new(64);
-        let leaves: Vec<Blake3Hash> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves = test_hashes(65);
         let (root, cache) = tree.build_with_cache(&leaves);
-
-        // Helper to extract Blake3Hash from MerkleChild
-        let child_hashes = |children: &[MerkleChild]| -> Vec<Blake3Hash> {
-            children
-                .iter()
-                .map(|c| match c {
-                    MerkleChild::Leaf { hash, .. } => hash.clone(),
-                    MerkleChild::Subtree(hash) => hash.clone(),
-                })
-                .collect()
-        };
-
-        // Verify root node
-        let root_children = &cache[&root];
-        assert!(
-            MerkleTree::verify_node(&root, &child_hashes(root_children)),
-            "root verification should pass"
-        );
-
-        // Drill into each subtree child and verify
-        for child in root_children {
-            if let MerkleChild::Subtree(parent_hash) = child {
-                let children = cache
-                    .get(parent_hash)
-                    .expect("every subtree child should be in the cache");
-                assert!(
-                    MerkleTree::verify_node(parent_hash, &child_hashes(children)),
-                    "intermediate node {parent_hash:?} verification should pass"
-                );
-            }
-        }
+        assert_full_drill(&root, &cache);
     }
 
     // Test 10: 64 leaves (exact fanout) should pass full drill — no single-child nodes.
     #[test]
     fn verify_node_64_leaves_full_drill() {
         let tree = MerkleTree::new(64);
-        let leaves: Vec<Blake3Hash> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves = test_hashes(64);
         let (root, cache) = tree.build_with_cache(&leaves);
-
-        let child_hashes = |children: &[MerkleChild]| -> Vec<Blake3Hash> {
-            children
-                .iter()
-                .map(|c| match c {
-                    MerkleChild::Leaf { hash, .. } => hash.clone(),
-                    MerkleChild::Subtree(hash) => hash.clone(),
-                })
-                .collect()
-        };
-
-        let root_children = &cache[&root];
-        assert!(
-            MerkleTree::verify_node(&root, &child_hashes(root_children)),
-            "root verification should pass"
-        );
+        assert_full_drill(&root, &cache);
     }
 
     // Test 11: 66 leaves should pass full drill — no single-child nodes.
     #[test]
     fn verify_node_66_leaves_full_drill() {
         let tree = MerkleTree::new(64);
-        let leaves: Vec<Blake3Hash> = (0u8..66).map(|i| Blake3Hash::new(&[i])).collect();
+        let leaves = test_hashes(66);
         let (root, cache) = tree.build_with_cache(&leaves);
-
-        let child_hashes = |children: &[MerkleChild]| -> Vec<Blake3Hash> {
-            children
-                .iter()
-                .map(|c| match c {
-                    MerkleChild::Leaf { hash, .. } => hash.clone(),
-                    MerkleChild::Subtree(hash) => hash.clone(),
-                })
-                .collect()
-        };
-
-        let root_children = &cache[&root];
-        assert!(
-            MerkleTree::verify_node(&root, &child_hashes(root_children)),
-            "root verification should pass"
-        );
-
-        for child in root_children {
-            if let MerkleChild::Subtree(parent_hash) = child {
-                let children = cache
-                    .get(parent_hash)
-                    .expect("every subtree child should be in the cache");
-                assert!(
-                    MerkleTree::verify_node(parent_hash, &child_hashes(children)),
-                    "intermediate node {parent_hash:?} verification should pass"
-                );
-            }
-        }
+        assert_full_drill(&root, &cache);
     }
 }
 
