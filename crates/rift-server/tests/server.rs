@@ -642,7 +642,10 @@ async fn resolve_accepts_broken_symlink_with_valid_relative_target() {
 
     // Create a broken symlink: share/link -> nonexistent_file
     // This is a simple relative target that stays within the share.
-    let link_path = share.join("good_link");
+    // Use the canonical share path so comparisons work on macOS where
+    // TempDir returns /var/... but the canonical form is /private/var/...
+    let canonical_share = share.canonicalize().unwrap();
+    let link_path = canonical_share.join("good_link");
     std::os::unix::fs::symlink("nonexistent_file", &link_path).unwrap();
 
     let handle_db = rift_server::handle::HandleDatabase::new();
