@@ -211,6 +211,23 @@ impl MerkleTree {
         Self { fanout }
     }
 
+    /// Compute the parent hash for a group of children.
+    ///
+    /// - Empty group → `BLAKE3("")`
+    /// - Single child → identity (`child_hash.clone()`)
+    /// - Multiple children → `BLAKE3(child_0 || child_1 || ...)`
+    fn hash_group(children: &[Blake3Hash]) -> Blake3Hash {
+        if children.len() == 1 {
+            children[0].clone()
+        } else {
+            let mut hasher = Hasher::new();
+            for child in children {
+                hasher.update(child.as_bytes());
+            }
+            Blake3Hash(*hasher.finalize().as_bytes())
+        }
+    }
+
     /// Build a Merkle tree from leaf hashes
     #[must_use]
     pub fn build(&self, leaf_hashes: &[Blake3Hash]) -> Blake3Hash {
@@ -229,17 +246,7 @@ impl MerkleTree {
             let mut next_level = Vec::new();
 
             for chunk in current_level.chunks(self.fanout) {
-                if chunk.len() == 1 {
-                    // Single child: identity (parent == child)
-                    next_level.push(chunk[0].clone());
-                } else {
-                    let mut hasher = Hasher::new();
-                    for hash in chunk {
-                        hasher.update(hash.as_ref());
-                    }
-                    let combined_hash = hasher.finalize();
-                    next_level.push(Blake3Hash(*combined_hash.as_bytes()));
-                }
+                next_level.push(Self::hash_group(chunk));
             }
 
             current_level = next_level;
@@ -260,18 +267,7 @@ impl MerkleTree {
     /// (parent == child), while two or more children are BLAKE3-hashed together.
     #[must_use]
     pub fn verify_node(parent_hash: &Blake3Hash, children: &[Blake3Hash]) -> bool {
-        if children.is_empty() {
-            return *parent_hash == Blake3Hash::new(&[]);
-        }
-        if children.len() == 1 {
-            return *parent_hash == children[0];
-        }
-        let mut hasher = Hasher::new();
-        for child in children {
-            hasher.update(child.as_bytes());
-        }
-        let computed = Blake3Hash(*hasher.finalize().as_bytes());
-        computed == *parent_hash
+        Self::hash_group(children) == *parent_hash
     }
 
     /// Serialize leaf hashes into a packed byte array for storage.
@@ -358,19 +354,9 @@ impl MerkleTree {
                         children.push(MerkleChild::Subtree(hash.clone()));
                     }
                 }
-                if chunk.len() == 1 {
-                    // Single child: identity (parent == child), matching verify_node
-                    cache.insert(chunk[0].clone(), children);
-                    next_level.push(chunk[0].clone());
-                } else {
-                    let mut hasher = Hasher::new();
-                    for hash in chunk {
-                        hasher.update(hash.as_bytes());
-                    }
-                    let parent_hash = Blake3Hash(*hasher.finalize().as_bytes());
-                    cache.insert(parent_hash.clone(), children);
-                    next_level.push(parent_hash);
-                }
+                let parent_hash = Self::hash_group(chunk);
+                cache.insert(parent_hash.clone(), children);
+                next_level.push(parent_hash);
             }
             is_bottom_level = false;
             current_level = next_level;
