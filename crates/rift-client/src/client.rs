@@ -465,7 +465,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("stat: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("stat: open stream"))?;
 
         let req = StatRequest {
             handles: vec![handle.as_bytes().to_vec()],
@@ -505,7 +505,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("lookup: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("lookup: open stream"))?;
 
         let req = LookupRequest {
             parent_handle: parent.as_bytes().to_vec(),
@@ -548,7 +548,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("readdir: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("readdir: open stream"))?;
 
         let req = ReaddirRequest {
             directory_handle: handle.as_bytes().to_vec(),
@@ -593,7 +593,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("read_chunks: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("read_chunks: open stream"))?;
 
         let req = ReadRequest {
             handle: handle.as_bytes().to_vec(),
@@ -686,7 +686,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("merkle_drill: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("merkle_drill: open stream"))?;
 
         let req = MerkleDrill {
             handle: handle.as_bytes().to_vec(),
@@ -712,7 +712,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("whoami: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("whoami: open stream"))?;
 
         let req = WhoamiRequest {};
         stream
@@ -758,7 +758,7 @@ impl<C: RiftConnection> RiftClient<C> {
             .conn
             .open_stream()
             .await
-            .map_err(|e| anyhow::anyhow!("stat_batch: open stream: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("stat_batch: open stream"))?;
 
         let req = StatRequest {
             handles: handle_bytes,

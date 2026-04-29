@@ -276,6 +276,20 @@ mod tests {
     }
 
     #[test]
+    fn is_connection_error_walks_chain_through_context_wrappers() {
+        use rift_transport::TransportError;
+        // Simulate what client.rs does: TransportError wrapped with .context()
+        // (not stringified). is_connection_error must find it through the chain.
+        let err = anyhow::Error::from(TransportError::ConnectionClosed)
+            .context("open stream")
+            .context("lookup");
+        assert!(
+            is_connection_error(&err),
+            "must recognise TransportError wrapped in anyhow context layers"
+        );
+    }
+
+    #[test]
     fn is_connection_error_uses_typed_downcast_for_transport_errors() {
         use rift_transport::TransportError;
 
