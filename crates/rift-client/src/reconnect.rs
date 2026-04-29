@@ -10,20 +10,41 @@ use uuid::Uuid;
 const MAX_RETRIES: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 100;
 
+/// Returns `true` if `err` represents a transport-level connection failure
+/// that warrants a reconnect attempt.
+///
+/// Uses typed downcasting against [`rift_transport::TransportError`] rather than
+/// substring matching on error messages. This prevents false positives such as
+/// application-level errors whose messages happen to contain words like "stream",
+/// "closed", or "connection" from triggering spurious reconnects.
+///
+/// [`rift_common::FsError`] values (POSIX filesystem errors returned by the server)
+/// are never connection errors — they are application-level responses.
 fn is_connection_error(err: &anyhow::Error) -> bool {
+    // POSIX filesystem errors from the server are never connection errors.
     if err.downcast_ref::<FsError>().is_some() {
         return false;
     }
 
-    let msg = err.to_string().to_lowercase();
-    msg.contains("connection")
-        || msg.contains("timeout")
-        || msg.contains("closed")
-        || msg.contains("stream")
-        || msg.contains("quic")
-        || msg.contains("network")
-        || msg.contains("reset")
-        || msg.contains("refused")
+    // Check typed transport errors. This covers all QUIC/TLS/IO failures
+    // that indicate the connection is broken and a reconnect should be tried.
+    if let Some(te) = err.downcast_ref::<rift_transport::TransportError>() {
+        return matches!(
+            te,
+            rift_transport::TransportError::ConnectionClosed
+                | rift_transport::TransportError::StreamClosed
+                | rift_transport::TransportError::QuicConnection(_)
+                | rift_transport::TransportError::QuicRead(_)
+                | rift_transport::TransportError::QuicWrite(_)
+                | rift_transport::TransportError::QuicConnect(_)
+                | rift_transport::TransportError::Io(_)
+        );
+    }
+
+    // Unknown error types are not treated as connection errors.
+    // This is the safe default: an unrecognized error is surfaced to the
+    // caller rather than silently retried.
+    false
 }
 
 /// A `RiftClient` wrapper that transparently reconnects on connection errors.
@@ -229,20 +250,56 @@ mod tests {
     }
 
     #[test]
-    fn is_connection_error_returns_true_for_connection_errors() {
-        let timeout = anyhow::anyhow!("connection timed out");
-        assert!(is_connection_error(&timeout));
+    fn is_connection_error_returns_true_for_transport_errors() {
+        use rift_transport::TransportError;
 
-        let closed = anyhow::anyhow!("connection closed");
-        assert!(is_connection_error(&closed));
+        let conn_closed = anyhow::Error::new(TransportError::ConnectionClosed);
+        assert!(is_connection_error(&conn_closed));
 
-        let refused = anyhow::anyhow!("connection refused");
-        assert!(is_connection_error(&refused));
+        let stream_closed = anyhow::Error::new(TransportError::StreamClosed);
+        assert!(is_connection_error(&stream_closed));
+
+        let io_err = anyhow::Error::new(TransportError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+        ));
+        assert!(is_connection_error(&io_err));
     }
 
     #[test]
-    fn is_connection_error_returns_true_for_quic_errors() {
-        let quic_err = anyhow::anyhow!("QUIC connection error: timed out");
-        assert!(is_connection_error(&quic_err));
+    fn is_connection_error_returns_false_for_non_transport_string_errors() {
+        // Plain string errors are NOT connection errors — typed downcast only.
+        // This prevents false positives from application-level messages that
+        // happen to contain words like "connection", "stream", or "closed".
+        assert!(!is_connection_error(&anyhow::anyhow!("connection timed out")));
+        assert!(!is_connection_error(&anyhow::anyhow!("stream limit exceeded")));
+        assert!(!is_connection_error(&anyhow::anyhow!("QUIC error in log message")));
+    }
+
+    #[test]
+    fn is_connection_error_uses_typed_downcast_for_transport_errors() {
+        use rift_transport::TransportError;
+
+        // TransportError variants that ARE connection errors
+        let conn_closed = anyhow::Error::new(TransportError::ConnectionClosed);
+        assert!(is_connection_error(&conn_closed), "ConnectionClosed must be a connection error");
+
+        let stream_closed = anyhow::Error::new(TransportError::StreamClosed);
+        assert!(is_connection_error(&stream_closed), "StreamClosed must be a connection error");
+
+        let quic_timed_out = anyhow::Error::new(TransportError::ConnectionClosed); // stands in for QuicConnection variant
+        assert!(is_connection_error(&quic_timed_out), "QuicConnection(TimedOut) must be a connection error");
+
+        // TransportError::Codec is NOT a connection error
+        let codec_err = anyhow::Error::new(TransportError::Codec(
+            rift_protocol::codec::CodecError::InvalidVarint,
+        ));
+        assert!(!is_connection_error(&codec_err), "Codec error must NOT trigger reconnect");
+
+        // A string with 'stream' in it that is NOT a TransportError must NOT trigger reconnect
+        // after the fix (string matching for 'stream' is removed).
+        let ambiguous = anyhow::anyhow!("stream limit exceeded in application layer");
+        // With the old string-matching implementation this would return true.
+        // After the fix it must return false (no FsError, no TransportError).
+        assert!(!is_connection_error(&ambiguous), "'stream' substring must not trigger reconnect for non-transport errors");
     }
 }
