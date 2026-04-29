@@ -229,12 +229,17 @@ impl MerkleTree {
             let mut next_level = Vec::new();
 
             for chunk in current_level.chunks(self.fanout) {
-                let mut hasher = Hasher::new();
-                for hash in chunk {
-                    hasher.update(hash.as_ref());
+                if chunk.len() == 1 {
+                    // Single child: identity (parent == child)
+                    next_level.push(chunk[0].clone());
+                } else {
+                    let mut hasher = Hasher::new();
+                    for hash in chunk {
+                        hasher.update(hash.as_ref());
+                    }
+                    let combined_hash = hasher.finalize();
+                    next_level.push(Blake3Hash(*combined_hash.as_bytes()));
                 }
-                let combined_hash = hasher.finalize();
-                next_level.push(Blake3Hash(*combined_hash.as_bytes()));
             }
 
             current_level = next_level;
@@ -341,10 +346,8 @@ impl MerkleTree {
         while current_level.len() > 1 {
             let mut next_level = Vec::new();
             for (chunk_idx, chunk) in current_level.chunks(self.fanout).enumerate() {
-                let mut hasher = Hasher::new();
                 let mut children = Vec::with_capacity(chunk.len());
                 for (i, hash) in chunk.iter().enumerate() {
-                    hasher.update(hash.as_bytes());
                     if is_bottom_level {
                         children.push(MerkleChild::Leaf {
                             hash: hash.clone(),
@@ -355,9 +358,19 @@ impl MerkleTree {
                         children.push(MerkleChild::Subtree(hash.clone()));
                     }
                 }
-                let parent_hash = Blake3Hash(*hasher.finalize().as_bytes());
-                cache.insert(parent_hash.clone(), children);
-                next_level.push(parent_hash);
+                if chunk.len() == 1 {
+                    // Single child: identity (parent == child), matching verify_node
+                    cache.insert(chunk[0].clone(), children);
+                    next_level.push(chunk[0].clone());
+                } else {
+                    let mut hasher = Hasher::new();
+                    for hash in chunk {
+                        hasher.update(hash.as_bytes());
+                    }
+                    let parent_hash = Blake3Hash(*hasher.finalize().as_bytes());
+                    cache.insert(parent_hash.clone(), children);
+                    next_level.push(parent_hash);
+                }
             }
             is_bottom_level = false;
             current_level = next_level;
@@ -969,7 +982,7 @@ mod merkle_ext_tests {
         // Level 0: 65 leaves [h0, h1, ..., h64]
         // Level 1: 2 nodes
         //   - chunk_0 = hash(h0, h1, ..., h63) for indices 0..64
-        //   - chunk_1 = hash(h64) for index 64
+        //   - chunk_1 = h64 (identity, single child)
         // Level 2: 1 root = hash(chunk_0, chunk_1)
 
         // Verify chunks
@@ -985,12 +998,8 @@ mod merkle_ext_tests {
         }
         let chunk0_hash = Blake3Hash(*hasher0.finalize().as_bytes());
 
-        // Compute chunk_1: hash of last leaf (single element)
-        let mut hasher1 = blake3::Hasher::new();
-        for hash in chunks[1].iter() {
-            hasher1.update(hash.as_bytes());
-        }
-        let chunk1_hash = Blake3Hash(*hasher1.finalize().as_bytes());
+        // chunk_1: single child uses identity (parent == child)
+        let chunk1_hash = chunks[1][0].clone();
 
         // Compute root: hash of both chunk hashes
         let mut root_hasher = blake3::Hasher::new();
@@ -1361,7 +1370,7 @@ mod verify_node_tests {
 
         // Level 1 has 2 intermediate nodes
         //   chunk_0 = hash(leaves[0..64])
-        //   chunk_1 = hash(leaves[64..65])
+        //   chunk_1 = leaves[64] (identity, single child)
         // Root = hash(chunk_0 || chunk_1)
 
         // Compute chunk_0 and chunk_1
@@ -1371,11 +1380,8 @@ mod verify_node_tests {
         }
         let chunk0 = Blake3Hash(*hasher0.finalize().as_bytes());
 
-        let mut hasher1 = blake3::Hasher::new();
-        for h in &leaves[64..65] {
-            hasher1.update(h.as_bytes());
-        }
-        let chunk1 = Blake3Hash(*hasher1.finalize().as_bytes());
+        // chunk_1: single child uses identity (parent == child)
+        let chunk1 = leaves[64].clone();
 
         // Verify the root from 2 subtree children
         assert!(MerkleTree::verify_node(&root, &[chunk0, chunk1]));
@@ -1419,6 +1425,136 @@ mod verify_node_tests {
             &leaf_hash,
             std::slice::from_ref(&leaf_hash)
         ));
+    }
+
+    // Test 8: Reproducer for verify_node inconsistency on single-child intermediate node.
+    // build_with_cache hashes a single child, but verify_node expects identity.
+    #[test]
+    fn verify_node_single_child_intermediate_node() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<Blake3Hash> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let (_root, cache) = tree.build_with_cache(&leaves);
+
+        // Find the intermediate node that has exactly 1 child.
+        let (parent, children) = cache
+            .iter()
+            .find(|(_, children)| children.len() == 1)
+            .expect("there should be an intermediate node with exactly 1 child");
+        let single_child_parent = parent.clone();
+        let single_child_hash = match &children[0] {
+            MerkleChild::Leaf { hash, .. } => hash.clone(),
+            MerkleChild::Subtree(hash) => hash.clone(),
+        };
+
+        // This assertion should FAIL because build_with_cache hashes a single child,
+        // but verify_node expects identity (parent == child) for single children.
+        assert!(
+            MerkleTree::verify_node(
+                &single_child_parent,
+                std::slice::from_ref(&single_child_hash)
+            ),
+            "verify_node should pass for a single-child intermediate node"
+        );
+    }
+
+    // Test 9: Full client-style drill verification for 65 leaves.
+    // Simulates resolve_merkle_tree by calling verify_node at every drill level.
+    #[test]
+    fn verify_node_65_leaves_full_drill() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<Blake3Hash> = (0u8..65).map(|i| Blake3Hash::new(&[i])).collect();
+        let (root, cache) = tree.build_with_cache(&leaves);
+
+        // Helper to extract Blake3Hash from MerkleChild
+        let child_hashes = |children: &[MerkleChild]| -> Vec<Blake3Hash> {
+            children
+                .iter()
+                .map(|c| match c {
+                    MerkleChild::Leaf { hash, .. } => hash.clone(),
+                    MerkleChild::Subtree(hash) => hash.clone(),
+                })
+                .collect()
+        };
+
+        // Verify root node
+        let root_children = &cache[&root];
+        assert!(
+            MerkleTree::verify_node(&root, &child_hashes(root_children)),
+            "root verification should pass"
+        );
+
+        // Drill into each subtree child and verify
+        for child in root_children {
+            if let MerkleChild::Subtree(parent_hash) = child {
+                let children = cache
+                    .get(parent_hash)
+                    .expect("every subtree child should be in the cache");
+                assert!(
+                    MerkleTree::verify_node(parent_hash, &child_hashes(children)),
+                    "intermediate node {parent_hash:?} verification should pass"
+                );
+            }
+        }
+    }
+
+    // Test 10: 64 leaves (exact fanout) should pass full drill — no single-child nodes.
+    #[test]
+    fn verify_node_64_leaves_full_drill() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<Blake3Hash> = (0u8..64).map(|i| Blake3Hash::new(&[i])).collect();
+        let (root, cache) = tree.build_with_cache(&leaves);
+
+        let child_hashes = |children: &[MerkleChild]| -> Vec<Blake3Hash> {
+            children
+                .iter()
+                .map(|c| match c {
+                    MerkleChild::Leaf { hash, .. } => hash.clone(),
+                    MerkleChild::Subtree(hash) => hash.clone(),
+                })
+                .collect()
+        };
+
+        let root_children = &cache[&root];
+        assert!(
+            MerkleTree::verify_node(&root, &child_hashes(root_children)),
+            "root verification should pass"
+        );
+    }
+
+    // Test 11: 66 leaves should pass full drill — no single-child nodes.
+    #[test]
+    fn verify_node_66_leaves_full_drill() {
+        let tree = MerkleTree::new(64);
+        let leaves: Vec<Blake3Hash> = (0u8..66).map(|i| Blake3Hash::new(&[i])).collect();
+        let (root, cache) = tree.build_with_cache(&leaves);
+
+        let child_hashes = |children: &[MerkleChild]| -> Vec<Blake3Hash> {
+            children
+                .iter()
+                .map(|c| match c {
+                    MerkleChild::Leaf { hash, .. } => hash.clone(),
+                    MerkleChild::Subtree(hash) => hash.clone(),
+                })
+                .collect()
+        };
+
+        let root_children = &cache[&root];
+        assert!(
+            MerkleTree::verify_node(&root, &child_hashes(root_children)),
+            "root verification should pass"
+        );
+
+        for child in root_children {
+            if let MerkleChild::Subtree(parent_hash) = child {
+                let children = cache
+                    .get(parent_hash)
+                    .expect("every subtree child should be in the cache");
+                assert!(
+                    MerkleTree::verify_node(parent_hash, &child_hashes(children)),
+                    "intermediate node {parent_hash:?} verification should pass"
+                );
+            }
+        }
     }
 }
 
