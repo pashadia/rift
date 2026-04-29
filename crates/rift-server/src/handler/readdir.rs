@@ -340,7 +340,9 @@ mod tests {
         //    not from the canonical target path. Look up the handle in the
         //    database and verify it resolves back to the symlink's own path
         //    (not the resolved target).
-        let link_path = share.join("link.txt");
+        // Use the canonical share path so the comparison works on macOS where
+        // TempDir returns /var/... but canonicalize() resolves /var -> /private/var.
+        let link_path = share.canonicalize().unwrap().join("link.txt");
         let handle_uuid =
             Uuid::from_slice(&link_entry.handle).expect("handle must be a valid UUID");
         let stored_path = handle_db

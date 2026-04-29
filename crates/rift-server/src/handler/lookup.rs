@@ -393,12 +393,14 @@ mod tests {
             "symlink_target must match the link target"
         );
 
-        // 3. The handle must map back to the symlink's own path, not the canonical target
+        // 3. The handle must map back to the symlink's own path, not the canonical target.
+        // Use the canonical share path so the comparison works on macOS where
+        // TempDir returns /var/... but canonicalize() resolves /var -> /private/var.
         let handle_uuid = Uuid::from_slice(&entry.handle).expect("handle must be a valid UUID");
         let stored_path = handle_db
             .get_path(&handle_uuid)
             .expect("handle must exist in database");
-        let link_path = share.join("link.txt");
+        let link_path = share.canonicalize().unwrap().join("link.txt");
         assert_eq!(
             stored_path, link_path,
             "symlink handle must map to the symlink's own path"
