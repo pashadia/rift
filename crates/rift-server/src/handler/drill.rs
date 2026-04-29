@@ -88,19 +88,32 @@ async fn build_and_cache_tree<M: MerkleCache>(
     let chunk_boundaries = chunker.chunk_stream(reader).await;
 
     let mut file = tokio::fs::File::open(canonical).await.ok()?;
-    let mut leaf_hashes = Vec::with_capacity(chunk_boundaries.len());
+
+    // Read all chunk data with async I/O
+    let mut chunk_data: Vec<Vec<u8>> = Vec::with_capacity(chunk_boundaries.len());
     for (offset, length) in &chunk_boundaries {
         let mut buf = vec![0u8; *length];
         file.seek(SeekFrom::Start(*offset as u64)).await.ok()?;
         file.read_exact(&mut buf).await.ok()?;
-        leaf_hashes.push(Blake3Hash::new(&buf));
+        chunk_data.push(buf);
     }
 
-    let merkle = MerkleTree::default();
-    let (root, cache, leaf_infos) =
-        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+    // CPU-bound work: hash chunks and build Merkle tree in spawn_blocking
+    let result = tokio::task::spawn_blocking(move || {
+        let leaf_hashes: Vec<Blake3Hash> = chunk_data
+            .iter()
+            .map(|data| Blake3Hash::new(data))
+            .collect();
 
-    // Store tree in database (best-effort)
+        let merkle = MerkleTree::default();
+        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries)
+    })
+    .await
+    .ok()?;
+
+    let (root, cache, leaf_infos) = result;
+
+    // Store tree in database (best-effort) - this must happen on async runtime
     if let Ok(meta) = tokio::fs::metadata(canonical).await {
         let mtime_ns = meta
             .modified()
