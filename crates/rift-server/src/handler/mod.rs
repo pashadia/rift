@@ -333,11 +333,31 @@ async fn handle_broken_symlink_containment(
     //      it must also be within the share root.
     // Relative targets are accepted (the link is within the share
     // and the target simply doesn't exist yet, which is fine).
-    if !is_within_share(stored_path, share_canonical) {
+    //
+    // On macOS (and any OS where the temp/config directory contains symlink
+    // components), `stored_path` may be non-canonical even though it is
+    // legitimately inside the share.  For example, TempDir returns /var/...
+    // but the canonical form is /private/var/... .  We cannot call
+    // canonicalize() on the symlink itself (it is broken), but we CAN
+    // canonicalize its *parent directory* and rejoin the filename.  This
+    // resolves any OS-level symlink components in the directory path without
+    // following the final (broken) symlink.
+    let canonical_stored_path = if let Some(parent) = stored_path.parent() {
+        match tokio::fs::canonicalize(parent).await {
+            Ok(canonical_parent) => {
+                canonical_parent.join(stored_path.file_name().unwrap_or_default())
+            }
+            Err(_) => stored_path.to_path_buf(),
+        }
+    } else {
+        stored_path.to_path_buf()
+    };
+
+    if !is_within_share(&canonical_stored_path, share_canonical) {
         return Err(evict_and_bail(
             handle_db,
             handle,
-            stored_path,
+            &canonical_stored_path,
             "broken symlink path escapes share root",
         ));
     }
@@ -347,19 +367,21 @@ async fn handle_broken_symlink_containment(
     // Path::starts_with() is component-based and does NOT resolve "..",
     // so we must normalize first to prevent e.g. "/share/../../etc/passwd"
     // from passing the containment check.
-    if let Ok(target) = tokio::fs::read_link(stored_path).await {
+    if let Ok(target) = tokio::fs::read_link(&canonical_stored_path).await {
         let normalized_target = if target.is_absolute() {
             normalize_path(&target)
         } else {
-            // Relative target: resolve against the symlink's parent directory,
-            // then normalize to resolve any ".." components.
-            let parent = stored_path.parent().unwrap_or(Path::new("/"));
+            // Relative target: resolve against the *canonical* symlink parent
+            // directory, then normalize to resolve any ".." components.
+            let parent = canonical_stored_path
+                .parent()
+                .unwrap_or(Path::new("/"));
             normalize_path(&parent.join(&target))
         };
 
         if !is_within_share(&normalized_target, share_canonical) {
             tracing::warn!(
-                path = %stored_path.display(),
+                path = %canonical_stored_path.display(),
                 target = %target.display(),
                 normalized = %normalized_target.display(),
                 "broken symlink target escapes share root"
@@ -374,7 +396,7 @@ async fn handle_broken_symlink_containment(
         }
     }
 
-    Ok(stored_path.to_path_buf())
+    Ok(canonical_stored_path)
 }
 
 /// Linux-only: open file, re-canonicalize via /proc/self/fd/N, verify containment.
