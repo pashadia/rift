@@ -112,7 +112,7 @@ fn generate_and_save_cert(
 
     // Save to disk
     std::fs::write(cert_path, &cert_der).context("failed to write certificate file")?;
-    std::fs::write(key_path, &key_der).context("failed to write key file")?;
+    write_key_file(key_path, &key_der)?;
 
     Ok((cert_der, key_der))
 }
@@ -144,6 +144,29 @@ fn key_pem_to_der(key_pem: &[u8]) -> Result<Vec<u8>> {
         Some(key) => Ok(key.secret_der().to_vec()),
         None => anyhow::bail!("no private key found in PEM data"),
     }
+}
+
+/// Write the private key file with restricted permissions (0o600 on Unix).
+///
+/// On Unix, `std::fs::write` creates files with `0o644` by default, making the
+/// private key readable by all local users. This function forces `0o600`.
+fn write_key_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .context("failed to open key file for writing")?;
+        file.write_all(data).context("failed to write key file")?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, data).context("failed to write key file")?;
+    Ok(())
 }
 
 fn validate_der(cert_der: &[u8], key_der: &[u8]) -> Result<(), anyhow::Error> {
@@ -258,6 +281,23 @@ mod tests {
             err_msg.contains("PEM") || err_msg.contains("malformed") || err_msg.contains("base64"),
             "Error should indicate PEM/base64 issue: {}",
             err_msg
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("test.cert");
+        let key_path = tmp_dir.path().join("test.key");
+
+        get_or_create_cert(Some(cert_path), Some(key_path.clone())).unwrap();
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "private key file must be 0o600, got 0o{mode:o}"
         );
     }
 
