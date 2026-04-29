@@ -19,6 +19,8 @@ async-trait.workspace = true
 blake3.workspace = true
 prost.workspace = true
 
+zeroize.workspace = true
+
 rift-protocol = { path = "../rift-protocol" }
 
 [dev-dependencies]
