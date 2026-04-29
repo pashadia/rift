@@ -53,6 +53,9 @@ redundant_clone = "warn"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Key material zeroization
+zeroize = { version = "1", features = ["derive"] }
+
 # QUIC and TLS
 quinn = "0.11"
 rustls = "0.23"

@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use zeroize::Zeroizing;
 use bytes::Bytes;
 use prost::Message as _;
 use tracing::instrument;
@@ -92,7 +93,9 @@ pub struct RiftClient<C: RiftConnection> {
     addr: SocketAddr,
     share_name: String,
     cert: Vec<u8>,
-    key: Vec<u8>,
+    /// Private key bytes — zeroed on drop to prevent key material leakage
+    /// in swap files, core dumps, or ptrace reads.
+    key: Zeroizing<Vec<u8>>,
     tofu_state: Option<TofuState>,
 }
 
@@ -251,7 +254,7 @@ impl RiftClient<QuicConnection> {
             addr,
             share_name: share_name.to_string(),
             cert,
-            key,
+            key: Zeroizing::new(key),
             tofu_state: None,
         })
     }
@@ -322,7 +325,7 @@ impl RiftClient<QuicConnection> {
             addr,
             share_name: share_name.to_string(),
             cert,
-            key,
+            key: Zeroizing::new(key),
             tofu_state: None,
         })
     }
@@ -398,7 +401,7 @@ impl RiftClient<QuicConnection> {
             addr,
             share_name: share_name.to_string(),
             cert,
-            key,
+            key: Zeroizing::new(key),
             tofu_state: Some(tofu_state),
         };
 
@@ -422,7 +425,7 @@ impl<C: RiftConnection> RiftClient<C> {
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             share_name: String::new(),
             cert: Vec::new(),
-            key: Vec::new(),
+            key: Zeroizing::new(Vec::new()),
             tofu_state: None,
         }
     }

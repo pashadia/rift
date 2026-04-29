@@ -21,6 +21,8 @@ use rustls::server::danger::ClientCertVerified;
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use tracing::instrument;
 
+use zeroize::Zeroizing;
+
 use crate::fingerprint::cert_fingerprint;
 use crate::policy::FingerprintPolicy;
 use crate::quic::{extract_peer_fingerprint, QuicConnection, QuicListener};
@@ -169,7 +171,9 @@ impl<P: FingerprintPolicy + std::fmt::Debug + 'static> rustls::client::danger::S
 pub struct ClientEndpoint {
     pub(crate) inner: quinn::Endpoint,
     cert_der: Option<Vec<u8>>,
-    key_der: Option<Vec<u8>>,
+    /// Private key bytes — zeroed on drop to prevent key material leakage
+    /// in swap files or core dumps.
+    key_der: Option<Zeroizing<Vec<u8>>>,
 }
 
 /// Build a QUIC server endpoint bound to `addr`.
@@ -211,7 +215,7 @@ pub fn client_endpoint(cert_der: &[u8], key_der: &[u8]) -> Result<ClientEndpoint
     Ok(ClientEndpoint {
         inner: quinn::Endpoint::client(addr)?,
         cert_der: Some(cert_der.to_vec()),
-        key_der: Some(key_der.to_vec()),
+        key_der: Some(Zeroizing::new(key_der.to_vec())),
     })
 }
 
@@ -270,7 +274,7 @@ where
 fn build_client_tls_config<P>(
     verifier: PolicyServerCertVerifier<P>,
     cert_der: &Option<Vec<u8>>,
-    key_der: &Option<Vec<u8>>,
+    key_der: &Option<Zeroizing<Vec<u8>>>,
 ) -> Result<rustls::ClientConfig, TransportError>
 where
     P: FingerprintPolicy + std::fmt::Debug + 'static,
@@ -282,7 +286,7 @@ where
     let config = match (cert_der, key_der) {
         (Some(cert), Some(key)) => {
             let cert = CertificateDer::from(cert.clone());
-            let key = PrivateKeyDer::try_from(key.clone()).map_err(|_| {
+            let key = PrivateKeyDer::try_from(key.as_slice().to_vec()).map_err(|_| {
                 TransportError::Cert(CertError::Malformed("invalid private key format".into()))
             })?;
             builder
@@ -355,6 +359,17 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let result = server_endpoint(addr, cert, key);
         assert!(result.is_err(), "expected Err for invalid cert bytes");
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_key_is_zeroizing() {
+        // Compile-time + runtime proof: key_der must be Zeroizing<Vec<u8>>.
+        fn require_zeroizing(_: &zeroize::Zeroizing<Vec<u8>>) {}
+        let (cert, key) = gen_cert("test").unwrap();
+        let ep = client_endpoint(&cert, &key).unwrap();
+        if let Some(ref k) = ep.key_der {
+            require_zeroizing(k);
+        }
     }
 
     #[test]
