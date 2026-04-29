@@ -267,8 +267,8 @@ fn verify_chunks_integrity(
     Ok(())
 }
 
-/// Sort chunks by index, verify contiguous indices, concatenate data,
-/// and extract the byte range `[offset..offset+length)`.
+/// Sort chunks by index, verify contiguous indices, and copy only the
+/// requested byte range `[offset..end)` directly into the output buffer.
 fn assemble_byte_range(
     chunks: Vec<crate::client::ChunkData>,
     start_chunk: u32,
@@ -288,22 +288,28 @@ fn assemble_byte_range(
             return Err(FsError::Io);
         }
     }
-    let mut all_data = Vec::new();
-    for chunk in sorted {
-        all_data.extend(chunk.data);
+
+    let needed = (end - offset) as usize;
+    let mut result = Vec::with_capacity(needed);
+
+    for chunk in &sorted {
+        let chunk_start_byte = chunk_starts[chunk.index as usize];
+        let chunk_end_byte = chunk_start_byte + chunk.data.len() as u64;
+
+        // Skip chunks that don't overlap with the requested range
+        if chunk_end_byte <= offset || chunk_start_byte >= end {
+            continue;
+        }
+
+        let slice_start = (offset.saturating_sub(chunk_start_byte)) as usize;
+        let slice_end = (end.min(chunk_end_byte) - chunk_start_byte) as usize;
+
+        if slice_start < slice_end && slice_end <= chunk.data.len() {
+            result.extend_from_slice(&chunk.data[slice_start..slice_end]);
+        }
     }
-    let actual_start_byte = chunk_starts[start_chunk as usize];
-    let start_offset = (offset - actual_start_byte) as usize;
-    let requested_length = (end - offset) as usize;
-    Ok(all_data
-        .get(start_offset..start_offset + requested_length)
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| {
-            all_data
-                .get(start_offset..)
-                .map(|s| s.to_vec())
-                .unwrap_or_default()
-        }))
+
+    Ok(result)
 }
 
 fn build_dir_entry(
@@ -4013,6 +4019,93 @@ mod tests {
         }];
         let starts = vec![0u64, 100];
         assert!(assemble_byte_range(chunks, 0, &starts, 0, 100).is_err());
+    }
+
+    #[test]
+    fn assemble_byte_range_partial_read_only_needed_bytes() {
+        // Create 3 chunks of 100 bytes each
+        let chunk0 = vec![0u8; 100];
+        let chunk1 = vec![1u8; 100];
+        let chunk2 = vec![2u8; 100];
+        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
+        let h1 = *Blake3Hash::new(&chunk1).as_bytes();
+        let h2 = *Blake3Hash::new(&chunk2).as_bytes();
+        let input = vec![
+            crate::client::ChunkData {
+                index: 0,
+                length: 100,
+                hash: h0,
+                data: Bytes::from(chunk0.clone()),
+            },
+            crate::client::ChunkData {
+                index: 1,
+                length: 100,
+                hash: h1,
+                data: Bytes::from(chunk1.clone()),
+            },
+            crate::client::ChunkData {
+                index: 2,
+                length: 100,
+                hash: h2,
+                data: Bytes::from(chunk2),
+            },
+        ];
+        let starts = vec![0u64, 100, 200, 300];
+        // Request bytes 50-150 (crossing chunk boundary)
+        let result = assemble_byte_range(input, 0, &starts, 50, 150).unwrap();
+        assert_eq!(result.len(), 100);
+        let mut expected = chunk0[50..100].to_vec();
+        expected.extend_from_slice(&chunk1[0..50]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn assemble_byte_range_single_byte_from_middle() {
+        let chunk0: Vec<u8> = (0u8..100u8).collect();
+        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
+        let input = vec![crate::client::ChunkData {
+            index: 0,
+            length: 100,
+            hash: h0,
+            data: Bytes::from(chunk0),
+        }];
+        let starts = vec![0u64, 100];
+        // Request 1 byte from the middle of a chunk
+        let result = assemble_byte_range(input, 0, &starts, 50, 51).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 50);
+    }
+
+    #[test]
+    fn assemble_byte_range_output_size_matches_request() {
+        let chunk0 = vec![0u8; 64];
+        let chunk1 = vec![1u8; 64];
+        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
+        let h1 = *Blake3Hash::new(&chunk1).as_bytes();
+        let input = vec![
+            crate::client::ChunkData {
+                index: 0,
+                length: 64,
+                hash: h0,
+                data: Bytes::from(chunk0),
+            },
+            crate::client::ChunkData {
+                index: 1,
+                length: 64,
+                hash: h1,
+                data: Bytes::from(chunk1),
+            },
+        ];
+        let starts = vec![0u64, 64, 128];
+        let result = assemble_byte_range(input, 0, &starts, 10, 90).unwrap();
+        // Exact length must match requested range (90 - 10 = 80)
+        assert_eq!(result.len(), 80, "output len must match requested range");
+        // Capacity must not exceed the requested range (u8 alignment = 1, so std gives exact)
+        assert_eq!(
+            result.capacity(),
+            80,
+            "capacity must not exceed requested range (no over-allocation)"
+        );
     }
 
     #[test]
