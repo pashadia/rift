@@ -700,10 +700,21 @@ impl<R: RemoteShare> RiftShareView<R> {
                         tracing::debug!("read {} bytes from cache", data.len());
                         Some(data)
                     }
-                    Err(ref bad_hashes) => {
+                    Err(crate::cache::db::ReconstructError::MissingChunks(_)) => {
+                        tracing::debug!(
+                            "cache missing some chunks for requested range, falling through"
+                        );
+                        None
+                    }
+                    Err(crate::cache::db::ReconstructError::CorruptedChunks(ref bad_hashes)) => {
                         tracing::warn!(
-                            "cache data corrupted: {} chunks failed hash verification",
-                            bad_hashes.len()
+                            "cache data corrupted: {} chunks failed hash verification: {:?}",
+                            bad_hashes.len(),
+                            bad_hashes
+                                .iter()
+                                .take(4)
+                                .map(|h| &h[..4])
+                                .collect::<Vec<_>>()
                         );
                         if let Err(e) = cache.remove_manifest(handle).await {
                             tracing::warn!("failed to remove manifest: {}", e);
@@ -732,30 +743,47 @@ impl<R: RemoteShare> RiftShareView<R> {
         let cache = self.cache.as_ref()?;
         let manifest = cache.get_manifest(handle).await.ok()??;
 
-        // NOTE: In offline mode, we cannot verify the manifest's root hash against
-        // the server's current value. A stale manifest from a previous file version
-        // could serve incorrect data. This is an inherent limitation of offline reads.
+        Self::reconstruct_offline(cache, &manifest, offset, length).await
+    }
 
-        // Determine file_size from the manifest chunks
+    /// Attempt to reconstruct a byte range from an offline manifest.
+    /// Returns `Some(data)` on success, `None` if the range is not covered or
+    /// chunks are missing/corrupted.
+    async fn reconstruct_offline(
+        cache: &crate::cache::db::FileCache,
+        manifest: &crate::cache::db::Manifest,
+        offset: u64,
+        length: u64,
+    ) -> Option<Vec<u8>> {
         let file_size: u64 = manifest.chunks.iter().map(|c| c.length).sum();
         if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
             tracing::debug!("offline read: manifest does not cover requested range");
             return None;
         }
 
-        match cache
+        let result = cache
             .reconstruct_range(&manifest.chunks, offset, length, file_size)
-            .await
-        {
+            .await;
+        Self::log_reconstruct_offline(result)
+    }
+
+    fn log_reconstruct_offline(
+        result: Result<Vec<u8>, crate::cache::db::ReconstructError>,
+    ) -> Option<Vec<u8>> {
+        match result {
             Ok(data) => {
                 tracing::debug!("offline read: served {} bytes from cache", data.len());
-                return Some(data);
+                Some(data)
             }
-            Err(_) => {
+            Err(crate::cache::db::ReconstructError::MissingChunks(_)) => {
                 tracing::debug!("offline read: could not reconstruct from cache");
+                None
+            }
+            Err(crate::cache::db::ReconstructError::CorruptedChunks(_)) => {
+                tracing::debug!("offline read: corrupted chunk data in cache");
+                None
             }
         }
-        None
     }
 }
 
@@ -4015,5 +4043,88 @@ mod tests {
         };
         let (_, _, symlink_target) = build_dir_entry(&entry, attrs, Path::new("subdir"));
         assert_eq!(symlink_target.as_deref(), Some("../../foo"));
+    }
+
+    /// When the manifest references chunks that were never fetched, a cached
+    /// read must report MissingChunks — never CorruptedChunks.
+    #[tokio::test]
+    async fn missing_chunks_reported_as_missing_not_corrupted() {
+        let chunk0_data = vec![0xAAu8; 100];
+        let chunk1_data = vec![0xBBu8; 150];
+        let chunk2_data = vec![0xCCu8; 200];
+        let (chunk_hashes, root_hash, _) =
+            build_mock_chunks(vec![chunk0_data, chunk1_data.clone(), chunk2_data]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        let leaves = vec![
+            ResolvedLeaf {
+                chunk_index: 0,
+                length: 100,
+                hash: Blake3Hash::from_array(chunk_hashes[0]),
+            },
+            ResolvedLeaf {
+                chunk_index: 1,
+                length: 150,
+                hash: Blake3Hash::from_array(chunk_hashes[1]),
+            },
+            ResolvedLeaf {
+                chunk_index: 2,
+                length: 200,
+                hash: Blake3Hash::from_array(chunk_hashes[2]),
+            },
+        ];
+        let chunk_starts = vec![0u64, 100, 250];
+
+        // Only cache chunk 1 on disk
+        let fetched_chunks = vec![ChunkData {
+            index: 1,
+            length: 150,
+            hash: chunk_hashes[1],
+            data: Bytes::from(chunk1_data),
+        }];
+
+        view.cache_fetched_chunks(
+            &file_uuid,
+            &root_hash,
+            &fetched_chunks,
+            &leaves,
+            &chunk_starts,
+        )
+        .await;
+
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
+            .await
+            .expect("cache should open");
+
+        // Full manifest is present, but chunk 0 is missing on disk
+        let manifest = cache
+            .get_manifest(&file_uuid)
+            .await
+            .expect("get_manifest ok")
+            .expect("manifest should exist");
+        assert_eq!(manifest.chunks.len(), 3, "manifest must contain all leaves");
+
+        // Request bytes in chunk 0 — should report MissingChunks, not corruption
+        let result = cache.reconstruct_range(&manifest.chunks, 0, 100, 450).await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::cache::db::ReconstructError::MissingChunks(_))
+            ),
+            "missing chunks must be reported as MissingChunks, not CorruptedChunks"
+        );
     }
 }

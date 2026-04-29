@@ -39,6 +39,15 @@ pub struct ChunkInfo {
     pub hash: [u8; 32],
 }
 
+/// Error returned when `reconstruct_range` cannot assemble the requested bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReconstructError {
+    /// One or more chunks needed for the range are not present in the chunk store.
+    MissingChunks(Vec<[u8; 32]>),
+    /// One or more chunks are present but fail length or hash verification.
+    CorruptedChunks(Vec<[u8; 32]>),
+}
+
 /// A file cache for storing root hashes and chunk data.
 ///
 /// Metadata (manifests, chunk references) is stored in SQLite.
@@ -358,7 +367,7 @@ impl FileCache {
         offset: u64,
         length: u64,
         file_size: u64,
-    ) -> Result<Vec<u8>, Vec<[u8; 32]>> {
+    ) -> Result<Vec<u8>, ReconstructError> {
         if offset >= file_size || length == 0 {
             return Ok(vec![]);
         }
@@ -387,7 +396,8 @@ impl FileCache {
         }
 
         let mut result = Vec::with_capacity((end - offset) as usize);
-        let mut bad_chunks = Vec::new();
+        let mut missing = Vec::new();
+        let mut corrupted = Vec::new();
 
         for chunk in &chunks[first_idx..=last_idx] {
             match self.get_chunk(&chunk.hash).await {
@@ -398,14 +408,14 @@ impl FileCache {
                             chunk.length,
                             data.len()
                         );
-                        bad_chunks.push(chunk.hash);
+                        corrupted.push(chunk.hash);
                     } else if *Blake3Hash::new(&data).as_bytes() != chunk.hash {
                         tracing::warn!(
                             "cached chunk hash mismatch: expected {:?}, got {:?}",
                             &chunk.hash[..4],
                             &Blake3Hash::new(&data).as_bytes()[..4]
                         );
-                        bad_chunks.push(chunk.hash);
+                        corrupted.push(chunk.hash);
                     } else {
                         // Determine the slice of this chunk that falls within [offset, end)
                         let chunk_start = chunk.offset;
@@ -415,18 +425,20 @@ impl FileCache {
                         result.extend_from_slice(&data[slice_start..slice_end]);
                     }
                 }
-                Ok(None) => bad_chunks.push(chunk.hash),
+                Ok(None) => missing.push(chunk.hash),
                 Err(e) => {
                     tracing::warn!("error reading chunk: {}", e);
-                    bad_chunks.push(chunk.hash);
+                    missing.push(chunk.hash);
                 }
             }
         }
 
-        if bad_chunks.is_empty() {
-            Ok(result)
+        if !corrupted.is_empty() {
+            Err(ReconstructError::CorruptedChunks(corrupted))
+        } else if !missing.is_empty() {
+            Err(ReconstructError::MissingChunks(missing))
         } else {
-            Err(bad_chunks)
+            Ok(result)
         }
     }
 }
@@ -563,8 +575,14 @@ mod tests {
 
         // Request range that requires the missing chunk 1
         let result = cache.reconstruct_range(&chunks, 6, 5, 11).await;
-        assert!(result.is_err());
-        let missing = result.unwrap_err();
+        assert!(
+            matches!(result, Err(ReconstructError::MissingChunks(_))),
+            "missing chunk should return MissingChunks"
+        );
+        let missing = match result.unwrap_err() {
+            ReconstructError::MissingChunks(m) => m,
+            other => panic!("expected MissingChunks, got {:?}", other),
+        };
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], *chunk1_hash.as_bytes());
     }
@@ -613,7 +631,10 @@ mod tests {
 
         let result = cache.reconstruct_range(&chunks, 0, 6, 6).await;
         assert!(result.is_err(), "corrupted chunk data must be rejected");
-        let bad_hashes = result.unwrap_err();
+        let bad_hashes = match result.unwrap_err() {
+            ReconstructError::CorruptedChunks(c) => c,
+            other => panic!("expected CorruptedChunks, got {:?}", other),
+        };
         assert_eq!(bad_hashes.len(), 1);
         // The returned hash should be the EXPECTED hash (chunk0_hash), not the
         // hash of the corrupted data
@@ -786,7 +807,10 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "missing chunk should return Err");
-        let missing = result.unwrap_err();
+        let missing = match result.unwrap_err() {
+            ReconstructError::MissingChunks(m) => m,
+            other => panic!("expected MissingChunks, got {:?}", other),
+        };
         assert_eq!(missing.len(), 1);
         assert_eq!(
             missing[0],
