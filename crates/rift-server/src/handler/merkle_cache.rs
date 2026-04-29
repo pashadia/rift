@@ -78,7 +78,8 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
         }
     };
 
-    let mut leaf_hashes = Vec::with_capacity(chunk_boundaries.len());
+    // Read all chunk data with async I/O
+    let mut chunk_data: Vec<Vec<u8>> = Vec::with_capacity(chunk_boundaries.len());
     for (offset, length) in &chunk_boundaries {
         let mut buf = vec![0u8; *length];
         if file.seek(SeekFrom::Start(*offset as u64)).await.is_err() {
@@ -101,11 +102,21 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
             };
             return sentinel_hash_for_non_file(file_type);
         }
-        leaf_hashes.push(Blake3Hash::new(&buf));
+        chunk_data.push(buf);
     }
 
-    let merkle = MerkleTree::default();
-    let root = merkle.build(&leaf_hashes);
+    // CPU-bound work: hash chunks and build Merkle tree in spawn_blocking
+    let root = tokio::task::spawn_blocking(move || {
+        let leaf_hashes: Vec<Blake3Hash> = chunk_data
+            .iter()
+            .map(|data| Blake3Hash::new(data))
+            .collect();
+
+        let merkle = MerkleTree::default();
+        merkle.build(&leaf_hashes)
+    })
+    .await
+    .unwrap_or_else(|_| Blake3Hash::new(&[]));
 
     if let Ok(file_meta) = tokio::fs::metadata(path).await {
         let mtime_ns = match file_meta.modified() {
@@ -117,7 +128,7 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
         };
         let file_size = file_meta.len();
         if let Err(e) = cache
-            .put_merkle(path, mtime_ns, file_size, &root, &leaf_hashes)
+            .put_merkle(path, mtime_ns, file_size, &root, &[])
             .await
         {
             tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
