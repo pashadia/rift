@@ -1,10 +1,12 @@
+use arc_swap::ArcSwap;
+
 use crate::client::{ChunkReadResult, MerkleDrillResult, RiftClient};
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, ReaddirEntry};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_RETRIES: u32 = 5;
@@ -51,32 +53,30 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
 ///
 /// ## Concurrency model
 ///
-/// Normal operations (lookup, readdir, stat_batch, read_chunks, merkle_drill)
-/// run **concurrently** — no lock is held during the network RPC itself:
+/// [`ArcSwap`] provides lock-free concurrent reads: every operation loads the
+/// current `Arc<RiftClient>` atomically (a single pointer-width CAS) and
+/// proceeds without holding any lock.
 ///
-/// 1. Acquire a **read** lock briefly to clone the inner `Arc<RiftClient>`.
-/// 2. Drop the read lock immediately.
-/// 3. Run the network operation with the cloned Arc (no lock held).
+/// Reconnects are serialized by [`reconnect_lock`]. Once the new connection is
+/// established, `ArcSwap::store` atomically publishes it. Operations that were
+/// using the old (broken) connection will fail and retry, picking up the new
+/// client on the next iteration.
 ///
-/// The reconnect path serializes via an exclusive **write** lock:
-///
-/// 1. Acquire write lock (waits for all in-flight ops to drain).
-/// 2. Call `reconnect()` to get a new client.
-/// 3. Swap the inner Arc.
-/// 4. Drop write lock.
-///
-/// This means concurrent `stat`/`readdir`/`read` calls no longer block each
-/// other, which was the critical bottleneck for parallel FUSE workloads such
-/// as `grep -r`, `find`, and `ls -R`.
+/// This means reads are **never** blocked by a reconnect in progress — a key
+/// difference from a `RwLock`-based design, where a write lock held during the
+/// QUIC handshake (potentially seconds) would stall all concurrent FUSE ops.
 pub struct ReconnectingClient {
-    client: Arc<RwLock<Arc<RiftClient<rift_transport::QuicConnection>>>>,
+    client: ArcSwap<RiftClient<rift_transport::QuicConnection>>,
+    /// Ensures only one reconnect attempt runs at a time.
+    reconnect_lock: Mutex<()>,
 }
 
 impl ReconnectingClient {
     #[must_use]
     pub fn new(client: RiftClient<rift_transport::QuicConnection>) -> Self {
         Self {
-            client: Arc::new(RwLock::new(Arc::new(client))),
+            client: ArcSwap::from_pointee(client),
+            reconnect_lock: Mutex::new(()),
         }
     }
 
@@ -88,10 +88,8 @@ impl ReconnectingClient {
         let mut attempts = 0;
 
         loop {
-            // Clone the Arc while briefly holding the read lock.
-            // The lock is dropped before the network operation runs,
-            // allowing other operations to proceed concurrently.
-            let client = Arc::clone(&*self.client.read().await);
+            // Lock-free atomic load — no lock held during the network RPC.
+            let client = self.client.load_full();
 
             match make_op(client).await {
                 Ok(result) => return Ok(result),
@@ -102,7 +100,7 @@ impl ReconnectingClient {
                 }
                 Err(e) => {
                     attempts += 1;
-                    // Saturating shift avoids overflow if attempts ever exceeds 63
+                    // Saturating shift avoids overflow if attempts ever exceeds 63.
                     let backoff_ms =
                         BASE_BACKOFF_MS.saturating_mul(1u64 << (attempts - 1).min(10));
                     tracing::warn!(
@@ -114,11 +112,18 @@ impl ReconnectingClient {
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
-                    // Write lock: exclusive — waits for all in-flight ops to drain,
-                    // then replaces the client Arc atomically.
-                    let mut guard = self.client.write().await;
-                    match guard.reconnect().await {
-                        Ok(new_client) => *guard = Arc::new(new_client),
+                    // Serialize reconnects: only one task re-establishes the
+                    // connection at a time. The lock is NOT held while the new
+                    // connection is being set up — the await happens with the
+                    // lock held only briefly to read the current client, then
+                    // released during the handshake, then re-acquired to store.
+                    //
+                    // Actually simpler: hold the lock for the whole reconnect.
+                    // Concurrent ops use the old (broken) client and will retry.
+                    let _guard = self.reconnect_lock.lock().await;
+                    let old = self.client.load_full();
+                    match old.reconnect().await {
+                        Ok(new_client) => self.client.store(Arc::new(new_client)),
                         Err(reconnect_err) => {
                             tracing::error!("reconnect failed: {}", reconnect_err);
                             return Err(reconnect_err);
@@ -130,16 +135,15 @@ impl ReconnectingClient {
     }
 
     pub async fn reconnect(&self) -> anyhow::Result<()> {
-        let mut guard = self.client.write().await;
-        let new_client = guard.reconnect().await?;
-        *guard = Arc::new(new_client);
+        let _guard = self.reconnect_lock.lock().await;
+        let old = self.client.load_full();
+        let new_client = old.reconnect().await?;
+        self.client.store(Arc::new(new_client));
         Ok(())
     }
 
     pub fn close_connection_for_test(&self) {
-        if let Ok(guard) = self.client.try_read() {
-            guard.close_connection();
-        }
+        self.client.load().close_connection();
     }
 }
 
@@ -199,44 +203,6 @@ impl RemoteShare for ReconnectingClient {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn concurrent_read_locks_do_not_block_each_other() {
-        use std::time::{Duration, Instant};
-        use tokio::sync::{Barrier, RwLock};
-
-        let rwlock = Arc::new(RwLock::new(Arc::new(42u64)));
-        let barrier = Arc::new(Barrier::new(2));
-        let start = Instant::now();
-
-        let r1 = rwlock.clone();
-        let b1 = barrier.clone();
-        let t1 = tokio::spawn(async move {
-            let val = Arc::clone(&*r1.read().await);
-            b1.wait().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            *val
-        });
-
-        let r2 = rwlock.clone();
-        let b2 = barrier.clone();
-        let t2 = tokio::spawn(async move {
-            let val = Arc::clone(&*r2.read().await);
-            b2.wait().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            *val
-        });
-
-        let (v1, v2) = tokio::join!(t1, t2);
-        let elapsed = start.elapsed();
-        assert_eq!(v1.unwrap(), 42);
-        assert_eq!(v2.unwrap(), 42);
-        assert!(
-            elapsed < Duration::from_millis(180),
-            "concurrent reads must not serialize, took {:?}",
-            elapsed
-        );
-    }
-
     #[test]
     fn is_connection_error_returns_false_for_fs_error() {
         let not_found = anyhow::Error::new(FsError::NotFound);
@@ -259,17 +225,15 @@ mod tests {
         let stream_closed = anyhow::Error::new(TransportError::StreamClosed);
         assert!(is_connection_error(&stream_closed));
 
-        let io_err = anyhow::Error::new(TransportError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
-        ));
+        let io_err = anyhow::Error::new(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        )));
         assert!(is_connection_error(&io_err));
     }
 
     #[test]
     fn is_connection_error_returns_false_for_non_transport_string_errors() {
-        // Plain string errors are NOT connection errors — typed downcast only.
-        // This prevents false positives from application-level messages that
-        // happen to contain words like "connection", "stream", or "closed".
         assert!(!is_connection_error(&anyhow::anyhow!("connection timed out")));
         assert!(!is_connection_error(&anyhow::anyhow!("stream limit exceeded")));
         assert!(!is_connection_error(&anyhow::anyhow!("QUIC error in log message")));
@@ -278,8 +242,6 @@ mod tests {
     #[test]
     fn is_connection_error_walks_chain_through_context_wrappers() {
         use rift_transport::TransportError;
-        // Simulate what client.rs does: TransportError wrapped with .context()
-        // (not stringified). is_connection_error must find it through the chain.
         let err = anyhow::Error::from(TransportError::ConnectionClosed)
             .context("open stream")
             .context("lookup");
@@ -293,27 +255,15 @@ mod tests {
     fn is_connection_error_uses_typed_downcast_for_transport_errors() {
         use rift_transport::TransportError;
 
-        // TransportError variants that ARE connection errors
         let conn_closed = anyhow::Error::new(TransportError::ConnectionClosed);
-        assert!(is_connection_error(&conn_closed), "ConnectionClosed must be a connection error");
+        assert!(is_connection_error(&conn_closed));
 
-        let stream_closed = anyhow::Error::new(TransportError::StreamClosed);
-        assert!(is_connection_error(&stream_closed), "StreamClosed must be a connection error");
-
-        let quic_timed_out = anyhow::Error::new(TransportError::ConnectionClosed); // stands in for QuicConnection variant
-        assert!(is_connection_error(&quic_timed_out), "QuicConnection(TimedOut) must be a connection error");
-
-        // TransportError::Codec is NOT a connection error
         let codec_err = anyhow::Error::new(TransportError::Codec(
             rift_protocol::codec::CodecError::InvalidVarint,
         ));
-        assert!(!is_connection_error(&codec_err), "Codec error must NOT trigger reconnect");
+        assert!(!is_connection_error(&codec_err), "Codec must NOT trigger reconnect");
 
-        // A string with 'stream' in it that is NOT a TransportError must NOT trigger reconnect
-        // after the fix (string matching for 'stream' is removed).
         let ambiguous = anyhow::anyhow!("stream limit exceeded in application layer");
-        // With the old string-matching implementation this would return true.
-        // After the fix it must return false (no FsError, no TransportError).
-        assert!(!is_connection_error(&ambiguous), "'stream' substring must not trigger reconnect for non-transport errors");
+        assert!(!is_connection_error(&ambiguous), "'stream' substring must not trigger reconnect");
     }
 }
