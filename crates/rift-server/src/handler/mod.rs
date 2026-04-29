@@ -650,27 +650,34 @@ mod tests {
     async fn resolve_broken_symlink_returns_symlink_path() {
         let tmp = TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
-        let dangling = share.join("dangling.txt");
         let link = share.join("broken_link.txt");
 
-        // Create a symlink pointing to a file that doesn't exist.
+        // Create a symlink pointing to a relative target that doesn't exist.
+        // Using a relative target avoids /var vs /private/var canonicalization
+        // mismatches on macOS (where absolute paths through TempDir are symlinks
+        // themselves).
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&dangling, &link).unwrap();
+        std::os::unix::fs::symlink("dangling.txt", &link).unwrap();
         #[cfg(not(unix))]
         {
             // Can't create broken symlinks on non-Unix; skip.
             return;
         }
 
+        // Canonicalize share so stored paths match what resolve() sees on macOS,
+        // where TempDir returns /var/... but canonicalize() resolves to /private/var/...
+        let canonical_share = share.canonicalize().unwrap();
+        let canonical_link = canonical_share.join(link.file_name().unwrap());
+
         let handle_db = HandleDatabase::new();
         let handle = Uuid::now_v7();
-        handle_db.insert_direct(handle, link.clone());
+        handle_db.insert_direct(handle, canonical_link.clone());
 
         let resolved = resolve(&share, &handle, &handle_db).await.unwrap();
 
         // The resolved path should be the symlink itself.
         assert_eq!(
-            resolved.canonical, link,
+            resolved.canonical, canonical_link,
             "resolve() for a broken symlink must return the symlink path, not fail"
         );
     }
