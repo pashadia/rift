@@ -29,3 +29,4 @@ bench-results/
 # Mutants
 mutants.out*
 
+.worktrees
