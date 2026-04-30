@@ -31,111 +31,92 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
     cache: &M,
     chunker: Chunker,
 ) -> Blake3Hash {
+    // Handle non-files (directories, symlinks, etc.)
     if !meta.is_file() {
-        let file_type = if meta.is_dir() {
-            FileType::Directory
-        } else if meta.is_symlink() {
-            FileType::Symlink
-        } else {
-            unreachable!("unexpected file type: expected directory or symlink")
-        };
+        let file_type = classify_file_type(meta);
         return sentinel_hash_for_non_file(file_type);
     }
 
-    match cache.get_merkle(path).await {
-        Ok(Some(entry)) => return entry.root,
-        Ok(None) => {}
-        Err(_) => {}
+    // Try cache first (errors are non-fatal, just continue)
+    if let Ok(Some(entry)) = cache.get_merkle(path).await {
+        return entry.root;
     }
 
-    let file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => {
-            let file_type = if meta.is_dir() {
-                FileType::Directory
-            } else if meta.is_symlink() {
-                FileType::Symlink
-            } else {
-                unreachable!("unexpected file type: expected directory or symlink")
-            };
-            return sentinel_hash_for_non_file(file_type);
+    // Compute Merkle root from file content
+    match compute_file_merkle_root(path, &chunker).await {
+        Some(root) => {
+            // Cache the result (errors are logged but don't fail the operation)
+            cache_computed_root(path, cache, &root).await;
+            root
         }
-    };
+        None => {
+            tracing::error!(path = %path.display(), "failed to compute merkle root");
+            Blake3Hash::new(&[])
+        }
+    }
+}
+
+/// Classify metadata into a FileType.
+fn classify_file_type(meta: &std::fs::Metadata) -> FileType {
+    if meta.is_dir() {
+        FileType::Directory
+    } else if meta.is_symlink() {
+        FileType::Symlink
+    } else {
+        tracing::error!("unexpected file type: {:#?}", meta.file_type());
+        unreachable!("unexpected file type: expected directory or symlink")
+    }
+}
+
+/// Compute the Merkle root for a regular file by chunking and hashing.
+async fn compute_file_merkle_root(path: &Path, chunker: &Chunker) -> Option<Blake3Hash> {
+    // Open file and compute chunk boundaries using streaming
+    let file = tokio::fs::File::open(path).await.ok()?;
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
     let chunk_boundaries = chunker.chunk_stream(reader).await;
 
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => {
-            let file_type = if meta.is_dir() {
-                FileType::Directory
-            } else if meta.is_symlink() {
-                FileType::Symlink
-            } else {
-                unreachable!("unexpected file type: expected directory or symlink")
-            };
-            return sentinel_hash_for_non_file(file_type);
-        }
-    };
+    // Re-open for reading chunk data
+    let mut file = tokio::fs::File::open(path).await.ok()?;
 
-    // Read all chunk data with async I/O
+    // Read all chunk data
     let mut chunk_data: Vec<Vec<u8>> = Vec::with_capacity(chunk_boundaries.len());
     for (offset, length) in &chunk_boundaries {
         let mut buf = vec![0u8; *length];
-        if file.seek(SeekFrom::Start(*offset as u64)).await.is_err() {
-            let file_type = if meta.is_dir() {
-                FileType::Directory
-            } else if meta.is_symlink() {
-                FileType::Symlink
-            } else {
-                unreachable!("unexpected file type: expected directory or symlink")
-            };
-            return sentinel_hash_for_non_file(file_type);
-        }
-        if file.read_exact(&mut buf).await.is_err() {
-            let file_type = if meta.is_dir() {
-                FileType::Directory
-            } else if meta.is_symlink() {
-                FileType::Symlink
-            } else {
-                unreachable!("unexpected file type: expected directory or symlink")
-            };
-            return sentinel_hash_for_non_file(file_type);
-        }
+        file.seek(SeekFrom::Start(*offset as u64)).await.ok()?;
+        file.read_exact(&mut buf).await.ok()?;
         chunk_data.push(buf);
     }
 
-    // CPU-bound work: hash chunks and build Merkle tree in spawn_blocking
-    let root = tokio::task::spawn_blocking(move || {
+    // CPU-bound: hash chunks and build Merkle tree
+    tokio::task::spawn_blocking(move || {
         let leaf_hashes: Vec<Blake3Hash> = chunk_data
             .iter()
             .map(|data| Blake3Hash::new(data))
             .collect();
-
-        let merkle = MerkleTree::default();
-        merkle.build(&leaf_hashes)
+        MerkleTree::default().build(&leaf_hashes)
     })
     .await
-    .unwrap_or_else(|_| Blake3Hash::new(&[]));
+    .ok()
+}
 
-    if let Ok(file_meta) = tokio::fs::metadata(path).await {
-        let mtime_ns = match file_meta.modified() {
-            Ok(t) => t
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-        let file_size = file_meta.len();
-        if let Err(e) = cache
-            .put_merkle(path, mtime_ns, file_size, &root, &[])
-            .await
-        {
-            tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
-        }
+/// Cache a computed Merkle root with current file metadata.
+async fn cache_computed_root<M: MerkleCache>(path: &Path, cache: &M, root: &Blake3Hash) {
+    let Ok(file_meta) = tokio::fs::metadata(path).await else {
+        return;
+    };
+
+    let mtime_ns = file_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let file_size = file_meta.len();
+
+    if let Err(e) = cache.put_merkle(path, mtime_ns, file_size, root, &[]).await {
+        tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
     }
-
-    root
 }
 
 #[cfg(test)]
