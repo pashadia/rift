@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::Arc;
 
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Semaphore;
 use tracing::instrument;
 
 use rift_common::crypto::{Blake3Hash, Chunker, MerkleChild, MerkleTree};
@@ -87,24 +89,41 @@ async fn build_and_cache_tree<M: MerkleCache>(
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
     let chunk_boundaries = chunker.chunk_stream(reader).await;
 
-    let mut file = tokio::fs::File::open(canonical).await.ok()?;
+    // Stream chunks and hash with bounded parallelism (memory-efficient)
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let sem = Arc::new(Semaphore::new(concurrency));
 
-    // Read all chunk data with async I/O
-    let mut chunk_data: Vec<Vec<u8>> = Vec::with_capacity(chunk_boundaries.len());
-    for (offset, length) in &chunk_boundaries {
+    let mut file = tokio::fs::File::open(canonical).await.ok()?;
+    let mut handles = Vec::with_capacity(chunk_boundaries.len());
+
+    for (chunk_index, (offset, length)) in chunk_boundaries.iter().enumerate() {
+        let permit = sem.clone().acquire_owned().await.ok()?;
+
         let mut buf = vec![0u8; *length];
         file.seek(SeekFrom::Start(*offset as u64)).await.ok()?;
         file.read_exact(&mut buf).await.ok()?;
-        chunk_data.push(buf);
+
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = permit; // Keep semaphore permit alive during hashing
+            let hash = Blake3Hash::new(&buf);
+            (chunk_index, hash, buf)
+        });
+        handles.push(handle);
     }
 
-    // CPU-bound work: hash chunks and build Merkle tree in spawn_blocking
-    let result = tokio::task::spawn_blocking(move || {
-        let leaf_hashes: Vec<Blake3Hash> = chunk_data
-            .iter()
-            .map(|data| Blake3Hash::new(data))
-            .collect();
+    // Collect results preserving order
+    let mut indexed_results: Vec<_> = Vec::with_capacity(handles.len());
+    for h in handles {
+        indexed_results.push(h.await.ok()?);
+    }
+    indexed_results.sort_by_key(|(idx, _, _)| *idx);
 
+    let leaf_hashes: Vec<Blake3Hash> = indexed_results.iter().map(|(_, h, _)| h.clone()).collect();
+
+    // Build Merkle tree
+    let result = tokio::task::spawn_blocking(move || {
         let merkle = MerkleTree::default();
         merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries)
     })
