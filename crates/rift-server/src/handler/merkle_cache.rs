@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
 
-use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
+use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleChild, MerkleTree};
 use rift_protocol::messages::FileType;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
@@ -43,10 +44,10 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
     }
 
     // Compute Merkle root from file content
-    match compute_file_merkle_root(path, &chunker).await {
-        Some(root) => {
+    match compute_file_merkle_tree(path, &chunker).await {
+        Some((root, tree_cache, leaf_infos)) => {
             // Cache the result (errors are logged but don't fail the operation)
-            cache_computed_root(path, cache, &root).await;
+            cache_computed_tree(path, cache, &root, tree_cache, leaf_infos).await;
             root
         }
         None => {
@@ -68,8 +69,16 @@ fn classify_file_type(meta: &std::fs::Metadata) -> FileType {
     }
 }
 
-/// Compute the Merkle root for a regular file by chunking and hashing.
-async fn compute_file_merkle_root(path: &Path, chunker: &Chunker) -> Option<Blake3Hash> {
+/// Compute the Merkle tree for a regular file by chunking and hashing.
+/// Returns the root hash, the tree cache, and leaf infos for caching.
+async fn compute_file_merkle_tree(
+    path: &Path,
+    chunker: &Chunker,
+) -> Option<(
+    Blake3Hash,
+    HashMap<Blake3Hash, Vec<MerkleChild>>,
+    Vec<LeafInfo>,
+)> {
     // Open file and compute chunk boundaries using streaming
     let file = tokio::fs::File::open(path).await.ok()?;
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
@@ -87,20 +96,29 @@ async fn compute_file_merkle_root(path: &Path, chunker: &Chunker) -> Option<Blak
         chunk_data.push(buf);
     }
 
-    // CPU-bound: hash chunks and build Merkle tree
+    // CPU-bound: hash chunks and build Merkle tree with cache
     tokio::task::spawn_blocking(move || {
         let leaf_hashes: Vec<Blake3Hash> = chunk_data
             .iter()
             .map(|data| Blake3Hash::new(data))
             .collect();
-        MerkleTree::default().build(&leaf_hashes)
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+        Some((root, cache, leaf_infos))
     })
     .await
-    .ok()
+    .ok()?
 }
 
-/// Cache a computed Merkle root with current file metadata.
-async fn cache_computed_root<M: MerkleCache>(path: &Path, cache: &M, root: &Blake3Hash) {
+/// Cache a computed Merkle tree with current file metadata.
+async fn cache_computed_tree<M: MerkleCache>(
+    path: &Path,
+    cache: &M,
+    root: &Blake3Hash,
+    tree_cache: HashMap<Blake3Hash, Vec<MerkleChild>>,
+    leaf_infos: Vec<LeafInfo>,
+) {
     let Ok(file_meta) = tokio::fs::metadata(path).await else {
         return;
     };
@@ -114,8 +132,11 @@ async fn cache_computed_root<M: MerkleCache>(path: &Path, cache: &M, root: &Blak
 
     let file_size = file_meta.len();
 
-    if let Err(e) = cache.put_merkle(path, mtime_ns, file_size, root, &[]).await {
-        tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle root");
+    if let Err(e) = cache
+        .put_tree(path, mtime_ns, file_size, root, &tree_cache, &leaf_infos)
+        .await
+    {
+        tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle tree");
     }
 }
 
@@ -155,6 +176,19 @@ mod tests {
             cached.is_some(),
             "cache must be populated after computation"
         );
-        assert_eq!(cached.unwrap().root, expected_root);
+        // Verify tree cache was populated by checking leaf info was cached
+        let leaf_info = db.get_all_leaf_info(&file).await.unwrap();
+        assert!(
+            leaf_info.is_some() && !leaf_info.as_ref().unwrap().is_empty(),
+            "leaf info must be cached after computation"
+        );
+
+        // Verify the first leaf matches expected hash
+        let expected_first_chunk_hash = Blake3Hash::new(&content[..chunk_boundaries[0].1]);
+        let first_leaf = &leaf_info.unwrap()[0];
+        assert_eq!(
+            first_leaf.hash, expected_first_chunk_hash,
+            "first leaf hash must match expected chunk hash"
+        );
     }
 }
