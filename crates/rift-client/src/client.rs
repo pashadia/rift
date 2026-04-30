@@ -29,11 +29,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use zeroize::Zeroizing;
 use bytes::Bytes;
 use prost::Message as _;
 use tracing::instrument;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use rift_common::FsError;
 use rift_protocol::messages::{

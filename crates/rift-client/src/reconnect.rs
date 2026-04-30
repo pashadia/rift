@@ -101,8 +101,7 @@ impl ReconnectingClient {
                 Err(e) => {
                     attempts += 1;
                     // Saturating shift avoids overflow if attempts ever exceeds 63.
-                    let backoff_ms =
-                        BASE_BACKOFF_MS.saturating_mul(1u64 << (attempts - 1).min(10));
+                    let backoff_ms = BASE_BACKOFF_MS.saturating_mul(1u64 << (attempts - 1).min(10));
                     tracing::warn!(
                         "connection error (attempt {}/{}): {}. retrying in {}ms",
                         attempts,
@@ -234,9 +233,15 @@ mod tests {
 
     #[test]
     fn is_connection_error_returns_false_for_non_transport_string_errors() {
-        assert!(!is_connection_error(&anyhow::anyhow!("connection timed out")));
-        assert!(!is_connection_error(&anyhow::anyhow!("stream limit exceeded")));
-        assert!(!is_connection_error(&anyhow::anyhow!("QUIC error in log message")));
+        assert!(!is_connection_error(&anyhow::anyhow!(
+            "connection timed out"
+        )));
+        assert!(!is_connection_error(&anyhow::anyhow!(
+            "stream limit exceeded"
+        )));
+        assert!(!is_connection_error(&anyhow::anyhow!(
+            "QUIC error in log message"
+        )));
     }
 
     #[test]
@@ -261,9 +266,15 @@ mod tests {
         let codec_err = anyhow::Error::new(TransportError::Codec(
             rift_protocol::codec::CodecError::InvalidVarint,
         ));
-        assert!(!is_connection_error(&codec_err), "Codec must NOT trigger reconnect");
+        assert!(
+            !is_connection_error(&codec_err),
+            "Codec must NOT trigger reconnect"
+        );
 
         let ambiguous = anyhow::anyhow!("stream limit exceeded in application layer");
-        assert!(!is_connection_error(&ambiguous), "'stream' substring must not trigger reconnect");
+        assert!(
+            !is_connection_error(&ambiguous),
+            "'stream' substring must not trigger reconnect"
+        );
     }
 }

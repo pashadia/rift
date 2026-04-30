@@ -373,9 +373,7 @@ async fn handle_broken_symlink_containment(
         } else {
             // Relative target: resolve against the *canonical* symlink parent
             // directory, then normalize to resolve any ".." components.
-            let parent = canonical_stored_path
-                .parent()
-                .unwrap_or(Path::new("/"));
+            let parent = canonical_stored_path.parent().unwrap_or(Path::new("/"));
             normalize_path(&parent.join(&target))
         };
 
