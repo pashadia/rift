@@ -76,63 +76,126 @@ async fn send_empty_drill_response<S: RiftStream>(stream: &mut S) -> anyhow::Res
     Ok(())
 }
 
-/// Build the Merkle tree for a file and cache it in the DB.
+/// Read one chunk from the file at `offset` with the given `length` and spawn a
+/// blocking task to compute its BLAKE3 hash.
 ///
-/// Returns `(root_hash, in_memory_cache)` on success, `None` if the file
-/// cannot be read.
-async fn build_and_cache_tree<M: MerkleCache>(
-    canonical: &Path,
-    chunker: Chunker,
-    db: &M,
-) -> Option<(Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>)> {
-    let file = tokio::fs::File::open(canonical).await.ok()?;
-    let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
-    let chunk_boundaries = chunker.chunk_stream(reader).await;
+/// The semaphore permit is held until the hash completes, bounding memory usage.
+///
+/// # Errors
+///
+/// Returns `None` and logs a warning if the semaphore is closed or a seek/read fails.
+async fn read_and_hash_one_chunk(
+    file: &mut tokio::fs::File,
+    sem: &Arc<Semaphore>,
+    chunk_index: usize,
+    offset: usize,
+    length: usize,
+) -> Option<tokio::task::JoinHandle<(usize, Blake3Hash, Vec<u8>)>> {
+    let permit = sem
+        .clone()
+        .acquire_owned()
+        .await
+        .inspect_err(
+            |e| tracing::warn!(%chunk_index, error = %e, "semaphore closed during chunk hashing"),
+        )
+        .ok()?;
 
-    // Stream chunks and hash with bounded parallelism (memory-efficient)
+    let mut buf = vec![0u8; length];
+    file.seek(SeekFrom::Start(offset as u64))
+        .await
+        .inspect_err(|e| tracing::warn!(%chunk_index, %offset, error = %e, "seek failed during chunk hashing"))
+        .ok()?;
+    file.read_exact(&mut buf)
+        .await
+        .inspect_err(|e| tracing::warn!(%chunk_index, %length, error = %e, "read failed during chunk hashing"))
+        .ok()?;
+
+    Some(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let hash = Blake3Hash::new(&buf);
+        (chunk_index, hash, buf)
+    }))
+}
+
+/// Read chunks from a file at the given boundary offsets and compute their BLAKE3 hashes.
+///
+/// Uses bounded parallelism (`available_parallelism` or 4) to hash chunks concurrently
+/// without exhausting memory: a semaphore limits the number of in-flight `spawn_blocking`
+/// hash operations. Chunks are read sequentially (single file descriptor) but hashed in
+/// parallel on the blocking thread-pool.
+///
+/// # Errors
+///
+/// Returns `None` and logs a warning if:
+/// - The file cannot be opened.
+/// - A seek or read operation fails.
+/// - The semaphore is closed.
+/// - A `spawn_blocking` task panics.
+async fn read_and_hash_chunks(
+    canonical: &Path,
+    chunk_boundaries: &[(usize, usize)],
+) -> Option<Vec<(usize, Blake3Hash, Vec<u8>)>> {
     let concurrency = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let sem = Arc::new(Semaphore::new(concurrency));
 
-    let mut file = tokio::fs::File::open(canonical).await.ok()?;
+    let mut file = tokio::fs::File::open(canonical)
+        .await
+        .inspect_err(|e| tracing::warn!(path = %canonical.display(), error = %e, "failed to open file for chunk hashing"))
+        .ok()?;
+
     let mut handles = Vec::with_capacity(chunk_boundaries.len());
-
     for (chunk_index, (offset, length)) in chunk_boundaries.iter().enumerate() {
-        let permit = sem.clone().acquire_owned().await.ok()?;
-
-        let mut buf = vec![0u8; *length];
-        file.seek(SeekFrom::Start(*offset as u64)).await.ok()?;
-        file.read_exact(&mut buf).await.ok()?;
-
-        let handle = tokio::task::spawn_blocking(move || {
-            let _permit = permit; // Keep semaphore permit alive during hashing
-            let hash = Blake3Hash::new(&buf);
-            (chunk_index, hash, buf)
-        });
+        let handle =
+            read_and_hash_one_chunk(&mut file, &sem, chunk_index, *offset, *length).await?;
         handles.push(handle);
     }
 
-    // Collect results preserving order
+    // Collect results preserving chunk-index order.
     let mut indexed_results: Vec<_> = Vec::with_capacity(handles.len());
     for h in handles {
-        indexed_results.push(h.await.ok()?);
+        let result = h
+            .await
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "spawn_blocking task panicked during chunk hashing"),
+            )
+            .ok()?;
+        indexed_results.push(result);
     }
     indexed_results.sort_by_key(|(idx, _, _)| *idx);
 
-    let leaf_hashes: Vec<Blake3Hash> = indexed_results.iter().map(|(_, h, _)| h.clone()).collect();
+    Some(indexed_results)
+}
 
-    // Build Merkle tree
+/// Build a Merkle tree from leaf hashes and persist it to the database cache.
+///
+/// The tree is constructed on the blocking thread-pool via `spawn_blocking` to avoid
+/// stalling the async runtime during CPU-intensive tree assembly. After construction
+/// the tree is written to `db` on a best-effort basis — a cache write failure is logged
+/// but does not cause the operation to fail.
+///
+/// # Errors
+///
+/// Returns `None` and logs a warning if `spawn_blocking` panics.
+async fn build_tree_and_cache<M: MerkleCache>(
+    canonical: &Path,
+    leaf_hashes: Vec<Blake3Hash>,
+    chunk_boundaries: &[(usize, usize)],
+    db: &M,
+) -> Option<(Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>)> {
+    let chunk_boundaries = chunk_boundaries.to_vec();
     let result = tokio::task::spawn_blocking(move || {
         let merkle = MerkleTree::default();
         merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries)
     })
     .await
+    .inspect_err(|e| tracing::warn!(path = %canonical.display(), error = %e, "spawn_blocking panicked in Merkle tree build"))
     .ok()?;
 
     let (root, cache, leaf_infos) = result;
 
-    // Store tree in database (best-effort) - this must happen on async runtime
+    // Store tree in database (best-effort) — failure is non-fatal for the caller.
     if let Ok(meta) = tokio::fs::metadata(canonical).await {
         let mtime_ns = meta
             .modified()
@@ -152,6 +215,36 @@ async fn build_and_cache_tree<M: MerkleCache>(
     }
 
     Some((root, cache))
+}
+
+/// Build the Merkle tree for a file and cache it in the database.
+///
+/// Orchestrates the full pipeline:
+/// 1. Open the file and compute chunk boundaries via `Chunker::chunk_stream`.
+/// 2. Read each chunk and compute its BLAKE3 hash concurrently (`read_and_hash_chunks`).
+/// 3. Assemble the Merkle tree and persist it (`build_tree_and_cache`).
+///
+/// # Errors
+///
+/// Returns `None` and logs a warning if:
+/// - The file cannot be opened.
+/// - Chunk reading or tree construction fails (delegated to sub-functions).
+async fn build_and_cache_tree<M: MerkleCache>(
+    canonical: &Path,
+    chunker: Chunker,
+    db: &M,
+) -> Option<(Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>)> {
+    let file = tokio::fs::File::open(canonical)
+        .await
+        .inspect_err(|e| tracing::warn!(path = %canonical.display(), error = %e, "failed to open file for tree build"))
+        .ok()?;
+    let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
+    let chunk_boundaries = chunker.chunk_stream(reader).await;
+
+    let indexed_results = read_and_hash_chunks(canonical, &chunk_boundaries).await?;
+    let leaf_hashes: Vec<Blake3Hash> = indexed_results.iter().map(|(_, h, _)| h.clone()).collect();
+
+    build_tree_and_cache(canonical, leaf_hashes, &chunk_boundaries, db).await
 }
 
 /// Handle a `MerkleDrill` request: look up children at a given hash in the file's

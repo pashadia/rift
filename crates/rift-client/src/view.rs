@@ -630,6 +630,120 @@ impl<R: RemoteShare> RiftShareView<R> {
         Ok((attrs.size, attrs.root_hash))
     }
 
+    /// Build a [`Manifest`] from resolved leaf information and chunk start offsets.
+    ///
+    /// Constructs a `Manifest` that maps logical chunk indices to their hashes and
+    /// file offsets, enabling the cache to reconstruct arbitrary byte ranges without
+    /// contacting the server.
+    ///
+    /// # Parameters
+    ///
+    /// * `merkle_root` — Raw bytes of the file's Merkle root hash. Used as the manifest
+    ///   identity; the caller should verify this matches the cached root before use.
+    /// * `leaves` — Resolved leaf nodes from the Merkle tree traversal.
+    /// * `chunk_starts` — File offsets where each chunk begins (parallel to `leaves`).
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Manifest)` — Successfully built from the inputs.
+    /// * `None` — `merkle_root` is not a valid 32-byte BLAKE3 hash.
+    fn build_manifest(
+        merkle_root: &[u8],
+        leaves: &[ResolvedLeaf],
+        chunk_starts: &[u64],
+    ) -> Option<crate::cache::db::Manifest> {
+        let root = rift_common::crypto::Blake3Hash::from_slice(merkle_root).ok()?;
+        Some(crate::cache::db::Manifest {
+            root,
+            chunks: leaves
+                .iter()
+                .enumerate()
+                .map(|(i, leaf)| crate::cache::db::ChunkInfo {
+                    index: leaf.chunk_index,
+                    offset: chunk_starts[i],
+                    length: leaf.length,
+                    hash: *leaf.hash.as_bytes(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Persist individual chunk data into the local file cache.
+    ///
+    /// Each chunk is stored keyed by its BLAKE3 hash. Cache write failures are logged
+    /// as warnings but do not abort — the operation continues with remaining chunks
+    /// so that partial results are available for future cache hits.
+    ///
+    /// # Parameters
+    ///
+    /// * `cache` — The file cache instance.
+    /// * `chunks` — List of `(hash, data)` pairs fetched from the server.
+    ///
+    /// # Error handling
+    ///
+    /// Individual `put_chunk` failures are logged at `WARN` level. The function always
+    /// completes — it never returns an error because a cache miss is handled gracefully
+    /// by falling through to a server fetch.
+    async fn cache_chunks_data(cache: &FileCache, chunks: &[crate::client::ChunkData]) {
+        for chunk in chunks {
+            if let Err(e) = cache.put_chunk(&chunk.hash, &chunk.data).await {
+                tracing::warn!("failed to cache chunk: {}", e);
+            }
+        }
+    }
+
+    /// Build and persist a [`Manifest`] for the given handle into the local cache.
+    ///
+    /// The manifest records which chunks belong to a file and where they start in the
+    /// byte stream, enabling the cache to serve partial reads. This is called after
+    /// chunk data has been stored via [`cache_chunks_data`].
+    ///
+    /// # Parameters
+    ///
+    /// * `cache` — The file cache instance.
+    /// * `handle` — Server-side file handle (used as the cache key).
+    /// * `merkle_root` — File's Merkle root hash bytes.
+    /// * `leaves` — Resolved Merkle leaf nodes.
+    /// * `chunk_starts` — File offsets for each leaf.
+    ///
+    /// # Error handling
+    ///
+    /// * If `merkle_root` is not a valid 32-byte hash, the manifest is silently skipped
+    ///   (this should never happen in practice since the root comes from the server).
+    /// * `put_manifest` failures are logged at `WARN` level but do not propagate.
+    async fn cache_manifest(
+        cache: &FileCache,
+        handle: &Uuid,
+        merkle_root: &[u8],
+        leaves: &[ResolvedLeaf],
+        chunk_starts: &[u64],
+    ) {
+        let Some(manifest) = Self::build_manifest(merkle_root, leaves, chunk_starts) else {
+            return;
+        };
+        if let Err(e) = cache.put_manifest(handle, &manifest).await {
+            tracing::warn!("failed to cache manifest: {}", e);
+        }
+    }
+
+    /// Cache fetched chunk data and a manifest for later read acceleration.
+    ///
+    /// This is the top-level cache-write entry point, called after a successful
+    /// `read_chunks` RPC. It stores:
+    ///
+    /// 1. Each chunk's raw bytes, keyed by hash (via [`cache_chunks_data`]).
+    /// 2. A manifest mapping chunk indices → hashes + file offsets (via [`cache_manifest`]).
+    ///
+    /// The cache is entirely optional — failures are logged but never propagated.
+    /// If `no_cache` is set or `self.cache` is `None`, the function returns immediately.
+    ///
+    /// # Parameters
+    ///
+    /// * `handle` — Server-side file handle used as the manifest cache key.
+    /// * `merkle_root` — File's Merkle root hash bytes (validates manifest identity).
+    /// * `chunks` — Fetched chunk data from the server.
+    /// * `leaves` — Resolved Merkle leaf nodes.
+    /// * `chunk_starts` — File offsets for each chunk.
     async fn cache_fetched_chunks(
         &self,
         handle: &Uuid,
@@ -645,31 +759,8 @@ impl<R: RemoteShare> RiftShareView<R> {
         let Some(ref cache) = self.cache else {
             return;
         };
-        for chunk in chunks {
-            if let Err(e) = cache.put_chunk(&chunk.hash, &chunk.data).await {
-                tracing::warn!("failed to cache chunk: {}", e);
-            }
-        }
-        let root = match rift_common::crypto::Blake3Hash::from_slice(merkle_root) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let manifest = crate::cache::db::Manifest {
-            root,
-            chunks: leaves
-                .iter()
-                .enumerate()
-                .map(|(i, leaf)| crate::cache::db::ChunkInfo {
-                    index: leaf.chunk_index,
-                    offset: chunk_starts[i],
-                    length: leaf.length,
-                    hash: *leaf.hash.as_bytes(),
-                })
-                .collect(),
-        };
-        if let Err(e) = cache.put_manifest(handle, &manifest).await {
-            tracing::warn!("failed to cache manifest: {}", e);
-        }
+        Self::cache_chunks_data(cache.as_ref(), chunks).await;
+        Self::cache_manifest(cache.as_ref(), handle, merkle_root, leaves, chunk_starts).await;
     }
 
     #[allow(clippy::cognitive_complexity)] // TODO: refactor into smaller functions

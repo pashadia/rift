@@ -49,6 +49,16 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
     false
 }
 
+/// Compute exponential backoff duration for a given retry attempt.
+///
+/// Uses the formula `BASE_BACKOFF_MS * 2^(attempt - 1)`, capped at 10 doublings
+/// (`BASE_BACKOFF_MS * 2^10 = 102.4s`) to prevent unbounded growth.
+fn reconnect_backoff_ms(attempt: u32) -> u64 {
+    // Saturating shift avoids overflow if attempts ever exceeds 63.
+    // `attempt` is 1-based, so `attempt - 1` doublings gives: 100ms, 200ms, 400ms, ...
+    BASE_BACKOFF_MS.saturating_mul(1u64 << (attempt.saturating_sub(1).min(10)))
+}
+
 /// A `RiftClient` wrapper that transparently reconnects on connection errors.
 ///
 /// ## Concurrency model
@@ -80,6 +90,20 @@ impl ReconnectingClient {
         }
     }
 
+    /// Attempt to execute `make_op`, retrying with exponential backoff on connection errors.
+    ///
+    /// On a connection error, the operation is retried up to `MAX_RETRIES` times with
+    /// exponential backoff (`BASE_BACKOFF_MS * 2^(attempt-1)`). Before each retry,
+    /// `attempt_reconnect` is called to establish a fresh QUIC connection.
+    ///
+    /// Non-connection errors (e.g. `FsError`, application-level failures) are propagated
+    /// immediately without retrying.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(T)` — The operation succeeded.
+    /// * `Err(e)` — A non-connection error, or the last connection error after all retries
+    ///   are exhausted.
     async fn with_reconnect<F, Fut, T>(&self, make_op: F) -> anyhow::Result<T>
     where
         F: Fn(Arc<RiftClient<rift_transport::QuicConnection>>) -> Fut,
@@ -100,8 +124,7 @@ impl ReconnectingClient {
                 }
                 Err(e) => {
                     attempts += 1;
-                    // Saturating shift avoids overflow if attempts ever exceeds 63.
-                    let backoff_ms = BASE_BACKOFF_MS.saturating_mul(1u64 << (attempts - 1).min(10));
+                    let backoff_ms = reconnect_backoff_ms(attempts);
                     tracing::warn!(
                         "connection error (attempt {}/{}): {}. retrying in {}ms",
                         attempts,
@@ -110,27 +133,29 @@ impl ReconnectingClient {
                         backoff_ms
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-
-                    // Serialize reconnects: only one task re-establishes the
-                    // connection at a time. The lock is NOT held while the new
-                    // connection is being set up — the await happens with the
-                    // lock held only briefly to read the current client, then
-                    // released during the handshake, then re-acquired to store.
-                    //
-                    // Actually simpler: hold the lock for the whole reconnect.
-                    // Concurrent ops use the old (broken) client and will retry.
-                    let _guard = self.reconnect_lock.lock().await;
-                    let old = self.client.load_full();
-                    match old.reconnect().await {
-                        Ok(new_client) => self.client.store(Arc::new(new_client)),
-                        Err(reconnect_err) => {
-                            tracing::error!("reconnect failed: {}", reconnect_err);
-                            return Err(reconnect_err);
-                        }
-                    }
+                    self.attempt_reconnect().await?;
                 }
             }
         }
+    }
+
+    /// Try to replace the current client with a fresh QUIC connection.
+    ///
+    /// Serialized by `reconnect_lock` so only one reconnect runs at a time across all
+    /// concurrent operations. While a reconnect is in-flight, concurrent operations that
+    /// loaded the old (broken) client will fail and retry, eventually picking up the new
+    /// client on the next iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with the underlying transport error if `old.reconnect()` fails.
+    /// The connection is left in its current (broken) state for the next retry attempt.
+    async fn attempt_reconnect(&self) -> anyhow::Result<()> {
+        let _guard = self.reconnect_lock.lock().await;
+        let old = self.client.load_full();
+        let new_client = old.reconnect().await?;
+        self.client.store(Arc::new(new_client));
+        Ok(())
     }
 
     pub async fn reconnect(&self) -> anyhow::Result<()> {

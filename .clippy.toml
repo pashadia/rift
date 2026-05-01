@@ -1,10 +1,6 @@
 # Clippy configuration file
 # https://doc.rust-lang.org/clippy/configuration.html
 
-too-many-arguments-threshold = 7
-cognitive-complexity-threshold = 30
-type-complexity-threshold = 5000
-
 # Don't complain about unwrap/expect in test code
 allow-unwrap-in-tests = true
 allow-dbg-in-tests = true
