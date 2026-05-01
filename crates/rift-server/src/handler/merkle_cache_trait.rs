@@ -22,7 +22,7 @@ pub type DeleteMerkleFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + S
 
 /// Trait abstracting Merkle tree cache operations.
 ///
-/// Implemented by `Database` (real SQLite cache) and `NoopCache` (no-op fallback).
+/// Implemented by `Database` (real `SQLite` cache) and `NoopCache` (no-op fallback).
 /// Eliminates `Option<&Database>` and the `db.as_ref().as_ref()` double-unwrap pattern.
 pub trait MerkleCache: Send + Sync {
     fn get_merkle<'a>(&'a self, path: &'a Path) -> GetMerkleFut<'a>;

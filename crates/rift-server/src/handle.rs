@@ -104,7 +104,7 @@ impl HandleDatabase {
         }
     }
 
-    /// Create a HandleDatabase with a known signing key (for testing).
+    /// Create a `HandleDatabase` with a known signing key (for testing).
     #[cfg(test)]
     fn with_key(signing_key: [u8; 32]) -> Self {
         Self {

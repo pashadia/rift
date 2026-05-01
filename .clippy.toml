@@ -12,13 +12,13 @@ allow-print-in-tests = true
 
 # Recognized identifiers in doc comments
 doc-valid-idents = [
-    "Beefy",
     "CDC",
     "CoW",
     "FS",
     "InMemoryConnection",
     "InMemoryListener",
     "MerkleTree",
+    "ProtoBuf",
     "QUIC",
     "RiftClient",
     "RiftShareView",

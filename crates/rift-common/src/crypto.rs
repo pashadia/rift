@@ -1,4 +1,4 @@
-//! Cryptographic primitives: BLAKE3 hashing, FastCDC chunking, Merkle trees
+//! Cryptographic primitives: BLAKE3 hashing, `FastCDC` chunking, Merkle trees
 
 use std::collections::HashMap;
 
@@ -78,7 +78,7 @@ impl Blake3Hash {
     }
 }
 
-/// FastCDC chunker with configurable parameters.
+/// `FastCDC` chunker with configurable parameters.
 ///
 /// Defaults to production parameters (32/128/512 KB).
 /// Use [`Chunker::new`] with smaller values for testing.
@@ -184,7 +184,7 @@ pub struct LeafInfo {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MerkleChild {
     /// Intermediate node — hash points to a subtree whose children
-    /// can be queried with another MerkleDrill.
+    /// can be queried with another `MerkleDrill`.
     Subtree(Blake3Hash),
     /// Leaf node — actual chunk with metadata.
     Leaf {
@@ -374,7 +374,7 @@ impl MerkleTree {
 
     /// Build a Merkle tree with chunk offset/length metadata.
     ///
-    /// Returns (root, cache, leaf_infos) where leaf_infos contains
+    /// Returns (root, cache, `leaf_infos`) where `leaf_infos` contains
     /// per-chunk metadata suitable for DB storage.
     /// The `chunk_boundaries` slice must be the same length as `leaf_hashes`
     /// and provide (offset, length) for each chunk.

@@ -165,10 +165,10 @@ where
 // Handshake handler
 // ---------------------------------------------------------------------------
 
-/// Handle a RIFT_HELLO handshake on the given stream.
+/// Handle a `RIFT_HELLO` handshake on the given stream.
 ///
 /// Validates protocol version, creates/gets the root handle, and sends
-/// RIFT_WELCOME. Returns `Ok(())` on success, `Err` on version mismatch
+/// `RIFT_WELCOME`. Returns `Ok(())` on success, `Err` on version mismatch
 /// or stream failure.
 async fn handle_handshake<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
@@ -214,7 +214,7 @@ async fn handle_handshake<S: RiftStream, M: MerkleCache>(
 /// Dispatch a simple request→response: call `handler`, encode the response,
 /// send a single frame, then `finish_send`.
 ///
-/// This eliminates the repeated "call handler → encode → send_frame → finish_send"
+/// This eliminates the repeated "call handler → encode → `send_frame` → `finish_send`"
 /// pattern for stat, lookup, and readdir handlers.
 async fn dispatch_simple<S, F, Fut, R>(
     stream: &mut S,
@@ -265,7 +265,7 @@ async fn send_error_response<S: RiftStream>(
 // Streaming dispatch wrappers
 // ---------------------------------------------------------------------------
 
-/// Handle a READ_REQUEST by delegating to the read handler with context.
+/// Handle a `READ_REQUEST` by delegating to the read handler with context.
 async fn handle_read_request<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
     payload: &[u8],
@@ -283,7 +283,7 @@ async fn handle_read_request<S: RiftStream, M: MerkleCache>(
     .map_err(|e| anyhow::anyhow!("read failed: {}", e))
 }
 
-/// Handle a MERKLE_DRILL request by delegating to the drill handler with context.
+/// Handle a `MERKLE_DRILL` request by delegating to the drill handler with context.
 async fn handle_merkle_drill_request<S: RiftStream, M: MerkleCache>(
     stream: &mut S,
     payload: &[u8],

@@ -56,7 +56,7 @@ pub struct InMemoryConnector {
     tx: mpsc::UnboundedSender<InMemoryConnection>,
     /// Fingerprint connecting clients will present as their cert fingerprint.
     client_fingerprint: String,
-    /// Fingerprint of the server, returned as peer_fingerprint on the client side.
+    /// Fingerprint of the server, returned as `peer_fingerprint` on the client side.
     server_fingerprint: String,
 }
 

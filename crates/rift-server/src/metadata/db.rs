@@ -1,4 +1,4 @@
-//! SQLite database connection and schema management.
+//! `SQLite` database connection and schema management.
 
 use std::path::Path;
 use tokio_rusqlite::rusqlite;
@@ -32,7 +32,7 @@ const SCHEMA_DDL: &str = r"
     );
 ";
 
-/// A SQLite database for storing share metadata.
+/// A `SQLite` database for storing share metadata.
 ///
 /// Uses WAL mode for concurrent reads and atomic writes.
 /// Uses tokio-rusqlite for async access - no Mutex needed.

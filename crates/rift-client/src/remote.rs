@@ -9,13 +9,13 @@ use crate::client::{ChunkReadResult, MerkleDrillResult};
 /// It is the boundary for all network communication.
 #[async_trait]
 pub trait RemoteShare: Send + Sync + 'static {
-    /// Corresponds to a LOOKUP_REQUEST.
+    /// Corresponds to a `LOOKUP_REQUEST`.
     async fn lookup(&self, parent_handle: Uuid, name: &str) -> anyhow::Result<(Uuid, FileAttrs)>;
 
-    /// Corresponds to a READDIR_REQUEST.
+    /// Corresponds to a `READDIR_REQUEST`.
     async fn readdir(&self, handle: Uuid) -> anyhow::Result<Vec<ReaddirEntry>>;
 
-    /// Corresponds to a batch STAT_REQUEST.
+    /// Corresponds to a batch `STAT_REQUEST`.
     async fn stat_batch(
         &self,
         handles: Vec<Uuid>,

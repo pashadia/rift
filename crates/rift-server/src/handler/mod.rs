@@ -34,7 +34,7 @@ pub use read::{read_response, MAX_CHUNK_COUNT};
 pub use readdir::readdir_response;
 pub use stat::stat_response;
 
-/// A path resolved through the HandleDatabase and verified to be within
+/// A path resolved through the `HandleDatabase` and verified to be within
 /// the share root.
 ///
 /// # Symlink semantics
@@ -61,11 +61,11 @@ pub struct ResolvedPath {
 }
 
 /// Resolve an opaque `handle` (UUID from the client) to a
-/// filesystem path within `share` using the HandleDatabase.
+/// filesystem path within `share` using the `HandleDatabase`.
 ///
 /// # Security invariants
 ///
-/// - Looks up path from HandleDatabase using UUID.
+/// - Looks up path from `HandleDatabase` using UUID.
 /// - Canonicalises the result with `tokio::fs::canonicalize`, which resolves
 ///   all `..` components and follows symlinks.
 /// - Verifies that the canonical result is prefixed by the canonical share root,
@@ -167,7 +167,7 @@ pub async fn resolve(
 /// (from re-canonicalizing via /proc/self/fd/N), return the path that
 /// should be used for subsequent filesystem operations.
 ///
-/// When fd_resolved is Some and differs from canonical, the fd-resolved
+/// When `fd_resolved` is Some and differs from canonical, the fd-resolved
 /// path is returned (it is guaranteed stable since the fd was open).
 /// Otherwise, canonical is returned as-is.
 pub(crate) fn effective_path(canonical: PathBuf, fd_resolved: Option<PathBuf>) -> PathBuf {
@@ -276,7 +276,7 @@ pub(crate) fn error_detail(
     }
 }
 
-/// Look up the stored path for a handle in the HandleDatabase.
+/// Look up the stored path for a handle in the `HandleDatabase`.
 /// Returns the path or bail with "invalid handle: not found".
 fn lookup_stored_path(handle: &Uuid, handle_db: &HandleDatabase) -> anyhow::Result<PathBuf> {
     match handle_db.get_path(handle) {
@@ -296,9 +296,9 @@ async fn canonicalize_share_root(share: &Path) -> anyhow::Result<PathBuf> {
         .context("share root does not exist or is inaccessible")
 }
 
-/// Check path metadata: get symlink_metadata, detect if path is a symlink,
+/// Check path metadata: get `symlink_metadata`, detect if path is a symlink,
 /// and handle missing-path eviction.
-/// Returns (is_symlink, stored_path) or errors on missing path.
+/// Returns (`is_symlink`, `stored_path`) or errors on missing path.
 async fn check_path_metadata(
     stored_path: &Path,
     handle: &Uuid,
@@ -398,7 +398,7 @@ async fn handle_broken_symlink_containment(
 }
 
 /// Linux-only: open file, re-canonicalize via /proc/self/fd/N, verify containment.
-/// Returns Some(fd_resolved_path) if the fd resolves to a different path (TOCTOU race detected),
+/// Returns `Some(fd_resolved_path)` if the fd resolves to a different path (TOCTOU race detected),
 /// or None if the path is stable (no race) or the check was skipped.
 /// On non-Linux, returns None (no-op).
 async fn fd_recanonicalize_linux(
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(resolved.canonical, file.canonicalize().unwrap());
     }
 
-    /// When a handle is registered for a symlink path, resolve() must return
+    /// When a handle is registered for a symlink path, `resolve()` must return
     /// the symlink path itself — NOT the canonical target.  This is critical
     /// for the stat handler to return symlink metadata (not the target's).
     #[tokio::test]
@@ -704,7 +704,7 @@ mod tests {
 
     /// SECURITY: A broken symlink whose stored path is outside the share root
     /// must be rejected even though canonicalize fails (and thus the normal
-    /// containment check is skipped).  resolve() is the security boundary and
+    /// containment check is skipped).  `resolve()` is the security boundary and
     /// must re-verify on every access, not trust the stored path.
     #[tokio::test]
     async fn resolve_broken_symlink_outside_share_is_rejected() {
@@ -741,7 +741,7 @@ mod tests {
     /// SECURITY: A broken symlink inside the share pointing to a relative
     /// target is acceptable (the target simply doesn't exist yet). But a
     /// broken symlink inside the share pointing to an absolute path outside
-    /// the share should be rejected via best-effort read_link check.
+    /// the share should be rejected via best-effort `read_link` check.
     #[tokio::test]
     async fn resolve_broken_symlink_inside_share_with_abs_target_outside_is_rejected() {
         let share_tmp = TempDir::new().unwrap();

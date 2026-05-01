@@ -19,12 +19,12 @@ message ReadSuccess {
   uint32 chunk_count = 1;
 }
 
-// BLOCK_HEADER (0x32)
+// `BLOCK_HEADER` (0x32)
 message BlockHeader {
   ChunkInfo chunk = 1;
 }
 
-// TRANSFER_COMPLETE (0x33)
+// `TRANSFER_COMPLETE` (0x33)
 message TransferComplete {
   bytes merkle_root = 1;
 }
@@ -55,13 +55,13 @@ message WriteSuccess {
   bytes handle   = 2;
 }
 
-// MERKLE_DRILL (0x50) — hash-based tree traversal
+// `MERKLE_DRILL` (0x50) — hash-based tree traversal
 message MerkleDrill {
   bytes handle = 1;
   bytes hash    = 2;  // empty = request root's children
 }
 
-// MERKLE_DRILL_RESPONSE (0x51)
+// `MERKLE_DRILL_RESPONSE` (0x51)
 message MerkleDrillResponse {
   bytes parent_hash              = 1;
   repeated MerkleChildProto children = 2;
@@ -80,7 +80,7 @@ message MerkleChildProto {
   uint32          chunk_index = 4;  // 0 for Subtree
 }
 
-// MERKLE_LEAVES_RESPONSE (0x52) — kept for block-level detail queries
+// `MERKLE_LEAVES_RESPONSE` (0x52) — kept for block-level detail queries
 message MerkleLeavesResponse {
   repeated SubtreeLeaves subtrees = 1;
 }

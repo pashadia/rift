@@ -29,7 +29,7 @@ enum Command {
         path: PathBuf,
 
         /// State directory for persistent certificates, cache, and TOFU data
-        /// (default: $XDG_STATE_HOME/rift, typically ~/.local/state/rift)
+        /// (default: $`XDG_STATE_HOME/rift`, typically ~/.local/state/rift)
         #[arg(long)]
         state_dir: Option<PathBuf>,
 

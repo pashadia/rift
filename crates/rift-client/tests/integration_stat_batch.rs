@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used)]
-//! Integration tests for stat_batch operation.
+//! Integration tests for `stat_batch` operation.
 //!
 //! These tests verify:
 //! - Behavior: correct results returned in order
@@ -128,11 +128,11 @@ async fn client_stat_batch_single_handle() {
 // stat_batch request counting (verifies single network request)
 // ---------------------------------------------------------------------------
 
-/// This test verifies that stat_batch sends ONE request with all handles,
+/// This test verifies that `stat_batch` sends ONE request with all handles,
 /// not N sequential requests (one per handle).
 ///
 /// This is both a behavior test (correct results) and a performance test
-/// (efficient network usage). Using RecordingConnection we can count the
+/// (efficient network usage). Using `RecordingConnection` we can count the
 /// actual frames sent over the wire.
 #[tokio::test]
 async fn stat_batch_sends_single_request_with_all_handles() {

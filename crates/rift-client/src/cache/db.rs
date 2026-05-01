@@ -1,14 +1,14 @@
 //! SQLite-based file cache.
 //!
 //! Stores:
-//! - File manifests: (handle -> root_hash, chunk list) — in SQLite
-//! - Chunk data: (chunk_hash -> data) — on disk via ChunkStore
+//! - File manifests: (handle -> `root_hash`, chunk list) — in `SQLite`
+//! - Chunk data: (`chunk_hash` -> data) — on disk via `ChunkStore`
 //!
 //! TODO(v1): Implement configurable cache size limits per mount.
 //! Current: unlimited. Future: LRU eviction based on configurable budget.
 //! See docs/03-cli-design/commands.md for planned config:
-//!   rift config get client.cache_size
-//!   rift config set client.cache_size 2GB
+//!   rift config get `client.cache_size`
+//!   rift config set `client.cache_size` 2GB
 
 use rift_common::crypto::Blake3Hash;
 use std::path::Path;
@@ -50,7 +50,7 @@ pub enum ReconstructError {
 
 /// A file cache for storing root hashes and chunk data.
 ///
-/// Metadata (manifests, chunk references) is stored in SQLite.
+/// Metadata (manifests, chunk references) is stored in `SQLite`.
 /// Chunk data is stored on disk via `ChunkStore`.
 pub struct FileCache {
     conn: Connection,
@@ -195,8 +195,8 @@ impl FileCache {
 
     /// Store a file manifest (root hash + chunk list).
     ///
-    /// Uses INSERT OR REPLACE for each chunk_ref so a complete manifest always
-    /// replaces a partial one. After inserting all chunk_refs, prunes any stale
+    /// Uses INSERT OR REPLACE for each `chunk_ref` so a complete manifest always
+    /// replaces a partial one. After inserting all `chunk_refs`, prunes any stale
     /// entries with `chunk_index >= N` (where N = chunk count), which can occur
     /// if the file shrank between versions.
     pub async fn put_manifest(&self, handle: &Uuid, manifest: &Manifest) -> SqliteResult<()> {
@@ -253,7 +253,7 @@ impl FileCache {
 
     /// Remove a file manifest and its chunk references from the cache.
     ///
-    /// Relies on ON DELETE CASCADE to automatically remove associated chunk_refs
+    /// Relies on ON DELETE CASCADE to automatically remove associated `chunk_refs`
     /// when the manifest row is deleted, so only the manifests table needs an
     /// explicit DELETE.
     pub async fn remove_manifest(&self, handle: &Uuid) -> SqliteResult<()> {
@@ -866,9 +866,9 @@ mod tests {
         );
     }
 
-    /// put_manifest prunes stale entries from a previous version.
+    /// `put_manifest` prunes stale entries from a previous version.
     /// When a file shrinks (e.g. from 4 chunks to 2), the old entries at
-    /// chunk_index >= 2 must be removed.
+    /// `chunk_index` >= 2 must be removed.
     #[tokio::test]
     async fn put_manifest_prunes_stale_chunk_refs() {
         let cache = FileCache::open_in_memory().await.unwrap();
@@ -1013,7 +1013,7 @@ mod tests {
         );
     }
 
-    /// Verify that remove_manifest cleans up chunk_refs via CASCADE.
+    /// Verify that `remove_manifest` cleans up `chunk_refs` via CASCADE.
     #[tokio::test]
     async fn remove_manifest_cleans_up_chunk_refs() {
         let cache = FileCache::open_in_memory().await.unwrap();
@@ -1057,7 +1057,7 @@ mod tests {
     }
 
     /// Verify that foreign key constraints are enforced in the in-memory DB.
-    /// Inserting a chunk_ref with a non-existent handle should fail.
+    /// Inserting a `chunk_ref` with a non-existent handle should fail.
     #[tokio::test]
     async fn foreign_key_constraint_enforced_in_memory() {
         let cache = FileCache::open_in_memory().await.unwrap();
@@ -1078,9 +1078,9 @@ mod tests {
         );
     }
 
-    /// Verify that reconstruct_range handles offset+length overflow safely.
-    /// With offset > 0 and length near u64::MAX, offset+length wraps around
-    /// in buggy code (e.g., 1 + u64::MAX = 0). With saturating_add it clamps correctly.
+    /// Verify that `reconstruct_range` handles offset+length overflow safely.
+    /// With offset > 0 and length near `u64::MAX`, offset+length wraps around
+    /// in buggy code (e.g., 1 + `u64::MAX` = 0). With `saturating_add` it clamps correctly.
     #[tokio::test]
     async fn reconstruct_range_handles_overflow_safely() {
         let tmp = tempfile::tempdir().unwrap();

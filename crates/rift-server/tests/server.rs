@@ -443,8 +443,8 @@ async fn readdir_response_applies_limit() {
 // Must-fix: resolve security with UUID handles
 // ---------------------------------------------------------------------------
 
-/// When a file is deleted after a handle was created, resolve() must evict
-/// the stale handle from the HandleDatabase so it doesn't accumulate forever.
+/// When a file is deleted after a handle was created, `resolve()` must evict
+/// the stale handle from the `HandleDatabase` so it doesn't accumulate forever.
 #[tokio::test]
 async fn resolve_evicts_stale_handle_when_file_deleted() {
     let (_dir, root) = helpers::make_share();
@@ -464,7 +464,7 @@ async fn resolve_evicts_stale_handle_when_file_deleted() {
     );
 }
 
-/// After a handle is evicted, get_or_create_handle must be able to re-create
+/// After a handle is evicted, `get_or_create_handle` must be able to re-create
 /// a handle for the same relative path if the file is recreated.
 #[tokio::test]
 async fn get_or_create_handle_recreates_after_eviction() {
@@ -486,8 +486,8 @@ async fn get_or_create_handle_recreates_after_eviction() {
 }
 
 /// A symlink whose *target* lies outside the share must be rejected.
-/// The HandleDatabase should not create handles for symlinks that point outside,
-/// and resolve() must reject them via canonicalization.
+/// The `HandleDatabase` should not create handles for symlinks that point outside,
+/// and `resolve()` must reject them via canonicalization.
 #[tokio::test]
 #[cfg(unix)]
 async fn resolve_rejects_symlink_target_outside_share() {
@@ -555,9 +555,9 @@ async fn resolve_rejects_intermediate_symlink_escape() {
 /// SECURITY: A broken symlink whose absolute target contains ".." components
 /// that escape the share root must be rejected.
 ///
-/// Path::starts_with() is component-based and does NOT resolve "..".
+/// `Path::starts_with()` is component-based and does NOT resolve "..".
 /// Without normalization, "/share/../../nonexistent" passes
-/// Path::starts_with("/share") because the prefix components match lexically.
+/// `Path::starts_with("/share`") because the prefix components match lexically.
 ///
 /// The target MUST NOT EXIST to ensure we enter the broken-symlink code path
 /// (canonicalize fails) rather than the normal path (canonicalize succeeds).
@@ -597,7 +597,7 @@ async fn resolve_rejects_broken_symlink_with_dotdot_in_absolute_target() {
 ///
 /// Relative targets were previously accepted without any containment check.
 /// A symlink deep inside the share could point to "../../nonexistent" and
-/// the resolve() function would allow it.
+/// the `resolve()` function would allow it.
 ///
 /// The target MUST NOT EXIST to ensure we enter the broken-symlink code path
 /// (canonicalize fails) rather than the normal path (canonicalize succeeds).
@@ -1334,7 +1334,7 @@ async fn server_rejects_wrong_protocol_version() {
     }
 }
 
-/// Unknown message types must receive an ERROR_RESPONSE before the stream closes.
+/// Unknown message types must receive an `ERROR_RESPONSE` before the stream closes.
 /// This ensures clients get a clear error instead of a silent close.
 #[tokio::test]
 async fn server_rejects_unknown_message_type_with_error_response() {
@@ -1428,7 +1428,7 @@ async fn server_handles_stream_with_no_request_data() {
 /// stream after sending its response.
 ///
 /// We verify both operations behave identically by checking that the server
-/// half-closes the stream (recv_frame returns None) after sending one
+/// half-closes the stream (`recv_frame` returns None) after sending one
 /// response frame, and that the server remains responsive to subsequent
 /// requests after a client drops mid-operation.
 #[tokio::test]
@@ -2141,14 +2141,14 @@ mod helpers_with_db {
             .expect("sabotage SQL should succeed");
     }
 
-    /// Drop the merkle_cache table, causing put_merkle to fail.
+    /// Drop the `merkle_cache` table, causing `put_merkle` to fail.
     /// stat and read still return correct data; they just can't cache.
     pub async fn drop_merkle_cache(db: &Database) {
         sabotage_db(db, "DROP TABLE IF EXISTS merkle_cache").await;
     }
 
-    /// Drop the merkle_tree_nodes and merkle_leaf_info tables,
-    /// causing put_tree to fail. Drill still returns correct data
+    /// Drop the `merkle_tree_nodes` and `merkle_leaf_info` tables,
+    /// causing `put_tree` to fail. Drill still returns correct data
     /// from in-memory cache.
     pub async fn drop_merkle_tree_tables(db: &Database) {
         sabotage_db(
@@ -2721,10 +2721,10 @@ async fn server_rejects_excessive_chunk_count() {
     }
 }
 
-/// Rejecting excessive chunk_count must happen before filesystem access.
+/// Rejecting excessive `chunk_count` must happen before filesystem access.
 /// Using the root handle (a directory) proves this: if the server attempted to
 /// read the directory it would get a non-file error, but we should see
-/// ErrorUnsupported first because the chunk_count guard runs before resolve().
+/// `ErrorUnsupported` first because the `chunk_count` guard runs before `resolve()`.
 #[tokio::test]
 async fn server_rejects_excessive_chunk_count_before_file_access() {
     use rift_protocol::messages::{msg, ReadRequest};
@@ -3130,8 +3130,8 @@ fn max_chunk_count_value_is_256() {
 // Multi-chunk boundary tests (use TEST_CHUNKER for small files with many chunks)
 // ---------------------------------------------------------------------------
 
-/// Helper: create a multi-chunk test file and return (dir, root, content, chunk_count).
-/// With TEST_CHUNKER (avg=256), gives 16+ chunks from ~4KB.
+/// Helper: create a multi-chunk test file and return (dir, root, content, `chunk_count`).
+/// With `TEST_CHUNKER` (avg=256), gives 16+ chunks from ~4KB.
 async fn setup_multi_chunk_file() -> (TempDir, PathBuf, Vec<u8>, usize) {
     let (_dir, root) = helpers::make_share();
     // 4KB varied content → 16+ chunks with TEST_CHUNKER
@@ -3571,7 +3571,7 @@ mod merkle_drill_tests {
         );
     }
 
-    /// Merkle drill must return correct data even when put_tree fails.
+    /// Merkle drill must return correct data even when `put_tree` fails.
     /// The handler uses in-memory cache first, so drill works even
     /// if DB writes fail.
     #[tokio::test]
@@ -3631,7 +3631,7 @@ mod db_failure_resilience_tests {
     use super::*;
     use rift_server::metadata::db::Database;
 
-    /// Stat must return a correct root_hash even when put_merkle fails.
+    /// Stat must return a correct `root_hash` even when `put_merkle` fails.
     /// The root hash is computed from file content regardless of DB state.
     #[tokio::test]
     async fn stat_returns_correct_root_hash_despite_db_write_failure() {
@@ -3670,7 +3670,7 @@ mod db_failure_resilience_tests {
         assert_eq!(attrs.size, 10, "file size should be 10 bytes");
     }
 
-    /// Read must return correct chunk data even when put_merkle fails.
+    /// Read must return correct chunk data even when `put_merkle` fails.
     /// The read handler computes content/chunks from the file regardless of DB state.
     #[tokio::test]
     async fn read_returns_correct_data_despite_db_write_failure() {

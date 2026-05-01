@@ -25,6 +25,9 @@ repository = "https://github.com/yourusername/rift"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
+# pedantic = "warn"
+doc_markdown = "warn"
+
 # Correctness & bug prevention
 unwrap_used = "deny"
 expect_used = "allow"

@@ -22,7 +22,7 @@ pub(crate) fn sentinel_hash_for_non_file(file_type: FileType) -> Blake3Hash {
 
 /// Get or compute the Merkle root hash for a file.
 ///
-/// Always returns a 32-byte Blake3Hash:
+/// Always returns a 32-byte `Blake3Hash`:
 /// - For regular files: Merkle root computed from content (cached if possible)
 /// - For non-files (directories, etc.): uses a constant sentinel hash
 #[instrument(skip_all, fields(path = %path.display()), level = "debug")]
@@ -57,7 +57,7 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
     }
 }
 
-/// Classify metadata into a FileType.
+/// Classify metadata into a `FileType`.
 fn classify_file_type(meta: &std::fs::Metadata) -> FileType {
     if meta.is_dir() {
         FileType::Directory

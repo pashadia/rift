@@ -296,7 +296,7 @@ mod tests {
     /// Symlinks within the share must:
     ///   1. Report `FileType::Symlink`.
     ///   2. Use the symlink's OWN path (not the canonical target) for the handle.
-    ///   (The symlink target string is provided via stat_batch/FileAttrs, not ReaddirEntry.)
+    ///   (The symlink target string is provided via `stat_batch/FileAttrs`, not `ReaddirEntry`.)
     #[tokio::test]
     async fn readdir_response_symlink_uses_own_path_and_includes_target() {
         let tmp = TempDir::new().unwrap();
@@ -356,7 +356,7 @@ mod tests {
 
     /// When a directory contains multiple symlinks, every one must report the
     /// correct `file_type`. This also serves as a regression guard for the
-    /// share_canonical hoist: if the hoist were broken, entries could silently
+    /// `share_canonical` hoist: if the hoist were broken, entries could silently
     /// vanish or report wrong metadata.
     #[tokio::test]
     async fn readdir_response_multiple_symlinks_all_consistent() {

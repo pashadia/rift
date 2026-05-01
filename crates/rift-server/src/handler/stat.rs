@@ -169,7 +169,7 @@ mod tests {
         );
     }
 
-    /// Statting a symlink should return symlink metadata (FileType::Symlink)
+    /// Statting a symlink should return symlink metadata (`FileType::Symlink`)
     /// and include the symlink target, not the target's metadata.
     #[tokio::test]
     #[cfg(unix)]

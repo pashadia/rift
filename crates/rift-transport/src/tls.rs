@@ -1,4 +1,4 @@
-//! TLS certificate verification — rustls adapters delegating to FingerprintPolicy.
+//! TLS certificate verification — rustls adapters delegating to `FingerprintPolicy`.
 //!
 //! [`AcceptAnyClientCertVerifier`] is used server-side: it requires mTLS (the
 //! client must present a cert) but accepts any certificate — authorization is

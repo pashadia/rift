@@ -3,7 +3,7 @@
 //!
 //! Each test spins up real loopback QUIC endpoints using rcgen-generated
 //! self-signed certificates and exercises the full path:
-//!   TLS verifier → quinn connection → frame codec → RiftStream
+//!   TLS verifier → quinn connection → frame codec → `RiftStream`
 
 use rift_transport::{
     client_endpoint, client_endpoint_no_cert, connect, server_endpoint, AcceptAnyPolicy,

@@ -100,7 +100,7 @@ fn decode_lookup_request(payload: &[u8]) -> Option<LookupRequest> {
     Some(req)
 }
 
-/// Resolve the parent handle to its canonical path via the HandleDatabase.
+/// Resolve the parent handle to its canonical path via the `HandleDatabase`.
 /// Returns `Some(PathBuf)` on success, `None` if the handle is invalid or not found.
 async fn resolve_parent_path(
     share: &Path,
@@ -407,7 +407,7 @@ mod tests {
         );
     }
 
-    /// A symlink whose target is outside the share must return ErrorNotFound.
+    /// A symlink whose target is outside the share must return `ErrorNotFound`.
     #[tokio::test]
     async fn lookup_response_symlink_outside_share_returns_not_found() {
         let tmp = TempDir::new().unwrap();
@@ -441,7 +441,7 @@ mod tests {
         }
     }
 
-    /// A broken symlink (target does not exist) must return ErrorNotFound.
+    /// A broken symlink (target does not exist) must return `ErrorNotFound`.
     #[tokio::test]
     async fn lookup_response_broken_symlink_returns_not_found() {
         let tmp = TempDir::new().unwrap();
@@ -485,9 +485,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// When a symlink is replaced by a regular file between two lookup calls,
-    /// the second lookup must return FileType::Regular, not File::Symlink.
+    /// the second lookup must return `FileType::Regular`, not <File::Symlink>.
     /// This verifies the TOCTOU re-verification: if the type changes after
-    /// the initial symlink_metadata check, the response reflects reality.
+    /// the initial `symlink_metadata` check, the response reflects reality.
     #[tokio::test]
     #[cfg(unix)]
     async fn lookup_response_symlink_replaced_by_file_returns_regular_type() {
@@ -551,7 +551,7 @@ mod tests {
     }
 
     /// When a regular file is replaced by a symlink between two lookup calls,
-    /// the second lookup must return FileType::Symlink with the correct target.
+    /// the second lookup must return `FileType::Symlink` with the correct target.
     #[tokio::test]
     #[cfg(unix)]
     async fn lookup_response_file_replaced_by_symlink_returns_symlink_type() {
@@ -611,7 +611,7 @@ mod tests {
     }
 
     /// When the entry at a name disappears between the parent resolution and
-    /// the child metadata check, lookup must return ErrorNotFound.
+    /// the child metadata check, lookup must return `ErrorNotFound`.
     #[tokio::test]
     async fn lookup_response_disappearing_entry_returns_not_found() {
         let tmp = TempDir::new().unwrap();

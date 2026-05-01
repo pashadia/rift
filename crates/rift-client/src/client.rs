@@ -203,7 +203,7 @@ impl RiftClient<QuicConnection> {
     }
 }
 
-/// Result of a read_chunks operation, containing the fetched chunk data and Merkle root.
+/// Result of a `read_chunks` operation, containing the fetched chunk data and Merkle root.
 pub struct ChunkReadResult {
     pub chunks: Vec<ChunkData>,
     pub merkle_root: Vec<u8>,
@@ -679,7 +679,7 @@ impl<C: RiftConnection> RiftClient<C> {
     /// - `handle`: The file handle
     /// - `hash`: Hash of the node to query (empty = request root's children)
     ///
-    /// Returns `MerkleDrillResponse` with parent_hash and children list.
+    /// Returns `MerkleDrillResponse` with `parent_hash` and children list.
     #[instrument(skip(self), fields(hash_len = hash.len()))]
     pub async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> Result<MerkleDrillResponse> {
         let mut stream = self
@@ -811,8 +811,8 @@ impl ConnectionStats for QuicConnection {
     }
 }
 
-/// Test helpers for RiftClient backed by RecordingConnection.
-/// These are separate from the main impl block because RecordingConnection
+/// Test helpers for RiftClient backed by `RecordingConnection`.
+/// These are separate from the main impl block because `RecordingConnection`
 /// is specifically designed for testing.
 impl<C: RiftConnection> RiftClient<rift_transport::RecordingConnection<C>> {
     /// Get the number of times `open_stream` was called on the underlying connection.
@@ -830,7 +830,7 @@ impl<C: RiftConnection> RiftClient<rift_transport::RecordingConnection<C>> {
 // RemoteShare impl (Linux only)
 // ---------------------------------------------------------------------------
 
-/// Wrapper type for MerkleDrill results, simplifying the protocol response.
+/// Wrapper type for `MerkleDrill` results, simplifying the protocol response.
 pub struct MerkleDrillResult {
     pub parent_hash: Vec<u8>,
     pub children: Vec<MerkleChildInfo>,

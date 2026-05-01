@@ -23,8 +23,8 @@ use crate::handler::{io_err_kind_to_code, resolve};
 
 use crate::metadata::merkle::MerkleEntry;
 
-/// Maximum number of chunks a client can request in a single ReadRequest.
-/// This prevents DoS attacks where a client requests u32::MAX chunks.
+/// Maximum number of chunks a client can request in a single `ReadRequest`.
+/// This prevents `DoS` attacks where a client requests `u32::MAX` chunks.
 pub const MAX_CHUNK_COUNT: u32 = 256;
 
 /// Error indicating the Merkle cache is stale and the cold path should be used.
@@ -132,7 +132,7 @@ async fn verify_cached_chunks(
     Ok(())
 }
 
-/// Stream verified chunks as BLOCK_HEADER + BLOCK_DATA frames.
+/// Stream verified chunks as `BLOCK_HEADER` + `BLOCK_DATA` frames.
 async fn send_cached_chunk_frames<S: RiftStream>(
     stream: &mut S,
     file: &mut tokio::fs::File,
@@ -1004,7 +1004,7 @@ mod tests {
         }
     }
 
-    /// After a cold READ, the database must have leaf_infos so the warm
+    /// After a cold READ, the database must have `leaf_infos` so the warm
     /// path works on the next request.  Regression for rift-5v10.
     #[tokio::test]
     async fn cold_read_populates_leaf_info_for_warm_path() {

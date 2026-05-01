@@ -103,7 +103,7 @@ mod tests {
         (dir, root)
     }
 
-    /// Helper: spin up accept_loop with an InMemoryListener and return the
+    /// Helper: spin up `accept_loop` with an InMemoryListener and return the
     /// connector so tests can open connections.
     fn start_in_memory_server(
         share: std::path::PathBuf,

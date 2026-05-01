@@ -1,9 +1,9 @@
 //! Message framing codec for type-and-length-delimited messages
 //!
-//! Wire format: varint(type_id) || varint(length) || payload
+//! Wire format: `varint(type_id)` || varint(length) || payload
 //!
 //! The type byte tells the receiver which protobuf message to decode (or that
-//! the payload is raw bytes for BLOCK_DATA frames at 0xF0+).
+//! the payload is raw bytes for `BLOCK_DATA` frames at 0xF0+).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
@@ -24,7 +24,7 @@ pub enum CodecError {
 /// Maximum message size (16 MB)
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
-/// Encode a message with varint type_id prefix and varint length prefix.
+/// Encode a message with varint `type_id` prefix and varint length prefix.
 pub fn encode_message(type_id: u8, payload: &[u8], buf: &mut BytesMut) -> Result<(), CodecError> {
     if payload.len() > MAX_MESSAGE_SIZE {
         return Err(CodecError::MessageTooLarge(payload.len()));
@@ -80,7 +80,7 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     buf.put_u8(value as u8);
 }
 
-/// Decode a varint from a mutable byte slice without a BytesMut (peek, no consume).
+/// Decode a varint from a mutable byte slice without a `BytesMut` (peek, no consume).
 fn decode_varint_peek(buf: &mut &[u8]) -> Result<Option<u64>, CodecError> {
     let mut value = 0u64;
     let mut shift = 0;
@@ -101,7 +101,7 @@ fn decode_varint_peek(buf: &mut &[u8]) -> Result<Option<u64>, CodecError> {
     Err(CodecError::InvalidVarint)
 }
 
-/// Decode a varint from a BytesMut, consuming bytes.
+/// Decode a varint from a `BytesMut`, consuming bytes.
 fn decode_varint(buf: &mut BytesMut) -> Result<Option<u64>, CodecError> {
     let mut value = 0u64;
     let mut shift = 0;

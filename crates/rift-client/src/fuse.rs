@@ -236,7 +236,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    /// Minimal no-op view used to test RiftFilesystem construction without a real FUSE mount.
+    /// Minimal no-op view used to test `RiftFilesystem` construction without a real FUSE mount.
     struct MinimalView;
 
     #[async_trait]
@@ -265,11 +265,11 @@ mod tests {
         }
     }
 
-    /// Verify that RiftFilesystem::new does not panic and accepts any ShareView.
+    /// Verify that `RiftFilesystem::new` does not panic and accepts any `ShareView`.
     ///
     /// NOTE: The fuse3 trait methods (getattr, lookup, readdir, read, opendir, etc.)
     /// require a real FUSE mount to be invoked — they are tested end-to-end in
-    /// tests/fuse_integration.rs (Linux only).
+    /// `tests/fuse_integration.rs` (Linux only).
     #[test]
     fn new_creates_filesystem() {
         let view = Arc::new(MinimalView);
@@ -398,7 +398,7 @@ mod tests {
     }
 
     /// When mtime is absent (proto field not set) the conversion must fall back
-    /// to UNIX_EPOCH rather than panicking.
+    /// to `UNIX_EPOCH` rather than panicking.
     #[test]
     fn proto_to_fuse3_attr_absent_mtime_falls_back_to_epoch() {
         let attrs = FileAttrs {

@@ -16,7 +16,7 @@ use uuid::Uuid;
 // TOFU (Trust-On-First-Use) policy
 // ---------------------------------------------------------------------------
 
-/// Client uses TofuPolicy on connect and persists known-servers.toml
+/// Client uses `TofuPolicy` on connect and persists known-servers.toml
 #[tokio::test]
 async fn client_tofu_pins_fingerprint_on_first_connect() {
     let (_dir, root) = helpers::make_share();
@@ -288,7 +288,7 @@ async fn client_cli_cert_overrides_persistent() {
 // Auto-reconnect wrapper
 // ---------------------------------------------------------------------------
 
-/// ReconnectingClient automatically reconnects on operation failure
+/// `ReconnectingClient` automatically reconnects on operation failure
 #[tokio::test]
 async fn client_auto_reconnect_on_operation_failure() {
     use rift_client::remote::RemoteShare;

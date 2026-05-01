@@ -130,7 +130,7 @@ impl<R: RemoteShare> RiftShareView<R> {
     }
 
     /// Recursively drills into the Merkle tree, verifying hashes at each level,
-    /// and returns all resolved leaf nodes sorted by chunk_index.
+    /// and returns all resolved leaf nodes sorted by `chunk_index`.
     async fn resolve_merkle_tree(
         &self,
         handle: Uuid,
@@ -815,11 +815,11 @@ mod tests {
         /// Map from hash (as Vec<u8>) to drill result. Empty Vec key = root drill.
         merkle_drill_results: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
         read_chunks_called: Mutex<u32>,
-        /// (start_chunk, chunk_count) from the most recent read_chunks call
+        /// (`start_chunk`, `chunk_count`) from the most recent `read_chunks` call
         last_read_chunks_args: Mutex<Option<(u32, u32)>>,
-        /// Number of times stat_batch was called
+        /// Number of times `stat_batch` was called
         stat_batch_called: Mutex<u32>,
-        /// Handles passed to the most recent stat_batch call
+        /// Handles passed to the most recent `stat_batch` call
         last_stat_batch_args: Mutex<Option<Vec<Uuid>>>,
     }
 
@@ -861,7 +861,7 @@ mod tests {
             self.merkle_drill_results.lock().await.insert(vec![], drill);
         }
 
-        /// Store a merkle_drill result keyed by hash. Empty Vec = root drill.
+        /// Store a `merkle_drill` result keyed by hash. Empty Vec = root drill.
         async fn set_merkle_drill_for_hash(&self, hash: Vec<u8>, result: MerkleDrillResult) {
             self.merkle_drill_results.lock().await.insert(hash, result);
         }
@@ -966,8 +966,8 @@ mod tests {
     }
 
     /// Build self-consistent mock chunks from raw data vecs.
-    /// Returns (chunk_hashes, root_hash, chunk_data_vec).
-    /// Each chunk's hash = blake3(data), root = MerkleTree::build(hashes).
+    /// Returns (`chunk_hashes`, `root_hash`, `chunk_data_vec`).
+    /// Each chunk's hash = blake3(data), root = `MerkleTree::build(hashes)`.
     #[allow(clippy::similar_names)] // chunks_data and chunk_data are intentionally similar
     fn build_mock_chunks(chunks_data: Vec<Vec<u8>>) -> (Vec<[u8; 32]>, [u8; 32], Vec<ChunkData>) {
         use rift_common::crypto::MerkleTree;
@@ -1096,8 +1096,8 @@ mod tests {
     /// When a symlink and its canonical target both resolve to the same UUID
     /// (as happens when the server returns the same handle for both), both
     /// paths must be cached and resolvable. This was the bug that caused
-    /// EIO/SIGBUS in production: BidirectionalMap silently dropped the second
-    /// insert, making the second path invisible to get_by_path.
+    /// EIO/SIGBUS in production: `BidirectionalMap` silently dropped the second
+    /// insert, making the second path invisible to `get_by_path`.
     #[tokio::test]
     async fn readdir_symlink_same_uuid_both_paths_resolvable() {
         let root = Uuid::now_v7();
@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     /// Three chunks with variable sizes [100, 200, 150].
-    /// Read offset=120, length=50 must request start_chunk=1 from the server — not chunk 0.
+    /// Read offset=120, length=50 must request `start_chunk=1` from the server — not chunk 0.
     #[tokio::test]
     async fn read_requests_correct_start_chunk_index_from_server() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -1279,7 +1279,7 @@ mod tests {
             "start_chunk should be 1 and chunk_count should be 1 for offset=120 in a [100,200,150]-sized file");
     }
 
-    /// offset >= file_size must return an empty vec, not an error (POSIX: read at/past EOF).
+    /// offset >= `file_size` must return an empty vec, not an error (POSIX: read at/past EOF).
     /// No network calls should be made — the result is trivially known from stat.
     #[tokio::test]
     async fn read_offset_beyond_eof_returns_empty() {
@@ -1315,7 +1315,7 @@ mod tests {
     }
 
     /// Read with length that would extend past EOF must be clamped to the remaining bytes.
-    /// sizes=[100, 200]. offset=250, length=999 → end=300 (file_size), 50 bytes returned.
+    /// sizes=[100, 200]. offset=250, length=999 → end=300 (`file_size`), 50 bytes returned.
     /// POSIX read(2): a short return at EOF is correct, not an error.
     #[tokio::test]
     async fn read_length_clamped_to_file_end() {
@@ -1484,7 +1484,7 @@ mod tests {
     }
 
     /// After a read, the manifest stored in cache must hold the correct byte offset
-    /// for each chunk — not chunk_index × 128 KB.
+    /// for each chunk — not `chunk_index` × 128 KB.
     ///
     /// For sizes=[100, 200, 150] the stored offsets must be [0, 100, 300].
     #[tokio::test]
@@ -1677,7 +1677,7 @@ mod tests {
     }
 
     /// Two chunks [100, 200]. offset=100 is the exact start of chunk 1.
-    /// start_offset must be 0, and only chunk 1 should be requested.
+    /// `start_offset` must be 0, and only chunk 1 should be requested.
     #[tokio::test]
     async fn read_starting_at_exact_chunk_boundary() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -1747,7 +1747,7 @@ mod tests {
 
     /// Two chunks [100, 200]. Read offset=80, length=50 spans the chunk 0/1 boundary.
     /// Expected: chunk0[80..100] ++ chunk1[0..30]  (20 bytes from chunk 0, 30 from chunk 1).
-    /// read_chunks must be called with start_chunk=0, chunk_count=2.
+    /// `read_chunks` must be called with `start_chunk=0`, `chunk_count=2`.
     #[tokio::test]
     async fn read_spanning_two_chunks_assembles_data_correctly() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -1818,8 +1818,8 @@ mod tests {
     /// Three chunks with variable sizes [100, 200, 150].
     /// Read offset=120, length=50 lands entirely inside chunk 1 (byte range 100..300).
     ///
-    /// Correct:  start_offset = 120 - 100 = 20  →  chunk1_data[20..70]
-    /// Broken:   start_offset = 120 % 131072 = 120 →  chunk1_data[120..170]  (wrong bytes)
+    /// Correct:  `start_offset` = 120 - 100 = 20  →  `chunk1_data`[20..70]
+    /// Broken:   `start_offset` = 120 % 131072 = 120 →  `chunk1_data`[120..170]  (wrong bytes)
     #[tokio::test]
     async fn read_offset_within_second_chunk_returns_correct_bytes() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -2206,7 +2206,7 @@ mod tests {
         }
     }
 
-    /// Wrong child hash -> FsError::Io
+    /// Wrong child hash -> `FsError::Io`
     #[tokio::test]
     async fn resolve_merkle_tree_wrong_child_hash_returns_io_error() {
         use rift_common::crypto::{Blake3Hash, MerkleTree};
@@ -2255,7 +2255,7 @@ mod tests {
         );
     }
 
-    /// Wrong parent hash (drill returns a different parent than root) -> FsError::Io
+    /// Wrong parent hash (drill returns a different parent than root) -> `FsError::Io`
     #[tokio::test]
     async fn resolve_merkle_tree_wrong_parent_hash_returns_io_error() {
         use rift_common::crypto::Blake3Hash;
@@ -2514,7 +2514,7 @@ mod tests {
         }
     }
 
-    /// read_chunks returning wrong data should cause FsError::Io (hash mismatch)
+    /// `read_chunks` returning wrong data should cause `FsError::Io` (hash mismatch)
     #[tokio::test]
     async fn read_rejects_wrong_chunk_data() {
         let root_uuid = Uuid::now_v7();
@@ -2575,7 +2575,7 @@ mod tests {
         );
     }
 
-    /// read_chunks returning wrong merkle_root should cause FsError::Io
+    /// `read_chunks` returning wrong `merkle_root` should cause `FsError::Io`
     #[tokio::test]
     async fn read_rejects_wrong_merkle_root() {
         let root_uuid = Uuid::now_v7();
@@ -2634,7 +2634,7 @@ mod tests {
         );
     }
 
-    /// read_chunks returning wrong chunk length should cause FsError::Io
+    /// `read_chunks` returning wrong chunk length should cause `FsError::Io`
     #[tokio::test]
     async fn read_rejects_wrong_chunk_length() {
         let root_uuid = Uuid::now_v7();
@@ -2777,7 +2777,7 @@ mod tests {
         );
     }
 
-    /// Second read in no_cache mode should also hit the server,
+    /// Second read in `no_cache` mode should also hit the server,
     /// not the cache.
     #[tokio::test]
     async fn no_cache_mode_always_fetches_from_server() {
@@ -3122,8 +3122,8 @@ mod tests {
     // Issue #1: Chunk ordering validation in read()
     // =======================================================================
 
-    /// When read_chunks returns chunks out of order (e.g., index 1 before index 0),
-    /// read() must validate indices and assemble data by chunk index, not received order.
+    /// When `read_chunks` returns chunks out of order (e.g., index 1 before index 0),
+    /// `read()` must validate indices and assemble data by chunk index, not received order.
     /// Without this fix, a buggy or malicious server could cause incorrect data assembly.
     #[tokio::test]
     async fn read_assembles_chunks_by_index_not_received_order() {
@@ -3203,7 +3203,7 @@ mod tests {
     // Issue #3: Zero-length read coverage
     // =======================================================================
 
-    /// Zero-length reads must always succeed, even when offset >= file_size.
+    /// Zero-length reads must always succeed, even when offset >= `file_size`.
     /// POSIX allows read(fd, buf, 0) to return 0 bytes at any offset.
     #[test]
     fn coverage_zero_length_returns_true() {
@@ -3412,8 +3412,8 @@ mod tests {
         assert_eq!(target, "../../foo");
     }
 
-    /// symlink targets are sourced exclusively from FileAttrs (stat_batch),
-    /// since ReaddirEntry no longer carries symlink_target.
+    /// symlink targets are sourced exclusively from `FileAttrs` (`stat_batch`),
+    /// since `ReaddirEntry` no longer carries `symlink_target`.
     #[tokio::test]
     async fn readdir_symlink_target_from_stat_attrs() {
         let root = Uuid::now_v7();
@@ -3444,7 +3444,7 @@ mod tests {
         assert_eq!(target, "/usr/bin/python3");
     }
 
-    /// lookup with a symlink should cache the target from FileAttrs,
+    /// lookup with a symlink should cache the target from `FileAttrs`,
     /// and readlink should return it.
     #[tokio::test]
     async fn lookup_symlink_caches_and_readlink_returns_target() {
@@ -3471,7 +3471,7 @@ mod tests {
     }
 
     /// readlink for a non-symlink path should return EIO because
-    /// the server stat_batch reveals it is not a symlink.
+    /// the server `stat_batch` reveals it is not a symlink.
     #[tokio::test]
     async fn readlink_non_symlink_returns_error() {
         let root = Uuid::now_v7();
@@ -3498,7 +3498,7 @@ mod tests {
         );
     }
 
-    /// readlink for a path that was never seen should return NotFound.
+    /// readlink for a path that was never seen should return `NotFound`.
     #[tokio::test]
     async fn readlink_unknown_path_returns_not_found() {
         let root = Uuid::now_v7();
@@ -3513,7 +3513,7 @@ mod tests {
     // Issue 4: getattr should cache symlink_target so readlink works after getattr
     // =======================================================================
 
-    /// The POSIX sequence lstat() -> readlink() must work. In FUSE terms,
+    /// The POSIX sequence `lstat()` -> `readlink()` must work. In FUSE terms,
     /// `getattr` is called first, then `readlink`. Currently `getattr` does
     /// not cache `symlink_target`, so `readlink` returns `NotFound`.
     #[tokio::test]
@@ -3556,9 +3556,9 @@ mod tests {
     // Bug fix: readdir symlink attrs must come from stat_batch, not defaults
     // =======================================================================
 
-    /// When readdir processes a symlink, the DirEntry attrs should reflect
-    /// the real metadata from stat_batch (uid, gid, mode, mtime), NOT the
-    /// Default::default() values (uid=0, gid=0, mode=0o777, mtime=None).
+    /// When readdir processes a symlink, the `DirEntry` attrs should reflect
+    /// the real metadata from `stat_batch` (uid, gid, mode, mtime), NOT the
+    /// `Default::default()` values (uid=0, gid=0, mode=0o777, mtime=None).
     #[tokio::test]
     async fn readdir_symlink_attrs_are_not_default() {
         let root = Uuid::now_v7();
@@ -3629,9 +3629,9 @@ mod tests {
     // readdir always calls stat_batch (including for symlinks)
     // =======================================================================
 
-    /// When all entries in a directory are symlinks with symlink_target set,
-    /// stat_batch should still be called — symlink attrs must come from
-    /// stat_batch to get accurate uid/gid/mtime.
+    /// When all entries in a directory are symlinks with `symlink_target` set,
+    /// `stat_batch` should still be called — symlink attrs must come from
+    /// `stat_batch` to get accurate uid/gid/mtime.
     #[tokio::test]
     async fn readdir_all_symlinks_calls_stat_batch() {
         let root = Uuid::now_v7();
@@ -4139,7 +4139,7 @@ mod tests {
     }
 
     /// When the manifest references chunks that were never fetched, a cached
-    /// read must report MissingChunks — never CorruptedChunks.
+    /// read must report `MissingChunks` — never `CorruptedChunks`.
     #[tokio::test]
     async fn missing_chunks_reported_as_missing_not_corrupted() {
         let chunk0_data = vec![0xAAu8; 100];

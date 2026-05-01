@@ -13,7 +13,7 @@ use tokio_rusqlite::Result as SqliteResult;
 /// Check if an error is `QueryReturnedNoRows`.
 ///
 /// This helper avoids fragile string matching and uses proper
-/// enum variant matching for the tokio_rusqlite error wrapper.
+/// enum variant matching for the `tokio_rusqlite` error wrapper.
 fn is_no_rows(e: &tokio_rusqlite::Error) -> bool {
     matches!(
         e,
@@ -113,7 +113,7 @@ impl Database {
     /// will silently miss on systems where temp directories involve symlinks
     /// (e.g. macOS `/var` → `/private/var`).
     ///
-    /// Takes explicit mtime_ns and file_size rather than reading from the
+    /// Takes explicit `mtime_ns` and `file_size` rather than reading from the
     /// filesystem, so callers can pass verified/cached values.
     pub async fn put_merkle(
         &self,

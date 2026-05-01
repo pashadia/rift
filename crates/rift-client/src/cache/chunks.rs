@@ -1,7 +1,7 @@
 //! File-based chunk storage module.
 //!
 //! Stores chunk data (binary blobs addressed by BLAKE3 hash) as individual files
-//! on disk with directory sharding, replacing the previous SQLite BLOB storage.
+//! on disk with directory sharding, replacing the previous `SQLite` BLOB storage.
 
 use std::io;
 use std::path::{Path, PathBuf};

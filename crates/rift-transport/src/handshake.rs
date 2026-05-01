@@ -129,9 +129,9 @@ mod tests {
     // recv_hello edge cases
     // ---------------------------------------------------------------------------
 
-    /// Sending a RIFT_HELLO frame with an empty payload decodes as a RiftHello
+    /// Sending a `RIFT_HELLO` frame with an empty payload decodes as a `RiftHello`
     /// with all-default fields (prost treats empty bytes as valid protobuf).
-    /// recv_hello should therefore succeed and return a default RiftHello.
+    /// `recv_hello` should therefore succeed and return a default `RiftHello`.
     #[tokio::test]
     async fn recv_hello_with_empty_payload_returns_default_hello() {
         let (client, server) = InMemoryConnection::pair();
@@ -156,8 +156,8 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    /// Sending a RIFT_HELLO frame with garbage bytes that are not valid protobuf
-    /// should cause recv_hello to return an Err (prost decode failure).
+    /// Sending a `RIFT_HELLO` frame with garbage bytes that are not valid protobuf
+    /// should cause `recv_hello` to return an Err (prost decode failure).
     #[tokio::test]
     async fn recv_hello_with_garbage_payload_returns_error() {
         let (client, server) = InMemoryConnection::pair();
@@ -188,7 +188,7 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    /// Sending a well-formed RiftHello should be decoded correctly by recv_hello.
+    /// Sending a well-formed `RiftHello` should be decoded correctly by `recv_hello`.
     #[tokio::test]
 
     async fn recv_hello_with_valid_hello_returns_correct_fields() {

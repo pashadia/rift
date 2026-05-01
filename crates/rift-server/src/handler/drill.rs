@@ -284,8 +284,8 @@ mod tests {
     use rift_transport::connection::InMemoryConnection;
     use rift_transport::RiftConnection;
 
-    /// SECURITY: Verifies that the MerkleDrill handler rejects handles pointing
-    /// outside the share, testing the resolve() path traversal guard.
+    /// SECURITY: Verifies that the `MerkleDrill` handler rejects handles pointing
+    /// outside the share, testing the `resolve()` path traversal guard.
     #[tokio::test]
     async fn drill_rejects_path_traversal() {
         let share = tempfile::tempdir().unwrap();
