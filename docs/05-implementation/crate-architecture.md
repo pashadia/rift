@@ -1,26 +1,25 @@
 # Rift Crate Architecture
 
-**Status:** PoC implementation architecture (v0.1)
+**Status:** Current implementation architecture (v0.1)
 
-**Last updated:** 2025-03-19
+**Last updated:** 2026-05-01
 
 ---
 
 ## Overview
 
-Rift uses a modular workspace architecture with 9 crates organized into 4 layers:
+Rift uses a modular workspace architecture with **5 crates** organized into 3 layers:
 
-1. **Binary layer** (applications)
-2. **High-level library layer** (reusable business logic, including FUSE)
-3. **Protocol/transport layer** (wire protocol, network)
-4. **Foundation layer** (crypto, utilities)
+1. **Binary layer** — each library crate contains its own `main.rs` binary
+2. **Protocol/transport layer** — wire protocol, network
+3. **Foundation layer** — crypto, shared types, utilities
 
 **Design principles:**
-- Dependencies flow from top (application) to bottom (foundation)
+- Dependencies flow from top to bottom
 - No circular dependencies
 - Each crate has a single, well-defined purpose
 - Libraries use `thiserror`, binaries use `anyhow`
-- Minimal public APIs (expose only what's needed)
+- Minimal public APIs
 
 ---
 
@@ -28,441 +27,232 @@ Rift uses a modular workspace architecture with 9 crates organized into 4 layers
 
 ```
 rift/
-├── Cargo.toml              # Workspace root
-
-# Binary crates (anyhow for errors)
-├── riftd/                  # Server daemon
-├── rift/                   # Client CLI
-
-# High-level library crates (thiserror for errors)
-├── rift-client/            # High-level client API + FUSE (optional "fuse" feature, Linux only)
-├── rift-server/            # Server business logic
-
-# Protocol layer (thiserror)
-├── rift-protocol/          # Protobuf message definitions
-├── rift-wire/              # Message framing, stream handling
-
-# Transport layer (thiserror)
-├── rift-transport/         # QUIC/TLS abstraction
-
-# Foundation layer (thiserror)
-├── rift-crypto/            # BLAKE3, CDC, Merkle trees
-├── rift-common/            # Shared types, config, utilities
+├── Cargo.toml              # Workspace root (5 members)
+├── crates/
+│   ├── rift-common/        # Shared types, crypto, config, utilities
+│   ├── rift-protocol/      # Protobuf messages + varint framing codec
+│   ├── rift-transport/     # QUIC/TLS abstraction (quinn, rustls)
+│   ├── rift-server/        # Server binary + library
+│   └── rift-client/        # Client binary + library (FUSE, caching)
 ```
 
-**Total:** 9 crates (2 binaries, 7 libraries)
-
-> **Note:** FUSE was previously a separate `rift-fuse` crate. It has been integrated into `rift-client` as an optional feature (`fuse`, on by default) that is only compiled on Linux. This simplifies the dependency graph and removes an unnecessary layer of indirection.
+**Total:** 5 crates (2 binaries via lib+main, 3 pure libraries)
 
 ---
 
 ## Dependency Graph
 
 ```
-                    ┌─────────┐
-                    │  riftd  │ (binary)
-                    └────┬────┘
-                         │
-                    ┌────▼────────┐
-                    │ rift-server │
-                    └────┬────────┘
-                         │
-        ┌────────────────┼────────────────┐
-        │                │                │
-   ┌────▼─────┐    ┌────▼────┐    ┌─────▼──────┐
-   │rift-wire│    │rift-    │    │rift-crypto│
-   │          │    │transport│    │            │
-   └────┬─────┘    └─────────┘    └────────────┘
-        │
-   ┌────▼────────┐
-   │rift-protocol│
-   └─────────────┘
+                    ┌─────────────┐
+                    │  rift-server│ (binary in main.rs)
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+         ┌────▼───┐  ┌────▼───┐  ┌────▼──────┐
+         │ rift-  │  │ rift-  │  │ rift-     │
+         │protocol│  │transport│  │ common    │
+         └────────┘  └────────┘  └───────────┘
 
-
-                    ┌──────┐
-                    │ rift │ (binary)
-                    └───┬──┘
-                        │
-                   ┌────▼──────┐
-                   │rift-client│ (includes FUSE module when fuse feature enabled)
-                   └────┬──────┘
-                        │
-        ┌───────────────┼───────────────┐
-        │               │               │
-   ┌────▼─────┐  ┌─────▼───┐  ┌───────▼────┐
-   │rift-wire│  │rift-    │  │rift-crypto│
-   │          │  │transport│  │            │
-   └────┬─────┘  └─────────┘  └────────────┘
-        │
-   ┌────▼────────┐
-   │rift-protocol│
-   └─────────────┘
-
+                    ┌─────────────┐
+                    │  rift-client│ (binary in main.rs)
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+         ┌────▼───┐  ┌────▼───┐  ┌────▼──────┐
+         │ rift-  │  │ rift-  │  │ rift-     │
+         │protocol│  │transport│  │ common    │
+         └────────┘  └────────┘  └───────────┘
 
             ┌─────────────┐
-            │ rift-common │ (used by all)
+            │ rift-common │ (foundation — used by all)
             └─────────────┘
 ```
 
-**Dependency flow:** Application → High-level → Protocol/Transport → Foundation
-
+**Dependency flow:** Application → Protocol/Transport → Foundation
 **No circular dependencies:** All dependencies are strictly top-down.
 
 ---
 
 ## Crate Specifications
 
-### Binary Crates
+### Binary / Library Hybrid Crates
 
-#### `riftd/` - Server Daemon
+Both `rift-server` and `rift-client` define both a library (`lib.rs`) and a binary (`main.rs`) in the same crate. This keeps the crate count small while still exposing a library API for testing and future embedding.
 
-**Purpose:** Server daemon entry point.
+#### `rift-server/` — Server
+
+**Purpose:** Server daemon + library.
 
 **Responsibilities:**
 - CLI argument parsing (`clap`)
-- Configuration loading (`/etc/rift/config.toml`)
-- Daemon lifecycle (signals, systemd integration)
-- Logging setup (`tracing-subscriber`)
-- Thin wrapper around `rift-server`
+- Configuration loading (TOML)
+- Accept QUIC connections with client certificate authentication
+- Filesystem operation handlers: stat, lookup, readdir, read, merkle drill
+- Symlink support with TOCTOU-hardened path resolution (fd-based re-canonicalization)
+- In-memory handle database with xattr persistence (HMAC-signed UUID v7 handles)
+- SQLite-backed metadata storage: Merkle tree cache, chunk manifests
+- Certificate generation and loading (DER + PEM support)
 
 **Dependencies:**
 ```toml
 [dependencies]
-rift-server.workspace = true
-rift-common.workspace = true
 tokio.workspace = true
-clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+prost.workspace = true
+tokio-rusqlite = "0.7"
+uuid.workspace = true
+scc.workspace = true
+xattr.workspace = true
+walkdir = "2"
+futures = "0.3"
+rift-common = { path = "../rift-common" }
+rift-protocol = { path = "../rift-protocol" }
+rift-transport = { path = "../rift-transport" }
 ```
 
-**Error handling:** `anyhow` (context chaining)
+**Error handling:** `anyhow` (binary), `thiserror` (library)
 
-**Binary output:** `riftd` (server daemon)
+**Binary output:** `rift-server`
 
-**Example code:**
-```rust
-// riftd/src/main.rs
-use anyhow::{Context, Result};
-use rift_server::Server;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Parse CLI args
-    let args = cli::parse_args();
-
-    // Load config
-    let config = rift_common::config::load_server_config(&args.config)
-        .context("Failed to load server configuration")?;
-
-    // Setup logging
-    setup_logging(&config.log_level)?;
-
-    // Start server
-    let server = Server::new(config)
-        .context("Failed to initialize server")?;
-
-    server.run().await
-        .context("Server error")?;
-
-    Ok(())
-}
+**Module structure:**
+```
+crates/rift-server/src/
+├── main.rs              # Binary entry point
+├── lib.rs               # Library API
+├── server.rs            # Connection accept loop
+├── handle.rs            # HandleDatabase (UUID ↔ Path, xattr persistence)
+├── config.rs            # Server configuration parsing
+├── cert.rs              # TLS certificate generation and loading
+├── handler/             # Per-operation request handlers
+│   ├── mod.rs           # resolve(), error helpers, ResolvedPath
+│   ├── stat.rs          # STAT handler
+│   ├── lookup.rs        # LOOKUP handler
+│   ├── readdir.rs       # READDIR handler
+│   ├── read.rs          # READ handler (chunked transfer)
+│   ├── drill.rs         # MERKLE_DRILL handler
+│   ├── attrs.rs         # FileAttrs construction from metadata
+│   ├── merkle_cache.rs  # Merkle tree cache logic + sentinel hashes
+│   └── merkle_cache_trait.rs  # MerkleCache trait definition
+└── metadata/            # SQLite-backed persistent storage
+    ├── mod.rs
+    ├── db.rs            # Database connection and schema
+    └── merkle.rs        # Merkle tree storage queries (get/put)
 ```
 
 ---
 
-#### `rift/` - Client CLI
+#### `rift-client/` — Client
 
-**Purpose:** Client CLI entry point.
+**Purpose:** Client binary + library (includes FUSE module, caching, connection management, reconnection).
 
 **Responsibilities:**
-- All CLI subcommands (`mount`, `whoami`, `show-mounts`, `allow`, etc.)
-- Interactive prompts (TOFU confirmation, etc.)
-- Output formatting (table, JSON)
-- Certificate management commands
-- Thin wrapper around `rift-client` (which includes the FUSE module)
+- CLI subcommands (`mount`)
+- QUIC connection to server (using `rift-transport`)
+- Path-based share view with UUID handle caching (`HandleMap` + `HandleCache`)
+- FUSE filesystem (Linux, `fuse` feature, enabled by default)
+- Client-side chunk cache (SQLite-backed, in `src/cache/`)
+- Reconnection handling with automatic retry (`ReconnectingRemote`)
+- Symlink target caching for efficient `readlink`
+- Known servers trust-on-first-use store
 
 **Dependencies:**
 ```toml
 [dependencies]
-rift-client.workspace = true
 rift-common.workspace = true
-tokio.workspace = true
-clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-anyhow.workspace = true
-```
-
-**Error handling:** `anyhow` (user-friendly messages)
-
-**Binary output:** `rift` (client CLI)
-
-**Example code:**
-```rust
-// rift/src/main.rs
-use anyhow::{Context, Result};
-use rift_client::RiftClient;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = cli::parse_args();
-
-    match args.command {
-        Command::Pair { server } => {
-            commands::pair(&server).await?;
-        }
-        Command::ShowMounts { server } => {
-            let client = RiftClient::connect(&server).await?;
-            let shares = client.list_shares().await?;
-            print_shares(&shares);
-        }
-        Command::Mount { share, mountpoint } => {
-            commands::mount(&share, &mountpoint).await?;
-        }
-        // ... other commands
-    }
-
-    Ok(())
-}
-```
-
----
-
-### High-Level Library Crates
-
-#### `rift-client/` - High-Level Client API + FUSE
-
-**Purpose:** Provides ergonomic client operations for the CLI, and (on Linux) the FUSE filesystem implementation.
-
-**Responsibilities:**
-- Connect to server (using `rift-transport`)
-- High-level operations:
-  - `list_shares()` → `Vec<ShareInfo>`
-  - `get_file_metadata(path)` → `FileMetadata`
-  - `read_file(path)` → `Stream<Bytes>`
-  - `write_file(path, data)` → `Result<()>`
-  - `list_directory(path)` → `Vec<DirEntry>`
-- Handle retries, timeouts
-- Manage connection pool
-- Session state management
-- **FUSE mount** (when `fuse` feature is enabled, Linux only): translate FUSE ops to client calls, manage the `fuse3` session
-
-**Dependencies:**
-```toml
-[dependencies]
-rift-wire.workspace = true
-rift-transport.workspace = true
 rift-protocol.workspace = true
-rift-crypto.workspace = true
-rift-common.workspace = true
+rift-transport.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
+prost.workspace = true
+uuid.workspace = true
+scc.workspace = true
+bytes.workspace = true
+futures.workspace = true
+# FUSE (Linux, optional)
 fuse3 = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-libc = { version = "0.2", optional = true }
-
-[features]
-default = ["fuse"]
-fuse = ["dep:fuse3", "dep:futures", "dep:libc"]
 ```
 
-**Error handling:** `thiserror` with `ClientError` enum
+**Error handling:** `anyhow` (binary), `thiserror` with `FsError` (library)
 
-**Public API:**
-```rust
-pub struct RiftClient { /* ... */ }
+**Binary output:** `rift-client`
 
-impl RiftClient {
-    pub async fn connect(server: &str) -> Result<Self, ClientError>;
-    pub async fn list_shares(&self) -> Result<Vec<ShareInfo>, ClientError>;
-    pub async fn whoami(&self) -> Result<WhoamiInfo, ClientError>;
-    pub async fn stat(&self, share: &str, path: &Path) -> Result<FileMetadata, ClientError>;
-    pub async fn read_file(&self, share: &str, path: &Path) -> Result<Vec<u8>, ClientError>;
-    pub async fn write_file(&self, share: &str, path: &Path, data: &[u8]) -> Result<(), ClientError>;
-    pub async fn list_dir(&self, share: &str, path: &Path) -> Result<Vec<DirEntry>, ClientError>;
-    // ... more operations
-}
-
-// Linux only, requires "fuse" feature
-pub mod fuse {
-    pub struct RiftFilesystem<F: RemoteShare> { /* ... */ }
-    pub trait RemoteShare { /* async stat, lookup, readdir, readdirplus */ }
-}
+**Module structure:**
 ```
-
-**Why combined:** The FUSE layer is tightly coupled to the client operations. Keeping it as a feature of `rift-client` avoids an unnecessary adapter crate and lets the client implement the `RemoteShare` trait directly. Future GUI clients can still use `rift-client` directly.
+crates/rift-client/src/
+├── main.rs              # Binary entry point
+├── lib.rs               # Library API
+├── client.rs            # RiftClient: connect, stat, read, merkle drill
+├── view.rs              # RiftShareView: path-based operations over handles
+├── remote.rs            # RemoteShare trait + MerkleDrillResult
+├── fuse.rs              # FUSE filesystem (Linux, fuse feature)
+├── handle.rs            # HandleCache + HandleMap (path↔UUID, symlink targets)
+├── reconnect.rs         # ReconnectingRemote: auto-reconnect wrapper
+├── known_servers.rs     # Known servers trust-on-first-use store
+├── paths.rs             # Path utilities (path_to_relative)
+└── cache/               # Client-side chunk cache
+    ├── mod.rs
+    ├── db.rs            # SQLite cache database
+    └── chunks.rs        # Chunk read/write operations
+```
 
 ---
 
-#### `rift-server/` - Server Business Logic
+### Library-Only Crates
 
-**Purpose:** Core server functionality, decoupled from daemon lifecycle.
+#### `rift-protocol/` — Protocol + Codec
 
-**Responsibilities:**
-- Accept client connections
-- Authorization (check fingerprints against permissions)
-- Serve files from shares
-- Handle all protocol operations (STAT, READ, WRITE, etc.)
-- Share management
-- Connection logging
-- Permission checking
-
-**Dependencies:**
-```toml
-[dependencies]
-rift-wire.workspace = true
-rift-transport.workspace = true
-rift-protocol.workspace = true
-rift-crypto.workspace = true
-rift-common.workspace = true
-tokio.workspace = true
-quinn.workspace = true
-thiserror.workspace = true
-```
-
-**Error handling:** `thiserror` with `ServerError` enum
-
-**Public API:**
-```rust
-pub struct Server { /* ... */ }
-
-impl Server {
-    pub fn new(config: ServerConfig) -> Result<Self, ServerError>;
-    pub async fn run(&self) -> Result<(), ServerError>;
-    pub async fn shutdown(&self) -> Result<(), ServerError>;
-}
-```
-
-**Why separate:** Enables embedding the server in other applications (e.g., testing, desktop app with embedded server). Keeps `riftd` binary minimal.
-
----
-
-### Protocol Layer
-
-#### `rift-protocol/` - Protobuf Message Definitions
-
-**Purpose:** Pure protocol data structures.
+**Purpose:** Protobuf message definitions and varint-length-delimited framing codec.
 
 **Responsibilities:**
-- Protobuf message types (generated by `prost-build`)
-- Message type constants (IDs)
-- Protobuf schema (`proto/rift.proto`)
-- Basic serialization/deserialization
+- Generated Rust types from `.proto` files (via `prost-build`)
+- Message type ID constants
+- Varint framing codec (`encode_message`, `decode_message`)
+- Maximum message size enforcement (16 MB)
 
 **Dependencies:**
 ```toml
 [dependencies]
 prost.workspace = true
-serde.workspace = true
+bytes.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
 ```
 
-**Error handling:** `thiserror` with `ProtocolError` enum
-
-**Directory structure:**
+**Module structure:**
 ```
-rift-protocol/
+crates/rift-protocol/
 ├── Cargo.toml
 ├── build.rs                # prost-build code generation
-├── proto/
-│   └── rift.proto         # Protocol definition
+├── proto/                  # Protobuf schema files
+│   ├── common.proto        # Shared types (FileAttrs, ErrorDetail, etc.)
+│   ├── handshake.proto     # RiftHello, RiftWelcome
+│   ├── operations.proto    # Filesystem operations
+│   └── transfer.proto      # Transfer + Merkle messages
 └── src/
-    ├── lib.rs             # Re-exports generated types
-    ├── message_types.rs   # Message type ID constants
-    └── error.rs           # ProtocolError definition
+    ├── lib.rs              # Re-exports generated types + codec
+    ├── codec.rs            # Varint message framing
+    └── messages.rs         # Type ID constants + tests
 ```
-
-**Message type constants:**
-```rust
-// rift-protocol/src/message_types.rs
-pub const MSG_RIFT_HELLO: u32 = 1;
-pub const MSG_RIFT_WELCOME: u32 = 2;
-pub const MSG_DISCOVER_REQUEST: u32 = 10;
-pub const MSG_DISCOVER_RESPONSE: u32 = 11;
-pub const MSG_WHOAMI_REQUEST: u32 = 12;
-pub const MSG_WHOAMI_RESPONSE: u32 = 13;
-pub const MSG_STAT_REQUEST: u32 = 100;
-pub const MSG_STAT_RESPONSE: u32 = 101;
-// ... more
-```
-
-**Why separate:** Protocol definitions are stable and rarely change. Other implementations (Go, Python) could use the `.proto` files. Minimal dependencies keep compilation fast.
 
 ---
 
-#### `rift-wire/` - Message Framing and Stream Handling
-
-**Purpose:** Wire format encoding/decoding.
-
-**Responsibilities:**
-- Varint message framing
-- Message type ID mapping
-- Request/response correlation
-- Stream multiplexing helpers
-- Send/receive messages over QUIC streams
-
-**Dependencies:**
-```toml
-[dependencies]
-rift-protocol.workspace = true
-quinn.workspace = true
-tokio.workspace = true
-prost.workspace = true
-thiserror.workspace = true
-```
-
-**Error handling:** `thiserror` with `WireError` enum
-
-**Public API:**
-```rust
-pub async fn send_message<T: prost::Message>(
-    stream: &mut SendStream,
-    msg_type: u32,
-    message: &T,
-) -> Result<(), WireError>;
-
-pub async fn recv_message(
-    stream: &mut RecvStream,
-) -> Result<(u32, Vec<u8>), WireError>;
-
-pub async fn send_request<Req, Resp>(
-    connection: &Connection,
-    msg_type: u32,
-    request: &Req,
-) -> Result<Resp, WireError>
-where
-    Req: prost::Message,
-    Resp: prost::Message + Default;
-```
-
-**Why separate from protocol:**
-- Protocol is pure data structures (no I/O)
-- Wire format could change (compression, encryption) without changing protocol
-- Clear separation of concerns: data vs encoding
-
----
-
-### Transport Layer
-
-#### `rift-transport/` - QUIC/TLS Abstraction
+#### `rift-transport/` — QUIC/TLS Abstraction
 
 **Purpose:** Wrapper around `quinn` with Rift-specific TLS configuration.
 
 **Responsibilities:**
-- Custom certificate verifiers (`AcceptAnyCertVerifier`, `TofuVerifier`)
-- QUIC connection establishment
-- 0-RTT session resumption
-- Connection migration handling
-- TLS configuration (mutual TLS, custom verifiers)
-- Certificate fingerprint extraction
+- QUIC connection establishment (client + server)
+- Custom certificate verifiers (AcceptAnyCertVerifier, TofuVerifier)
+- TLS 1.3 configuration (mutual TLS, rustls)
+- Certificate fingerprint extraction (SHA-256 / BLAKE3)
+- Stream creation and management
+- In-memory stream for testing
 
 **Dependencies:**
 ```toml
@@ -473,978 +263,104 @@ tokio.workspace = true
 thiserror.workspace = true
 ```
 
-**Error handling:** `thiserror` with `TransportError` enum
-
-**Directory structure:**
+**Module structure:**
 ```
-rift-transport/
-├── Cargo.toml
-└── src/
-    ├── lib.rs              # Public API, re-exports
-    ├── connection.rs       # Connection management
-    ├── verifier.rs         # AcceptAnyCertVerifier, TofuVerifier
-    ├── config.rs           # TLS configuration helpers
-    ├── error.rs            # TransportError definition
-    └── fingerprint.rs      # Certificate fingerprint extraction
+crates/rift-transport/src/
+├── lib.rs              # Public API, re-exports
+├── connection.rs       # Connection management
+├── listener.rs         # Server-side connection acceptance
+├── tls.rs              # TLS configuration helpers
+├── quic.rs             # QUIC-specific helpers
+├── handshake.rs        # Handshake helpers
+├── policy.rs           # Connection policy (rate limiting, etc.)
+├── fingerprint.rs      # Certificate fingerprint extraction
+└── error.rs            # TransportError definition
 ```
-
-**Public API:**
-```rust
-pub struct RiftConnection { /* ... */ }
-
-impl RiftConnection {
-    pub async fn connect(server: &str, config: TlsConfig) -> Result<Self, TransportError>;
-    pub fn open_bi(&self) -> Result<(SendStream, RecvStream), TransportError>;
-    pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), TransportError>;
-    pub fn client_fingerprint(&self) -> String;  // For server-side
-}
-
-pub struct TlsConfig { /* ... */ }
-
-impl TlsConfig {
-    pub fn client_config(cert_path: &Path, key_path: &Path) -> Result<Self, TransportError>;
-    pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Self, TransportError>;
-    pub fn with_tofu_verifier(self, trusted_servers_path: &Path) -> Self;
-}
-
-pub fn compute_fingerprint(cert_der: &[u8]) -> String;
-```
-
-**Custom verifier example:**
-```rust
-// rift-transport/src/verifier.rs
-use rustls::server::danger::{ClientCertVerifier, ClientCertVerified};
-
-pub struct AcceptAnyCertVerifier;
-
-impl ClientCertVerifier for AcceptAnyCertVerifier {
-    fn verify_client_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer,
-        intermediates: &[rustls::pki_types::CertificateDer],
-        now: rustls::pki_types::UnixTime,
-    ) -> Result<ClientCertVerified, rustls::Error> {
-        // Accept any certificate
-        // Application layer will check authorization
-        Ok(ClientCertVerified::assertion())
-    }
-
-    // ... other required methods
-}
-```
-
-**Why separate:**
-- Transport logic is independent of protocol
-- Could be reused for other QUIC-based tools
-- Isolates `quinn` API changes (easier to migrate to `quiche` later)
 
 ---
 
-### Foundation Layer
+#### `rift-common/` — Shared Foundation
 
-#### `rift-crypto/` - Cryptographic Operations
-
-**Purpose:** All cryptographic primitives.
+**Purpose:** Shared types, crypto, configuration, and utilities used by all other crates.
 
 **Responsibilities:**
-- BLAKE3 hashing (wrapper around `blake3` crate)
-- Content-defined chunking (wrapper around `fastcdc`)
-- Merkle tree construction and verification
-- Fingerprint computation (BLAKE3 of certs)
+- BLAKE3 hashing (Blake3Hash newtype)
+- Content-defined chunking (FastCDC wrapper)
+- Merkle tree construction (64-ary, hash-based)
+- `MerkleChild` enum and `LeafInfo` struct for hash-based tree storage
+- HandleMap (BidirectionalMap with `scc::HashIndex`)
+- Configuration parsing (server + client config TOML)
+- Shared types (FileType, etc.)
+- Test utilities (temp directories, test certs)
 
 **Dependencies:**
 ```toml
 [dependencies]
 blake3.workspace = true
 fastcdc.workspace = true
-thiserror.workspace = true
-```
-
-**Error handling:** `thiserror` with `CryptoError` enum
-
-**Directory structure:**
-```
-rift-crypto/
-├── Cargo.toml
-└── src/
-    ├── lib.rs         # Public API, re-exports
-    ├── hash.rs        # BLAKE3 wrapper
-    ├── cdc.rs         # Content-defined chunking
-    ├── merkle.rs      # Merkle tree operations
-    └── error.rs       # CryptoError definition
-```
-
-**Public API:**
-```rust
-// BLAKE3 hashing
-pub fn hash_bytes(data: &[u8]) -> [u8; 32];
-pub fn hash_stream<R: Read>(reader: R) -> Result<[u8; 32], CryptoError>;
-
-// Content-defined chunking
-pub struct ChunkIterator<R> { /* ... */ }
-pub fn chunk_stream<R: Read>(reader: R, avg_size: u32) -> ChunkIterator<R>;
-
-// Merkle trees
-pub struct MerkleTree { /* ... */ }
-impl MerkleTree {
-    pub fn from_leaves(leaves: Vec<[u8; 32]>) -> Self;
-    pub fn root(&self) -> [u8; 32];
-    pub fn get_level(&self, level: usize) -> &[[u8; 32]];
-}
-```
-
-**Why separate:**
-- Crypto operations are pure functions (easy to test)
-- Used by both client and server
-- Could be used by other tools (backup tools, etc.)
-- Minimal dependencies (fast compilation)
-
----
-
-#### `rift-common/` - Shared Utilities
-
-**Purpose:** Truly shared code that doesn't fit elsewhere.
-
-**Responsibilities:**
-- Configuration parsing (`config.toml`, `trusted-servers.toml`, permission files)
-- Shared type definitions (`ShareInfo`, `Permissions`, etc.)
-- Utility functions (path handling, time formatting)
-- Test utilities (under `#[cfg(test)]`)
-
-**Dependencies:**
-```toml
-[dependencies]
 serde.workspace = true
-toml.workspace = true
+scc.workspace = true
+uuid.workspace = true
 thiserror.workspace = true
 ```
 
-**Error handling:** `thiserror` with `CommonError` enum
-
-**Directory structure:**
+**Module structure:**
 ```
-rift-common/
-├── Cargo.toml
-└── src/
-    ├── lib.rs             # Re-exports
-    ├── config.rs          # Config file parsing
-    ├── types.rs           # Shared types (ShareInfo, Permissions, etc.)
-    ├── permissions.rs     # Permission file parsing
-    ├── utils.rs           # Misc utilities
-    └── error.rs           # CommonError definition
+crates/rift-common/src/
+├── lib.rs             # Re-exports
+├── crypto.rs          # Blake3Hash, MerkleTree, FastCDC, MerkleChild, LeafInfo
+├── config.rs          # Config file parsing
+├── types.rs           # Shared types
+├── error.rs           # CommonError definition
+├── handle_map.rs      # BidirectionalMap (HashIndex-based, server)
+└── test_utils.rs      # Test helpers (cfg(test))
 ```
-
-**Public API:**
-```rust
-// Configuration
-pub struct ServerConfig { /* ... */ }
-pub struct ClientConfig { /* ... */ }
-
-pub fn load_server_config(path: &Path) -> Result<ServerConfig, CommonError>;
-pub fn load_client_config(path: &Path) -> Result<ClientConfig, CommonError>;
-
-// Shared types
-pub struct ShareInfo {
-    pub name: String,
-    pub description: String,
-    pub permissions: Permissions,
-    pub is_public: bool,
-}
-
-pub enum Permissions {
-    ReadOnly,
-    ReadWrite,
-}
-
-// Permission file parsing
-pub fn load_permission_file(share: &str) -> Result<Vec<String>, CommonError>;  // Vec of fingerprints
-pub fn add_permission(share: &str, fingerprint: &str, perms: Permissions) -> Result<(), CommonError>;
-```
-
-**Warning:** This is a potential dumping ground. **Rule:** Only add code that's used by **2+ crates** and doesn't fit in a more specific crate.
-
-**Refactoring trigger:** If this crate grows beyond 2000 LOC, split into `rift-config` and `rift-types`.
 
 ---
 
-## Pairing and Authorization Logic
+### Removed Crate Consolidations
 
-**Cross-cutting concern:** Pairing and authorization logic spans multiple crates. Here's where each piece lives:
+**What changed from the original 9-crate design:**
 
-### Client-Side Pairing
+| Planned crate | Status | Why |
+|---|---|---|
+| `riftd` (server bin) | ❌ Merged into `rift-server` | Single crate for server binary + library |
+| `rift` (client bin) | ❌ Merged into `rift-client` | Single crate for client binary + library |
+| `rift-wire` | ❌ Merged into `rift-protocol` | Wire framing is part of protocol; `codec.rs` lives there |
+| `rift-crypto` | ❌ Merged into `rift-common` | Crypto types (Blake3Hash, MerkleTree, CDC) are part of common utilities |
+| `rift-fuse` | ❌ Merged into `rift-client` | FUSE is an optional feature of `rift-client` |
 
-**`rift-transport/`** - Certificate Verification
-- Custom TLS verifiers (`AcceptAnyCertVerifier`, `TofuVerifier`)
-- TOFU (Trust-On-First-Use) implementation for self-signed server certs
-- Fingerprint extraction and comparison
-- Trusted server storage (`~/.config/rift/trusted-servers.toml`)
-
-**`rift-client/`** - Pairing Workflow
-- `pair(server)` function - Establishes connection, verifies server cert
-- Interactive TOFU prompts (if server cert is self-signed)
-- Sends `WHOAMI_REQUEST` to query identity
-- Sends `DISCOVER_REQUEST` to list available shares
-- Connection management (initial pairing + subsequent connections)
-
-**`rift/`** (CLI binary) - User Commands
-- `rift pair <server>` - User-facing pairing command
-- `rift whoami <server>` - Debug identity and authorization
-- `rift show-mounts <server>` - List accessible shares
-- Interactive prompts for TOFU confirmation
-
-**Flow:**
-```
-User: rift pair server.example.com
-  ↓
-rift CLI → rift-client.pair()
-  ↓
-rift-client → rift-transport.connect()
-  ↓
-rift-transport → TofuVerifier (if self-signed)
-  ↓ (user confirms fingerprint)
-rift-transport → establishes QUIC connection
-  ↓
-rift-client → sends WHOAMI_REQUEST
-  ↓
-server responds with client fingerprint + authorization status
-  ↓
-rift CLI → displays fingerprint for admin to grant access
-```
-
-### Server-Side Authorization
-
-**`rift-transport/`** - Certificate Acceptance
-- `AcceptAnyCertVerifier` - Accepts all client certificates at TLS layer
-- Fingerprint extraction from client cert
-- Application-layer authorization happens later
-
-**`rift-server/`** - Authorization Checks
-- Extract client fingerprint from QUIC connection
-- For each request:
-  1. Check if share is public → grant access with public permissions
-  2. Check if fingerprint is in `/etc/rift/permissions/<share>.allow`
-  3. If authorized → grant access with specified permissions (ro/rw)
-  4. If not authorized → exclude share from response / reject operation
-
-**`rift-common/`** - Permission File Parsing
-- `load_permission_file(share)` → `Vec<String>` (fingerprints)
-- `add_permission(share, fingerprint, perms)` → append to `.allow` file
-- Parse permission files: `BLAKE3:abc123... rw`
-
-**`riftd/`** (server binary) - Admin Commands
-- `rift allow <share> <fingerprint> <perms>` - Grant access
-- `rift deny <share> <fingerprint>` - Revoke access to one share
-- `rift revoke <fingerprint>` - Revoke access to all shares
-- `rift list-connections` - Show recent connections (including unknown clients)
-- `rift list-clients` - Show clients with granted access
-
-**Flow:**
-```
-Client connects (mutual TLS)
-  ↓
-rift-transport → AcceptAnyCertVerifier accepts cert
-  ↓
-rift-server → extracts fingerprint: BLAKE3:def456...abc123
-  ↓
-Client sends DISCOVER_REQUEST
-  ↓
-rift-server → checks authorization:
-  - Public shares? Include with public permissions
-  - Fingerprint in /etc/rift/permissions/data.allow? Include with granted perms
-  - Not authorized? Exclude from response
-  ↓
-Server responds with authorized shares only
-  ↓
-Admin sees connection in `rift list-connections`
-  ↓
-Admin: rift allow data BLAKE3:def456...abc123 rw --name "Alice's Laptop"
-  ↓
-rift-common → append to /etc/rift/permissions/data.allow
-  ↓
-Client's next DISCOVER_REQUEST now includes 'data' share
-```
-
-### Connection Logging
-
-**`rift-server/`** - Connection Tracking
-- In-memory connection log (last 1000 connections)
-- Persistent log: `/var/lib/rift/connection-log.jsonl`
-- Log rotation (daily, keep 30 days)
-- Includes: timestamp, fingerprint, CN, IP, event type
-
-**DoS Protection:**
-- Unknown clients logged but NOT persisted to `/etc/rift/clients/`
-- Client directories only created when admin grants access via `rift allow`
-- Rate limiting (configurable per-IP connection limits)
-
-### Public Shares
-
-**`rift-common/`** - Share Configuration
-- `ShareInfo.is_public: bool` flag
-- `public_permissions: Permissions` (typically `ReadOnly`)
-
-**`rift-server/`** - Public Share Handling
-- Include public shares in `DISCOVER_RESPONSE` for ALL clients
-- Apply `public_permissions` (ignore fingerprint-based grants)
-- Public read-write shares: log warning, require confirmation on creation
-
-**`riftd/`** (CLI) - Share Creation
-- `rift export <name> <path> --public --read-only`
-- `rift export <name> <path> --public --read-write` → shows security warning
+**Rationale for consolidation:** Fewer crates means faster workspace compilation (~35-45s clean build), simpler dependency management, and fewer `Cargo.toml` files to maintain. The original 9-crate design assumed more independent reuse cases than materialized during PoC development.
 
 ---
 
-## Workspace Cargo.toml Template
+## Workspace Configuration
 
 ```toml
 [workspace]
-members = [
-    "riftd",
-    "rift",
-    "rift-client",
-    "rift-server",
-    "rift-protocol",
-    "rift-wire",
-    "rift-transport",
-    "rift-crypto",
-    "rift-common",
-]
 resolver = "2"
+members = [
+    "crates/rift-common",
+    "crates/rift-protocol",
+    "crates/rift-transport",
+    "crates/rift-server",
+    "crates/rift-client",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/rift"
-authors = ["Rift Contributors"]
-
-[workspace.dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# QUIC + TLS
-quinn = "0.11"
-rustls = "0.23"
-
-# Protocol
-prost = "0.12"
-serde = { version = "1", features = ["derive"] }
-
-# FUSE (Linux only, optional — used by rift-client's "fuse" feature)
-fuse3 = { git = "https://github.com/Sherlock-Holo/fuse3", features = ["tokio-runtime", "unprivileged"] }
-futures = "0.3"
-
-# Crypto
-blake3 = "1"
-fastcdc = "3"
-
-# Config
-toml = "0.8"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Errors
-anyhow = "1"
-thiserror = "1"
-
-# Internal crates
-rift-protocol = { path = "rift-protocol" }
-rift-wire = { path = "rift-wire" }
-rift-transport = { path = "rift-transport" }
-rift-crypto = { path = "rift-crypto" }
-rift-common = { path = "rift-common" }
-rift-client = { path = "rift-client" }
-rift-server = { path = "rift-server" }
-
-[workspace.dependencies.prost-build]
-version = "0.12"
-
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true
-
-[profile.dev]
-# Faster dev builds
-split-debuginfo = "unpacked"  # macOS/Linux
-opt-level = 0
-debug = true
 ```
+
+**Lints:** `unsafe_code = "forbid"` at workspace level (the entire project forbids unsafe code).
 
 ---
 
-## Per-Crate Cargo.toml Examples
-
-### Library Crate Example: `rift-transport/Cargo.toml`
-
-```toml
-[package]
-name = "rift-transport"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
-
-[dependencies]
-quinn.workspace = true
-rustls.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-```
-
-### Binary Crate Example: `riftd/Cargo.toml`
-
-```toml
-[package]
-name = "riftd"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
-
-[[bin]]
-name = "riftd"
-path = "src/main.rs"
-
-[dependencies]
-rift-server.workspace = true
-rift-common.workspace = true
-tokio.workspace = true
-clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-anyhow.workspace = true
-```
-
----
-
-## Module Organization Best Practices
-
-### Keep lib.rs Minimal
-
-**Pattern:**
-```rust
-// rift-transport/src/lib.rs
-mod connection;
-mod verifier;
-mod config;
-mod error;
-mod fingerprint;
-
-// Re-export public API
-pub use connection::RiftConnection;
-pub use verifier::{AcceptAnyCertVerifier, TofuVerifier};
-pub use config::TlsConfig;
-pub use error::TransportError;
-pub use fingerprint::compute_fingerprint;
-
-// Keep internal types private
-pub(crate) use internal_helper::InternalThing;
-```
-
-**Benefits:**
-- Clear public API (consumers only see re-exported items)
-- Internal details remain private
-- Easy to see what's exposed at a glance
-
-### Private Modules for Internal Logic
-
-Use `pub(crate)` for types shared within the crate but not exposed:
-
-```rust
-// rift-wire/src/framing.rs
-pub(crate) struct FrameHeader {
-    pub msg_type: u32,
-    pub payload_len: u32,
-}
-
-pub(crate) fn encode_frame(header: FrameHeader, payload: &[u8]) -> Vec<u8> {
-    // ...
-}
-```
-
-### Test Modules
-
-Keep tests close to code:
-
-```rust
-// rift-crypto/src/hash.rs
-pub fn hash_bytes(data: &[u8]) -> [u8; 32] {
-    // ...
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hash_empty() {
-        let hash = hash_bytes(&[]);
-        assert_eq!(hash.len(), 32);
-    }
-}
-```
-
----
-
-## Testing Strategy
-
-### Unit Tests
-
-In each crate, use `#[cfg(test)] mod tests`:
-
-```rust
-// rift-crypto/src/cdc.rs
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_chunking() {
-        let data = b"hello world";
-        let chunks: Vec<_> = chunk_stream(data.as_ref(), 8192).collect();
-        assert!(!chunks.is_empty());
-    }
-}
-```
-
-**Benefit:** Tests stay close to code, compiled only for `cargo test`.
-
-### Integration Tests
-
-In `tests/` directory at crate root:
-
-```
-rift-client/
-├── Cargo.toml
-├── src/
-│   └── lib.rs
-└── tests/
-    ├── connect.rs
-    └── operations.rs
-```
-
-```rust
-// rift-client/tests/connect.rs
-use rift_client::RiftClient;
-
-#[tokio::test]
-async fn test_connect_to_server() {
-    let client = RiftClient::connect("localhost:8433").await;
-    assert!(client.is_ok());
-}
-```
-
-**Benefit:** Tests the crate as an external consumer would use it.
-
-### End-to-End Tests
-
-In workspace root `tests/`:
-
-```
-rift/
-├── tests/
-│   ├── e2e_mount.rs
-│   └── e2e_pairing.rs
-```
-
-```rust
-// tests/e2e_mount.rs
-use rift_server::Server;
-use rift_client::RiftClient;
-
-#[tokio::test]
-async fn test_full_mount_workflow() {
-    // Start server
-    let server = spawn_test_server().await;
-
-    // Connect client
-    let client = RiftClient::connect("localhost:8433").await.unwrap();
-
-    // List shares
-    let shares = client.list_shares().await.unwrap();
-    assert!(!shares.is_empty());
-
-    // Cleanup
-    server.shutdown().await;
-}
-```
-
-**Benefit:** Tests entire system integration.
-
-### Test Utilities
-
-In `rift-common`, provide test helpers:
-
-```rust
-// rift-common/src/testing.rs (only compiled for tests)
-#[cfg(test)]
-pub mod testing {
-    use std::path::PathBuf;
-
-    pub fn temp_config_dir() -> PathBuf {
-        // Create temporary config directory
-    }
-
-    pub fn generate_test_cert() -> (Vec<u8>, Vec<u8>) {
-        // Generate test certificate and key
-    }
-}
-```
-
-Usage:
-```rust
-// rift-client/tests/connect.rs
-#[cfg(test)]
-use rift_common::testing::*;
-
-#[tokio::test]
-async fn test_with_temp_config() {
-    let config_dir = temp_config_dir();
-    // ...
-}
-```
-
----
-
-## Compilation Time Estimates
-
-### Clean Build (Parallel Compilation)
-
-**Layer 1 - Foundation (parallel):**
-- `rift-common`: ~5s (minimal deps: `serde`, `toml`)
-- `rift-crypto`: ~8s (`blake3`, `fastcdc`)
-
-**Layer 2 - Protocol/Transport (parallel after Layer 1):**
-- `rift-protocol`: ~10s (`prost` codegen)
-- `rift-transport`: ~12s (`quinn`, `rustls` - largest deps)
-
-**Layer 3 - Wire (after protocol + transport):**
-- `rift-wire`: ~8s (depends on both)
-
-**Layer 4 - High-level (parallel after wire):**
-- `rift-client`: ~10s (includes FUSE module compilation on Linux)
-- `rift-server`: ~10s
-
-**Layer 5 - Binaries (parallel after high-level):**
-- `rift`: ~5s (minimal additional code)
-- `riftd`: ~5s (minimal additional code)
-
-**Total clean build: ~35-45s** (with 8-core CPU, parallel compilation enabled)
-
-### Incremental Build Examples
-
-**Modify server business logic (`rift-server`):**
-- Recompile: `rift-server`, `riftd`
-- Time: ~2-3s
-- No recompilation: client, protocol, crypto, etc.
-
-**Modify CLI UX (`rift`):**
-- Recompile: `rift` only
-- Time: ~1-2s
-- No recompilation: everything else
-
-**Modify protocol definition (`.proto` file):**
-- Recompile: `rift-protocol`, `rift-wire`, `rift-client`, `rift-server`, `rift`, `riftd`
-- Time: ~15-20s
-- No recompilation: `rift-crypto`, `rift-common`, `rift-transport`
-
-**Modify crypto function (`rift-crypto`):**
-- Recompile: `rift-crypto`, `rift-client`, `rift-server`, `rift`, `riftd`
-- Time: ~10-15s
-- No recompilation: protocol, transport, wire
-
-**Benefit:** Modular structure keeps incremental builds fast for most changes.
-
----
-
-## Critical Analysis
-
-### Pros of This Architecture
-
-**1. Modularity:**
-- Clear separation of concerns (protocol, transport, crypto, application)
-- Each crate has a single, well-defined purpose
-- Easy to reason about where code belongs
-
-**2. Compilation times:**
-- Changing server logic doesn't recompile client code
-- Changing CLI UX doesn't recompile protocol definitions
-- Protocol and crypto crates are stable (rarely recompile)
-- Parallel compilation of independent crates
-
-**3. Testing:**
-- Each crate tested in isolation
-- Mock dependencies easily (e.g., mock `rift-client` for FUSE tests)
-- Protocol and crypto crates have pure functions (easy unit tests)
-
-**4. Reusability:**
-- `rift-client` can be used by future GUI
-- `rift-protocol` can be used by alternative implementations
-- `rift-crypto` can be used by other tools
-- `rift-transport` can be used for other QUIC projects
-
-**5. Future flexibility:**
-- Can replace FUSE with an NFSv4 kernel module without touching protocol or transport
-- Can swap wire format (e.g., add encryption) without changing protocol types
-- Can embed server (`rift-server`) in other applications
-
-**6. Dependency isolation:**
-- FUSE dependency only in `rift-client` (optional, not pulled by server)
-- `quinn` and `rustls` isolated in `rift-transport` (easier to swap)
-- Protobuf codegen isolated in `rift-protocol`
-
-### Cons and Risks
-
-**1. Workspace overhead:**
-- 10 `Cargo.toml` files (vs 1 for monolith)
-- More boilerplate (edition, license, version fields)
-- **Mitigation:** Use `[workspace.package]` for shared metadata
-
-**2. Premature abstraction risk:**
-- `rift-client` and `rift-server` might be over-engineering for PoC
-- **Counter:** These are thin layers, provide clear API boundaries
-- **Monitoring:** If either stays under 500 LOC, consider merging
-
-**3. Compilation overhead for clean builds:**
-- More crates = more codegen units = longer clean builds (~40-50s)
-- **Mitigation:** Incremental compilation is fast (2-5s for most changes)
-- **Counter:** Development is 95% incremental builds, 5% clean builds
-
-**4. Dependency duplication (cargo feature problem):**
-- Multiple crates depend on `tokio`, `serde`, etc.
-- If one crate needs extra features, all get recompiled
-- **Mitigation:** Use `[workspace.dependencies]` (single version for all)
-- **Best practice:** Keep feature sets minimal, add features only when needed
-
-**5. Risk of circular dependencies:**
-- Must be vigilant about dependency direction
-- **Mitigation:** Clear layering (foundation → protocol → high-level → binary)
-- **Tooling:** `cargo depgraph` to visualize dependencies
-
-**6. "Common" crate becoming a dumping ground:**
-- Risk: `rift-common` accumulates unrelated utilities
-- **Mitigation:** Strict rule: Only code used by 2+ crates
-- **Refactoring trigger:** Split if exceeds 2000 LOC
-
-### When to Split vs When to Keep Together
-
-**Split when:**
-- Clear separation of concerns (different domains)
-- One part is stable, other changes frequently
-- Want to reuse independently
-- Different dependency sets (minimize what each crate pulls in)
-
-**Keep together when:**
-- Tightly coupled (no clear boundary)
-- Both change at same rate
-- No independent reuse expected
-- Splitting adds more complexity than value
-
-**For PoC:** Current split is appropriate. Re-evaluate at 10k total LOC.
-
----
-
-## Alternative Architectures Considered
-
-### Alternative 1: Monolithic Binary
-
-Single crate with modules:
-
-```
-rift/
-├── Cargo.toml
-└── src/
-    ├── main.rs
-    ├── client/
-    ├── server/
-    ├── protocol/
-    ├── crypto/
-    └── fuse/
-```
-
-**Pros:**
-- Simplicity (1 `Cargo.toml`)
-- Faster clean builds (~30s)
-
-**Cons:**
-- Long incremental builds (changing server recompiles client)
-- No reusability
-- Tight coupling
-- Can't test components in isolation
-
-**Verdict:** Too limiting for a project of this scope. Only viable for <5k LOC projects.
-
----
-
-### Alternative 2: More Aggressive Splitting
-
-Separate crates for:
-- `rift-hash` (just BLAKE3)
-- `rift-cdc` (just chunking)
-- `rift-merkle` (just Merkle trees)
-- `rift-config` (just config parsing)
-- `rift-types` (just shared types)
-
-**Pros:**
-- Maximum modularity
-- Each component independently versioned
-
-**Cons:**
-- Workspace overhead (15+ crates)
-- Over-engineering
-- Diminishing returns
-
-**Verdict:** Premature for PoC. Consider for v1 if crates grow large (>5k LOC each).
-
----
-
-### Alternative 3: Binaries Only, No Libraries
-
-`riftd` and `rift` as separate crates, duplicate code
-
-**Pros:**
-- Simplicity
-- No shared dependencies
-
-**Cons:**
-- Code duplication
-- Hard to maintain
-- No reuse
-- Testing nightmare
-
-**Verdict:** Unmaintainable for anything beyond trivial PoC. Rejected.
-
----
-
-## Future Refactoring Triggers
-
-**When crates grow too large:**
-
-1. **Split `rift-crypto` → 3 crates** (if exceeds 3000 LOC):
-   - `rift-hash` (BLAKE3 only)
-   - `rift-cdc` (Chunking only)
-   - `rift-merkle` (Merkle trees only)
-
-2. **Split `rift-common` → 2 crates** (if exceeds 2000 LOC):
-   - `rift-config` (Config parsing)
-   - `rift-types` (Shared type definitions)
-
-3. **Extract shared protocol logic** (if needed):
-   - `rift-session` (Session management, connection pooling)
-   - Used by both `rift-client` and `rift-server`
-
-4. **Split `rift-client`** (if exceeds 5000 LOC):
-   - `rift-client-core` (Low-level operations)
-   - `rift-client` (High-level operations, caching)
-
-**Trigger:** Any crate exceeds 5000 LOC or has 3+ distinct responsibilities.
-
-**Process:**
-1. Identify cohesive modules within large crate
-2. Extract to new crate
-3. Update dependencies
-4. Verify compilation times improved
-
----
-
-## Implementation Roadmap
-
-**Critical path for starting implementation:**
-
-### Phase 1: Foundation (Week 1)
-
-1. **`rift-common`** (types, config parsing)
-   - Define `ShareInfo`, `Permissions`, etc.
-   - Config file parsing (`config.toml`)
-   - Permission file parsing
-
-2. **`rift-protocol`** (protobuf messages)
-   - Write `.proto` schema
-   - Set up `prost-build`
-   - Generate Rust types
-
-3. **`rift-crypto`** (hashing, CDC)
-   - BLAKE3 wrapper
-   - FastCDC wrapper
-   - Merkle tree implementation
-
-### Phase 2: Transport (Week 2)
-
-4. **`rift-transport`** (QUIC + custom TLS verifiers)
-   - Custom certificate verifiers (`AcceptAnyCertVerifier`, `TofuVerifier`)
-   - QUIC connection establishment
-   - Fingerprint extraction
-
-5. **`rift-wire`** (message framing)
-   - Varint framing
-   - Send/receive helpers
-   - Request/response correlation
-
-### Phase 3: Business Logic (Week 3-4)
-
-6. **`rift-server`** + **`riftd`** (server daemon)
-   - Accept connections
-   - Authorization logic
-   - File serving
-   - CLI daemon wrapper
-
-7. **`rift-client`** + **`rift`** (CLI commands)
-   - Connect to server
-   - High-level operations
-   - CLI commands (`whoami`, `show-mounts`, `allow`, etc.)
-
-### Phase 4: Filesystem (Week 5)
-
-8. **`rift-client` FUSE module** (mount command, `fuse` feature)
-   - FUSE filesystem implementation (`fuse3` path interface)
-   - `RemoteShare` trait + `RiftFilesystem` implementation
-   - Already integrated into `rift-client` (no separate crate needed)
-
----
-
-## Summary
-
-**Final crate structure:**
-- ✅ 9 crates (2 binaries, 7 libraries)
-- ✅ FUSE integrated into `rift-client` as an optional feature (no separate crate)
-- ✅ Clear layering (foundation → protocol → high-level → binary)
-- ✅ No circular dependencies
-- ✅ Modular, testable, reusable
-- ✅ ~35-45s clean builds, ~2-5s incremental builds
-- ✅ Error handling: `thiserror` for libraries, `anyhow` for binaries
-
-**Benefits:**
-- Fast incremental compilation (change server, don't recompile client)
-- Isolated testing (test each component independently)
-- Reusability (libraries can be used by future tools)
-- Future flexibility (swap FUSE module, wire format, etc.)
-
-**Risks:**
-- Workspace overhead (10 `Cargo.toml` files)
-- Risk of circular dependencies (mitigated by clear layering)
-- `rift-common` dumping ground (mitigated by strict rules)
-
-**Recommendation:** This architecture is appropriate for Rift PoC and beyond.
-
----
-
-## Next Steps
-
-1. Create workspace directory structure
-2. Set up `Cargo.toml` files (workspace + per-crate)
-3. Scaffold crates with basic `lib.rs` / `main.rs`
-4. Implement foundation layer (`rift-common`, `rift-protocol`, `rift-crypto`)
-5. Implement transport layer (`rift-transport`, `rift-wire`)
-6. Implement business logic (`rift-server`, `rift-client`)
-7. Implement applications (`riftd`, `rift`)
+## Compilation Time
+
+- **Clean build (8-core):** ~35-45s
+- **Incremental (server-only change):** ~2-5s
+- **Incremental (protocol change):** ~15-20s
+- **Incremental (client-only change):** ~2-5s

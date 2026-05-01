@@ -10,16 +10,16 @@ a data share from a single server over a LAN.
 
 ### Protocol Foundation
 - [x] QUIC transport with TLS 1.3 (mutual auth via client certs)
-- [ ] Async multiplexed request/response model
+- [x] Async multiplexed request/response model
 - [x] Protobuf control messages + raw byte data framing
-- [ ] Capability-based version negotiation handshake
-- [ ] Heartbeat / lease mechanism (default 30s / 60s grace)
+- [ ] Capability-based version negotiation handshake — planned
+- [ ] Heartbeat / lease mechanism (default 30s / 60s grace) — planned
 
 ### Filesystem Operations
-- [ ] open, close, read, write, stat
-- [ ] readdir with READDIR_PLUS support
-- [ ] mkdir, rmdir, rename, unlink
-- [ ] hard links
+- [x] open, close, read, stat — done (write not yet implemented)
+- [x] readdir with READDIR_PLUS support
+- [ ] mkdir, rmdir, rename, unlink — planned
+- [ ] hard links — planned
 - [x] UTF-8 filename validation
 - [x] 64-bit offsets, nanosecond timestamps
 
@@ -30,17 +30,16 @@ a data share from a single server over a LAN.
 - [ ] Write progress timeout (default 60s)
 
 ### Cache Coherency
-- [ ] mtime + size fast-path validation
-- [ ] BLAKE3 block-level Merkle tree checksums
-- [ ] End-to-end integrity verification (root hash exchange on write
-  completion)
-- [ ] Streaming incremental Merkle tree construction
+- [x] mtime + size fast-path validation — done (read path)
+- [x] BLAKE3 block-level Merkle tree checksums — done (read path)
+- [ ] End-to-end integrity verification (root hash exchange on write completion) — pending writes
+- [x] Streaming incremental Merkle tree construction — done (read path)
 
 ### Transfer Resilience
-- [ ] Resumable transfers (read and write)
-- [ ] Resume validation (fingerprint check: mtime + size)
-- [ ] Resume retention window (default 1 hour)
-- [ ] Delta sync via Merkle tree block comparison
+- [ ] Resumable transfers (read and write) — planned
+- [ ] Resume validation (fingerprint check: mtime + size) — planned
+- [ ] Resume retention window (default 1 hour) — planned
+- [x] Delta sync via Merkle tree block comparison — done
 
 ### Security
 - [ ] TLS client certificate authentication
@@ -56,9 +55,9 @@ a data share from a single server over a LAN.
 
 ### Client
 - [x] FUSE-based mount (`rift mount`)
-- [ ] Persistent client state in `/var/lib/rift/`
-- [ ] Merkle tree cache persistence
-- [ ] QUIC connection migration support
+- [x] Persistent client state in `/var/lib/rift/`
+- [x] Merkle tree cache persistence
+- [x] QUIC connection migration support
 
 ### Operations
 - [x] `rift mount <server>:<share> <mountpoint>`
@@ -72,7 +71,7 @@ a data share from a single server over a LAN.
 Each feature below has a detailed spec in this directory:
 
 - [Multi-client support](multi-client.md)
-- [Symlinks](symlinks.md)
+- [x] [Symlinks](symlinks.md) — implemented
 - [ACLs](acls.md)
 - [Sparse files](sparse-files.md)
 - [Change watches](change-watches.md) — promoted to v1 for developer
@@ -80,25 +79,23 @@ Each feature below has a detailed spec in this directory:
 - [Selective sync / Files on Demand](selective-sync.md) — mount large
   shares without caching all content locally
 - [Supplementary group mapping](supplementary-groups.md)
-- [Case-insensitive filenames](case-insensitive.md)
 - [Readdir glob filter](readdir-filter.md)
-- [Native kernel module](kernel-module.md)
 
-## Undecided (analysis preserved for future reference)
+## Promoted to v1
 
 - [Reconnection cache sync](reconnect-sync.md) — mutation log replay
   and directory hashing analysis
-
-## Post-v1
-
 - [Offline mode](offline-mode.md) — disconnected operation with
   conflict detection on reconnect
+
+## Post-v1 (undecided)
+
 - [Bandwidth throttling](bandwidth-throttling.md) — rate limiting and
   time-based scheduling for WAN
 - [Pluggable backends](pluggable-backends.md) — abstract storage layer
   (local filesystem, S3, database)
 
-## Future (exploring)
+## Future (undecided)
 
 - [Multi-server striping](multi-server-striping.md)
 - [File versioning](file-versioning.md) — time-travel access to

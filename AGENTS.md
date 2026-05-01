@@ -1,6 +1,7 @@
 # AGENTS.md - Coding Agent Guidelines for Rift
 
-This file provides guidelines for AI coding agents working on the Rift project.
+This file consolidates instructions previously split across AGENTS.md and CLAUDE.md.
+It provides guidelines for any AI coding agent working on the Rift project.
 
 ## Build & Test Commands
 
