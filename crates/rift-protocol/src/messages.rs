@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(decoded.code, ErrorCode::ErrorConflict as i32);
         match decoded.metadata.unwrap() {
             error_detail::Metadata::Conflict(m) => assert_eq!(m.server_root, vec![0xAB; 32]),
-            _ => panic!("wrong metadata variant"),
+            error_detail::Metadata::FileLock(_) => panic!("wrong metadata variant"),
         }
     }
 
@@ -171,7 +171,7 @@ mod tests {
     fn error_detail_file_lock_metadata() {
         let msg = ErrorDetail {
             code: ErrorCode::ErrorFileLocked as i32,
-            message: "".to_string(),
+            message: String::new(),
             metadata: Some(error_detail::Metadata::FileLock(FileLockMetadata {
                 retry_after_ms: 500,
             })),
@@ -180,7 +180,7 @@ mod tests {
         let decoded = ErrorDetail::decode(encoded.as_slice()).unwrap();
         match decoded.metadata.unwrap() {
             error_detail::Metadata::FileLock(m) => assert_eq!(m.retry_after_ms, 500),
-            _ => panic!("wrong metadata variant"),
+            error_detail::Metadata::Conflict(_) => panic!("wrong metadata variant"),
         }
     }
 
@@ -223,7 +223,7 @@ mod tests {
                 assert_eq!(e.handle, b"file-handle");
                 assert_eq!(e.attrs.unwrap().size, 1024);
             }
-            _ => panic!("wrong result variant"),
+            lookup_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -242,7 +242,7 @@ mod tests {
             lookup_response::Result::Error(e) => {
                 assert_eq!(e.code, ErrorCode::ErrorNotFound as i32);
             }
-            _ => panic!("wrong result variant"),
+            lookup_response::Result::Entry(_) => panic!("wrong result variant"),
         }
     }
 
@@ -296,7 +296,7 @@ mod tests {
                 assert_eq!(s.entries[0].name, "foo.txt");
                 assert!(!s.has_more);
             }
-            _ => panic!("wrong result variant"),
+            readdir_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -319,7 +319,7 @@ mod tests {
         let decoded = WriteRequest::decode(encoded.as_slice()).unwrap();
         match decoded.target.unwrap() {
             write_request::Target::ExistingHandle(h) => assert_eq!(h, b"file-handle"),
-            _ => panic!("wrong target variant"),
+            write_request::Target::NewFile(_) => panic!("wrong target variant"),
         }
         assert_eq!(decoded.chunks.len(), 1);
     }
@@ -342,7 +342,7 @@ mod tests {
                 assert_eq!(nf.name, "new.txt");
                 assert_eq!(nf.mode, 0o644);
             }
-            _ => panic!("wrong target variant"),
+            write_request::Target::ExistingHandle(_) => panic!("wrong target variant"),
         }
         assert!(decoded.expected_root.is_empty());
     }
@@ -584,7 +584,7 @@ mod tests {
                 assert_eq!(e.handle, b"new-dir-handle");
                 assert_eq!(e.attrs.unwrap().file_type, FileType::Directory as i32);
             }
-            _ => panic!("wrong result variant"),
+            mkdir_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -604,7 +604,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
                 assert_eq!(e.message, "permission denied");
             }
-            _ => panic!("wrong result variant"),
+            mkdir_response::Result::Entry(_) => panic!("wrong result variant"),
         }
     }
 
@@ -629,7 +629,7 @@ mod tests {
         let decoded = UnlinkResponse::decode(encoded.as_slice()).unwrap();
         match decoded.result.unwrap() {
             unlink_response::Result::Ok(()) => {}
-            _ => panic!("wrong result variant"),
+            unlink_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -649,7 +649,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
                 assert_eq!(e.message, "permission denied");
             }
-            _ => panic!("wrong result variant"),
+            unlink_response::Result::Ok(_) => panic!("wrong result variant"),
         }
     }
 
@@ -674,7 +674,7 @@ mod tests {
         let decoded = RmdirResponse::decode(encoded.as_slice()).unwrap();
         match decoded.result.unwrap() {
             rmdir_response::Result::Ok(()) => {}
-            _ => panic!("wrong result variant"),
+            rmdir_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -694,7 +694,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::ErrorNotEmpty as i32);
                 assert_eq!(e.message, "directory not empty");
             }
-            _ => panic!("wrong result variant"),
+            rmdir_response::Result::Ok(_) => panic!("wrong result variant"),
         }
     }
 
@@ -723,7 +723,7 @@ mod tests {
         let decoded = RenameResponse::decode(encoded.as_slice()).unwrap();
         match decoded.result.unwrap() {
             rename_response::Result::Ok(()) => {}
-            _ => panic!("wrong result variant"),
+            rename_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -743,7 +743,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
                 assert_eq!(e.message, "permission denied");
             }
-            _ => panic!("wrong result variant"),
+            rename_response::Result::Ok(_) => panic!("wrong result variant"),
         }
     }
 
@@ -803,7 +803,7 @@ mod tests {
                 assert_eq!(a.mode, 0o600);
                 assert_eq!(a.size, 512);
             }
-            _ => panic!("wrong result variant"),
+            set_attr_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -823,7 +823,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::ErrorPermissionDenied as i32);
                 assert_eq!(e.message, "permission denied");
             }
-            _ => panic!("wrong result variant"),
+            set_attr_response::Result::Attrs(_) => panic!("wrong result variant"),
         }
     }
 
@@ -838,7 +838,7 @@ mod tests {
         let decoded = ReadResponse::decode(encoded.as_slice()).unwrap();
         match decoded.result.unwrap() {
             read_response::Result::Ok(s) => assert_eq!(s.chunk_count, 8),
-            _ => panic!("wrong result variant"),
+            read_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -858,7 +858,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::ErrorStaleHandle as i32);
                 assert_eq!(e.message, "stale handle");
             }
-            _ => panic!("wrong result variant"),
+            read_response::Result::Ok(_) => panic!("wrong result variant"),
         }
     }
 
@@ -885,7 +885,7 @@ mod tests {
                 assert_eq!(s.new_root, vec![0xDE; 32]);
                 assert_eq!(s.handle, b"file-handle");
             }
-            _ => panic!("wrong result variant"),
+            write_response::Result::Error(_) => panic!("wrong result variant"),
         }
     }
 
@@ -909,10 +909,10 @@ mod tests {
                     error_detail::Metadata::Conflict(m) => {
                         assert_eq!(m.server_root, vec![0xAB; 32]);
                     }
-                    _ => panic!("wrong metadata variant"),
+                    error_detail::Metadata::FileLock(_) => panic!("wrong metadata variant"),
                 }
             }
-            _ => panic!("wrong result variant"),
+            write_response::Result::Ok(_) => panic!("wrong result variant"),
         }
     }
 

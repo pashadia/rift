@@ -585,7 +585,9 @@ mod tests {
         );
         let missing = match result.unwrap_err() {
             ReconstructError::MissingChunks(m) => m,
-            other => panic!("expected MissingChunks, got {:?}", other),
+            other @ ReconstructError::CorruptedChunks(_) => {
+                panic!("expected MissingChunks, got {:?}", other)
+            }
         };
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], *chunk1_hash.as_bytes());
@@ -637,7 +639,9 @@ mod tests {
         assert!(result.is_err(), "corrupted chunk data must be rejected");
         let bad_hashes = match result.unwrap_err() {
             ReconstructError::CorruptedChunks(c) => c,
-            other => panic!("expected CorruptedChunks, got {:?}", other),
+            other @ ReconstructError::MissingChunks(_) => {
+                panic!("expected CorruptedChunks, got {:?}", other)
+            }
         };
         assert_eq!(bad_hashes.len(), 1);
         // The returned hash should be the EXPECTED hash (chunk0_hash), not the
@@ -813,7 +817,9 @@ mod tests {
         assert!(result.is_err(), "missing chunk should return Err");
         let missing = match result.unwrap_err() {
             ReconstructError::MissingChunks(m) => m,
-            other => panic!("expected MissingChunks, got {:?}", other),
+            other @ ReconstructError::CorruptedChunks(_) => {
+                panic!("expected MissingChunks, got {:?}", other)
+            }
         };
         assert_eq!(missing.len(), 1);
         assert_eq!(

@@ -1212,7 +1212,7 @@ mod merkle_cache_tests {
                 MerkleChild::Leaf {
                     chunk_index, hash, ..
                 } => Some((*chunk_index, hash.clone())),
-                _ => None,
+                MerkleChild::Subtree(_) => None,
             })
             .collect();
         assert_eq!(leaf_children.len(), 5);
@@ -1244,7 +1244,7 @@ mod merkle_cache_tests {
                 MerkleChild::Leaf {
                     chunk_index, hash, ..
                 } => Some((*chunk_index, hash.clone())),
-                _ => None,
+                MerkleChild::Subtree(_) => None,
             })
             .collect();
         all_leaves.sort_by_key(|(idx, _)| *idx);
