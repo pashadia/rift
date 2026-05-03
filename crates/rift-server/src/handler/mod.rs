@@ -124,16 +124,13 @@ pub async fn resolve(
     };
 
     // Step 4: TOCTOU hardening — re-verify is_symlink after canonicalize
-    let is_symlink = match reverify_file_type(&stored_path, is_symlink).await {
-        Some(b) => b,
-        None => {
-            return Err(evict_and_bail(
-                handle_db,
-                handle,
-                &stored_path,
-                "TOCTOU: path disappeared between metadata checks",
-            ));
-        }
+    let Some(is_symlink) = reverify_file_type(&stored_path, is_symlink).await else {
+        return Err(evict_and_bail(
+            handle_db,
+            handle,
+            &stored_path,
+            "TOCTOU: path disappeared between metadata checks",
+        ));
     };
 
     // Step 5: verify the canonical path is within the share root

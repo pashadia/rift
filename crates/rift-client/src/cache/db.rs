@@ -381,15 +381,13 @@ impl FileCache {
         let end = offset.saturating_add(length).min(file_size);
 
         // Find the first chunk whose byte range overlaps [offset, end)
-        let first_idx = match chunks.iter().position(|c| c.offset + c.length > offset) {
-            Some(i) => i,
-            None => return Ok(vec![]),
+        let Some(first_idx) = chunks.iter().position(|c| c.offset + c.length > offset) else {
+            return Ok(vec![]);
         };
 
         // Find the last chunk whose byte range overlaps [offset, end)
-        let last_idx = match chunks.iter().rposition(|c| c.offset < end) {
-            Some(i) => i,
-            None => return Ok(vec![]),
+        let Some(last_idx) = chunks.iter().rposition(|c| c.offset < end) else {
+            return Ok(vec![]);
         };
 
         if first_idx > last_idx {

@@ -31,9 +31,8 @@ pub async fn stat_response<M: MerkleCache>(
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> StatResponse {
-    let req = match StatRequest::decode(payload) {
-        Ok(r) => r,
-        Err(_) => return StatResponse { results: vec![] },
+    let Ok(req) = StatRequest::decode(payload) else {
+        return StatResponse { results: vec![] };
     };
 
     let futures: Vec<_> = req

@@ -266,14 +266,12 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
     handle_db: &HandleDatabase,
     chunker: Chunker,
 ) -> anyhow::Result<()> {
-    let req = match MerkleDrill::decode(payload) {
-        Ok(r) => r,
-        Err(_) => return send_empty_drill_response(stream).await,
+    let Ok(req) = MerkleDrill::decode(payload) else {
+        return send_empty_drill_response(stream).await;
     };
 
-    let handle = match Uuid::from_slice(&req.handle) {
-        Ok(u) => u,
-        Err(_) => return send_empty_drill_response(stream).await,
+    let Ok(handle) = Uuid::from_slice(&req.handle) else {
+        return send_empty_drill_response(stream).await;
     };
 
     let canonical = match resolve(share, &handle, handle_db).await {
@@ -290,15 +288,14 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
             Ok(Some(entry)) => entry.root,
             _ => {
                 // Cache miss — must build the tree
-                let (root, cache) = match build_and_cache_tree(&canonical, chunker, db).await {
-                    Some(r) => r,
-                    None => return send_empty_drill_response(stream).await,
+                let Some((root, cache)) = build_and_cache_tree(&canonical, chunker, db).await
+                else {
+                    return send_empty_drill_response(stream).await;
                 };
 
                 // Look up root's children in the in-memory cache
-                let children = match resolve_children(&cache, &canonical, &root, db).await {
-                    Some(c) => c,
-                    None => return send_empty_drill_response(stream).await,
+                let Some(children) = resolve_children(&cache, &canonical, &root, db).await else {
+                    return send_empty_drill_response(stream).await;
                 };
 
                 let response = MerkleDrillResponse {
@@ -333,15 +330,13 @@ pub async fn merkle_drill_response<S: RiftStream, M: MerkleCache>(
     }
 
     // Step 3: Cache miss — read file and build tree
-    let (root, cache) = match build_and_cache_tree(&canonical, chunker, db).await {
-        Some(r) => r,
-        None => return send_empty_drill_response(stream).await,
+    let Some((root, cache)) = build_and_cache_tree(&canonical, chunker, db).await else {
+        return send_empty_drill_response(stream).await;
     };
 
     // Step 4: Look up children at the query hash
-    let children = match resolve_children(&cache, &canonical, &query_hash, db).await {
-        Some(c) => c,
-        None => return send_empty_drill_response(stream).await,
+    let Some(children) = resolve_children(&cache, &canonical, &query_hash, db).await else {
+        return send_empty_drill_response(stream).await;
     };
 
     let parent_hash = if req.hash.is_empty() {

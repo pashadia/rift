@@ -45,9 +45,8 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Bytes)>, CodecEr
     // Peek at the buffer without consuming to check if we have enough data.
     let mut peek = &buf[..];
 
-    let type_id = match decode_varint_peek(&mut peek)? {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some(type_id) = decode_varint_peek(&mut peek)? else {
+        return Ok(None);
     };
 
     let length = match decode_varint_peek(&mut peek)? {

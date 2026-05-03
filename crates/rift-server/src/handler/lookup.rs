@@ -32,15 +32,14 @@ pub async fn lookup_response<M: MerkleCache>(
     chunker: Chunker,
 ) -> LookupResponse {
     // Decode and validate the request.
-    let req = match decode_lookup_request(payload) {
-        Some(r) => r,
-        None => return lookup_error(ErrorCode::ErrorUnsupported),
+    let Some(req) = decode_lookup_request(payload) else {
+        return lookup_error(ErrorCode::ErrorUnsupported);
     };
 
     // Resolve parent handle to canonical path.
-    let parent_canonical = match resolve_parent_path(share, &req.parent_handle, handle_db).await {
-        Some(p) => p,
-        None => return lookup_error(ErrorCode::ErrorNotFound),
+    let Some(parent_canonical) = resolve_parent_path(share, &req.parent_handle, handle_db).await
+    else {
+        return lookup_error(ErrorCode::ErrorNotFound);
     };
 
     // Canonicalize the share root once.
@@ -165,15 +164,12 @@ async fn handle_regular_child<M: MerkleCache>(
 
     // TOCTOU hardening: re-verify is_symlink after canonicalize for the non-symlink path.
     if !initial_is_symlink {
-        let current_meta = match tokio::fs::symlink_metadata(child_path).await {
-            Ok(m) => m,
-            Err(_) => {
-                tracing::warn!(
-                    path = %child_path.display(),
-                    "TOCTOU: path disappeared between metadata checks"
-                );
-                return lookup_error(ErrorCode::ErrorNotFound);
-            }
+        let Ok(current_meta) = tokio::fs::symlink_metadata(child_path).await else {
+            tracing::warn!(
+                path = %child_path.display(),
+                "TOCTOU: path disappeared between metadata checks"
+            );
+            return lookup_error(ErrorCode::ErrorNotFound);
         };
         if current_meta.is_symlink() {
             // Regular file was replaced by a symlink. Re-do containment and build symlink response.

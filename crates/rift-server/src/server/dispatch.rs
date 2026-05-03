@@ -64,9 +64,8 @@ async fn handle_stream<S, M: MerkleCache>(
 where
     S: RiftStream,
 {
-    let request = match recv_request(&mut stream).await? {
-        Some(r) => r,
-        None => return Ok(()),
+    let Some(request) = recv_request(&mut stream).await? else {
+        return Ok(());
     };
 
     debug!(

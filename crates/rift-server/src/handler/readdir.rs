@@ -28,14 +28,12 @@ pub async fn readdir_response(
     share: &Path,
     handle_db: &HandleDatabase,
 ) -> ReaddirResponse {
-    let req = match ReaddirRequest::decode(payload) {
-        Ok(r) => r,
-        Err(_) => return readdir_error(ErrorCode::ErrorUnsupported),
+    let Ok(req) = ReaddirRequest::decode(payload) else {
+        return readdir_error(ErrorCode::ErrorUnsupported);
     };
 
-    let dir_uuid = match Uuid::from_slice(&req.directory_handle) {
-        Ok(u) => u,
-        Err(_) => return readdir_error(ErrorCode::ErrorNotFound),
+    let Ok(dir_uuid) = Uuid::from_slice(&req.directory_handle) else {
+        return readdir_error(ErrorCode::ErrorNotFound);
     };
 
     let dir_canonical = match resolve(share, &dir_uuid, handle_db).await {

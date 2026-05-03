@@ -77,13 +77,12 @@ impl Database {
         match result {
             Ok((root, leaf_hashes, cached_mtime, cached_size)) => {
                 if cached_mtime == mtime_ns as i64 && cached_size == file_size as i64 {
-                    let root = match Blake3Hash::from_slice(&root) {
-                        Ok(h) => h,
-                        Err(_) => return Ok(None),
+                    let Ok(root) = Blake3Hash::from_slice(&root) else {
+                        return Ok(None);
                     };
-                    let leaf_hashes = match MerkleTree::default().deserialize_leaves(&leaf_hashes) {
-                        Ok(h) => h,
-                        Err(_) => return Ok(None),
+                    let Ok(leaf_hashes) = MerkleTree::default().deserialize_leaves(&leaf_hashes)
+                    else {
+                        return Ok(None);
                     };
                     Ok(Some(MerkleEntry { root, leaf_hashes }))
                 } else {
@@ -176,7 +175,7 @@ impl Database {
 
         // Serialize all children entries for DB insertion
         let mut node_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(cache.len());
-        for (hash, children) in cache.iter() {
+        for (hash, children) in cache {
             let hash_bytes = hash.as_bytes().to_vec();
             let children_bytes = postcard::to_allocvec(children)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -309,9 +308,8 @@ impl Database {
                     let offset: i64 = row.get(1)?;
                     let length: i64 = row.get(2)?;
                     let chunk_index: i64 = row.get(3)?;
-                    let hash = match Blake3Hash::from_slice(&hash_bytes) {
-                        Ok(h) => h,
-                        Err(_) => return Err(rusqlite::Error::IntegralValueOutOfRange(0, 0)),
+                    let Ok(hash) = Blake3Hash::from_slice(&hash_bytes) else {
+                        return Err(rusqlite::Error::IntegralValueOutOfRange(0, 0));
                     };
                     Ok(LeafInfo {
                         hash,

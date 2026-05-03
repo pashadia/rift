@@ -973,7 +973,7 @@ mod merkle_ext_tests {
 
         // Compute chunk_0: hash of first 64 leaves
         let mut hasher0 = blake3::Hasher::new();
-        for hash in chunks[0].iter() {
+        for hash in chunks[0] {
             hasher0.update(hash.as_bytes());
         }
         let chunk0_hash = Blake3Hash(*hasher0.finalize().as_bytes());

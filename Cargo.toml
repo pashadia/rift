@@ -41,11 +41,13 @@ similar_names = "warn"
 fn_params_excessive_bools = "warn"
 unreadable_literal = "warn"
 cast_lossless = "warn"
+manual_let_else = "warn"
 
 # API design & idioms
 must_use_candidate = "warn"
 return_self_not_must_use = "warn"
 semicolon_if_nothing_returned = "warn"
+explicit_iter_loop = "warn"
 
 # Error handling
 question_mark = "warn"

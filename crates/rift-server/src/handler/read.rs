@@ -57,12 +57,9 @@ async fn decode_read_request<S: RiftStream>(
     stream: &mut S,
     payload: &[u8],
 ) -> anyhow::Result<ReadRequest> {
-    let req = match ReadRequest::decode(payload) {
-        Ok(r) => r,
-        Err(_) => {
-            send_read_error(stream, ErrorCode::ErrorUnsupported).await?;
-            anyhow::bail!("failed to decode ReadRequest");
-        }
+    let Ok(req) = ReadRequest::decode(payload) else {
+        send_read_error(stream, ErrorCode::ErrorUnsupported).await?;
+        anyhow::bail!("failed to decode ReadRequest");
     };
     Ok(req)
 }
@@ -70,12 +67,9 @@ async fn decode_read_request<S: RiftStream>(
 /// Validate the handle UUID in the request.
 /// On failure sends an error response and returns Err.
 async fn validate_handle<S: RiftStream>(stream: &mut S, req: &ReadRequest) -> anyhow::Result<Uuid> {
-    let handle = match Uuid::from_slice(&req.handle) {
-        Ok(u) => u,
-        Err(_) => {
-            send_read_error(stream, ErrorCode::ErrorNotFound).await?;
-            anyhow::bail!("invalid handle UUID");
-        }
+    let Ok(handle) = Uuid::from_slice(&req.handle) else {
+        send_read_error(stream, ErrorCode::ErrorNotFound).await?;
+        anyhow::bail!("invalid handle UUID");
     };
     Ok(handle)
 }

@@ -990,9 +990,8 @@ async fn readdir_and_lookup_return_consistent_handles_for_symlink() {
     let frame = stream.recv_frame().await.unwrap().unwrap();
     let (_, payload) = frame;
     let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
-    let lookup_entry = match lookup_resp.result {
-        Some(lookup_response::Result::Entry(e)) => e,
-        _ => panic!("expected entry"),
+    let Some(lookup_response::Result::Entry(lookup_entry)) = lookup_resp.result else {
+        panic!("expected entry")
     };
 
     // Lookup should return same handle as readdir for the symlink
@@ -1130,9 +1129,8 @@ async fn readdir_and_lookup_return_consistent_handles_for_nested_symlink() {
     let frame = stream.recv_frame().await.unwrap().unwrap();
     let (_, payload) = frame;
     let lookup_resp = rift_protocol::messages::LookupResponse::decode(&payload[..]).unwrap();
-    let lookup_entry = match lookup_resp.result {
-        Some(lookup_response::Result::Entry(e)) => e,
-        _ => panic!("expected entry"),
+    let Some(lookup_response::Result::Entry(lookup_entry)) = lookup_resp.result else {
+        panic!("expected entry")
     };
 
     // Lookup should return same handle as readdir
@@ -2510,9 +2508,8 @@ async fn server_read_partial_chunks_returns_requested_only() {
     // Read response
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let response = rift_protocol::messages::ReadResponse::decode(&payload[..]).unwrap();
-    let success = match response.result {
-        Some(rift_protocol::messages::read_response::Result::Ok(s)) => s,
-        _ => panic!("expected success"),
+    let Some(rift_protocol::messages::read_response::Result::Ok(success)) = response.result else {
+        panic!("expected success")
     };
     // May have 0 or 1 depending on file size and CDC behavior
     // Just verify we don't crash and can read a chunk if available
@@ -3229,9 +3226,8 @@ async fn multi_chunk_start_chunk_at_last_valid_returns_data() {
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let resp = ReadResponse::decode(&payload[..]).unwrap();
-    let success = match resp.result {
-        Some(read_response::Result::Ok(s)) => s,
-        _ => panic!("expected success at last valid chunk, got error"),
+    let Some(read_response::Result::Ok(success)) = resp.result else {
+        panic!("expected success at last valid chunk, got error")
     };
     assert_eq!(success.chunk_count, 1, "should return exactly 1 chunk");
 }
@@ -3262,9 +3258,8 @@ async fn multi_chunk_requesting_more_than_available_returns_what_exists() {
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let resp = ReadResponse::decode(&payload[..]).unwrap();
-    let success = match resp.result {
-        Some(read_response::Result::Ok(s)) => s,
-        _ => panic!("expected success, got error"),
+    let Some(read_response::Result::Ok(success)) = resp.result else {
+        panic!("expected success, got error")
     };
     assert_eq!(
         success.chunk_count as usize, expected_count,
@@ -3298,9 +3293,8 @@ async fn multi_chunk_read_all_from_offset_with_chunk_count_zero() {
 
     let (_, payload) = stream.recv_frame().await.unwrap().unwrap();
     let resp = ReadResponse::decode(&payload[..]).unwrap();
-    let success = match resp.result {
-        Some(read_response::Result::Ok(s)) => s,
-        _ => panic!("expected success with chunk_count=0, got error"),
+    let Some(read_response::Result::Ok(success)) = resp.result else {
+        panic!("expected success with chunk_count=0, got error")
     };
     assert_eq!(
         success.chunk_count as usize, expected_count,
