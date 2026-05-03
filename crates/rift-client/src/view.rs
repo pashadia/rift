@@ -231,10 +231,14 @@ fn build_chunk_starts(leaves: &[ResolvedLeaf], file_size: u64) -> Result<Vec<u64
 ///
 /// Uses `partition_point` for O(log n) lookup.
 fn calculate_chunk_range(chunk_starts: &[u64], offset: u64, end: u64) -> (u32, u32) {
-    let start_chunk = chunk_starts
-        .partition_point(|&s| s <= offset)
-        .saturating_sub(1) as u32;
-    let end_chunk = chunk_starts.partition_point(|&s| s < end) as u32;
+    let start_chunk = u32::try_from(
+        chunk_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1),
+    )
+    .expect("chunk index fits in u32");
+    let end_chunk =
+        u32::try_from(chunk_starts.partition_point(|&s| s < end)).expect("chunk index fits in u32");
     (start_chunk, end_chunk)
 }
 
@@ -279,21 +283,22 @@ fn assemble_byte_range(
     let mut sorted: Vec<_> = chunks.into_iter().collect();
     sorted.sort_by_key(|c| c.index);
     for (i, chunk) in sorted.iter().enumerate() {
-        if chunk.index != start_chunk + i as u32 {
+        if chunk.index != start_chunk + u32::try_from(i).expect("chunk index fits in u32") {
             tracing::error!(
                 "chunk index mismatch: expected {}, got {}",
-                start_chunk + i as u32,
+                start_chunk + u32::try_from(i).expect("chunk index fits in u32"),
                 chunk.index
             );
             return Err(FsError::Io);
         }
     }
 
-    let needed = (end - offset) as usize;
+    let needed = usize::try_from(end - offset).expect("byte range fits in usize");
     let mut result = Vec::with_capacity(needed);
 
     for chunk in &sorted {
-        let chunk_start_byte = chunk_starts[chunk.index as usize];
+        let chunk_start_byte =
+            chunk_starts[usize::try_from(chunk.index).expect("chunk index fits in usize")];
         let chunk_end_byte = chunk_start_byte + chunk.data.len() as u64;
 
         // Skip chunks that don't overlap with the requested range
@@ -301,8 +306,10 @@ fn assemble_byte_range(
             continue;
         }
 
-        let slice_start = (offset.saturating_sub(chunk_start_byte)) as usize;
-        let slice_end = (end.min(chunk_end_byte) - chunk_start_byte) as usize;
+        let slice_start = usize::try_from(offset.saturating_sub(chunk_start_byte))
+            .expect("byte offset fits in usize");
+        let slice_end = usize::try_from(end.min(chunk_end_byte) - chunk_start_byte)
+            .expect("byte offset fits in usize");
 
         if slice_start < slice_end && slice_end <= chunk.data.len() {
             result.extend_from_slice(&chunk.data[slice_start..slice_end]);
@@ -1075,7 +1082,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, d)| ChunkData {
-                index: i as u32,
+                index: u32::try_from(i).expect("chunk index fits in u32"),
                 length: d.len() as u64,
                 hash: chunk_hashes[i],
                 data: Bytes::from(d.clone()),

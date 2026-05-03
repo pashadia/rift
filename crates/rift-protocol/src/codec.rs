@@ -51,7 +51,7 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Bytes)>, CodecEr
     };
 
     let length = match decode_varint_peek(&mut peek)? {
-        Some(v) => v as usize,
+        Some(v) => usize::try_from(v).expect("frame length fits in usize"),
         None => return Ok(None),
     };
 
@@ -68,16 +68,19 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Bytes)>, CodecEr
     decode_varint(buf)?.ok_or(CodecError::InvalidVarint)?; // length
     let payload = buf.split_to(length).freeze();
 
-    Ok(Some((type_id as u8, payload)))
+    Ok(Some((
+        u8::try_from(type_id).expect("type_id is 0x00-0xFF"),
+        payload,
+    )))
 }
 
 /// Encode a u64 as varint.
 fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     while value >= 0x80 {
-        buf.put_u8((value as u8) | 0x80);
+        buf.put_u8(u8::try_from(value & 0x7F).expect("value & 0x7F fits in u8") | 0x80);
         value >>= 7;
     }
-    buf.put_u8(value as u8);
+    buf.put_u8(u8::try_from(value).expect("varint final byte fits in u8"));
 }
 
 /// Decode a varint from a mutable byte slice without a `BytesMut` (peek, no consume).

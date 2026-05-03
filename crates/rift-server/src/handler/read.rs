@@ -116,14 +116,22 @@ async fn verify_cached_chunks(
         let chunk_idx = start + i;
         let expected_hash = &leaf_hashes[chunk_idx];
 
-        if buf.len() < info.length as usize {
-            buf.resize(info.length as usize, 0);
+        if buf.len() < usize::try_from(info.length).expect("chunk length fits in usize") {
+            buf.resize(
+                usize::try_from(info.length).expect("chunk length fits in usize"),
+                0,
+            );
         }
 
         file.seek(SeekFrom::Start(info.offset)).await?;
-        file.read_exact(&mut buf[..info.length as usize]).await?;
+        file.read_exact(
+            &mut buf[..usize::try_from(info.length).expect("chunk length fits in usize")],
+        )
+        .await?;
 
-        let actual_hash = Blake3Hash::new(&buf[..info.length as usize]);
+        let actual_hash = Blake3Hash::new(
+            &buf[..usize::try_from(info.length).expect("chunk length fits in usize")],
+        );
         if actual_hash != *expected_hash {
             tracing::warn!(chunk_idx, "chunk hash mismatch in warm path");
             anyhow::bail!(StaleCache);
@@ -147,11 +155,15 @@ async fn send_cached_chunk_frames<S: RiftStream>(
         let expected_hash = &leaf_hashes[chunk_idx];
 
         file.seek(SeekFrom::Start(info.offset)).await?;
-        file.read_exact(&mut buf[..info.length as usize]).await?;
+        file.read_exact(
+            &mut buf[..usize::try_from(info.length).expect("chunk length fits in usize")],
+        )
+        .await?;
 
         let block_header = BlockHeader {
             chunk: Some(ChunkInfo {
-                index: chunk_idx as u32,
+                index: u32::try_from(chunk_idx)
+                    .expect("chunk index exceeds u32 (max 256 chunks/request)"),
                 length: info.length,
                 hash: expected_hash.as_bytes().to_vec(),
             }),
@@ -160,7 +172,10 @@ async fn send_cached_chunk_frames<S: RiftStream>(
             .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
             .await?;
         stream
-            .send_frame(msg::BLOCK_DATA, &buf[..info.length as usize])
+            .send_frame(
+                msg::BLOCK_DATA,
+                &buf[..usize::try_from(info.length).expect("chunk length fits in usize")],
+            )
             .await?;
     }
     Ok(())
@@ -188,7 +203,7 @@ async fn stream_cached_read<S: RiftStream, M: MerkleCache>(
     let count = if req_chunk_count == 0 {
         total_chunks.saturating_sub(start)
     } else {
-        req_chunk_count as usize
+        usize::try_from(req_chunk_count).expect("chunk_count fits in usize")
     };
     let end = (start + count).min(total_chunks);
     let actual_count = end - start;
@@ -237,7 +252,8 @@ async fn stream_cached_read<S: RiftStream, M: MerkleCache>(
 
     let response = ReadResponse {
         result: Some(read_response::Result::Ok(ReadSuccess {
-            chunk_count: actual_count as u32,
+            chunk_count: u32::try_from(actual_count)
+                .expect("chunk count exceeds u32 (bounded by MAX_CHUNK_COUNT=256)"),
         })),
     };
     stream
@@ -352,7 +368,8 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     };
     let end = (start + count).min(chunk_boundaries.len());
 
-    let chunk_count = (end - start) as u32;
+    let chunk_count = u32::try_from(end - start)
+        .expect("chunk count exceeds u32 (bounded by MAX_CHUNK_COUNT=256)");
     let response = ReadResponse {
         result: Some(read_response::Result::Ok(ReadSuccess { chunk_count })),
     };
@@ -418,7 +435,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         let hash = &leaf_hashes[i];
         let block_header = BlockHeader {
             chunk: Some(ChunkInfo {
-                index: i as u32,
+                index: u32::try_from(i).expect("chunk index exceeds u32 (max 256 chunks/request)"),
                 length: buf.len() as u64,
                 hash: hash.as_bytes().to_vec(),
             }),

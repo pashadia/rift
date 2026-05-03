@@ -127,7 +127,7 @@ async fn cache_computed_tree<M: MerkleCache>(
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
+        .map(|d| u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64"))
         .unwrap_or(0);
 
     let file_size = file_meta.len();

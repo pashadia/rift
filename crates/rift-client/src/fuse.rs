@@ -134,7 +134,10 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
             }));
         }
 
-        let skipped: Vec<_> = all.into_iter().skip(offset.max(0) as usize).collect();
+        let skipped: Vec<_> = all
+            .into_iter()
+            .skip(usize::try_from(offset.max(0)).expect("FUSE offset is non-negative"))
+            .collect();
         Ok(ReplyDirectory {
             entries: stream::iter(skipped),
         })
@@ -167,7 +170,10 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
             }));
         }
 
-        let skipped: Vec<_> = all.into_iter().skip(offset as usize).collect();
+        let skipped: Vec<_> = all
+            .into_iter()
+            .skip(usize::try_from(offset).expect("FUSE offset fits in usize"))
+            .collect();
         Ok(ReplyDirectoryPlus {
             entries: stream::iter(skipped),
         })

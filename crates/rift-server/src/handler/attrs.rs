@@ -47,7 +47,7 @@ pub fn build_attrs_with_symlink_target(
         mode: meta.mode(),
         uid: meta.uid(),
         gid: meta.gid(),
-        nlinks: meta.nlink() as u32,
+        nlinks: u32::try_from(meta.nlink()).expect("nlink fits in u32"),
         root_hash: root_hash.as_bytes().to_vec(),
         symlink_target,
     }

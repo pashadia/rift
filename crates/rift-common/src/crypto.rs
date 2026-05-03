@@ -84,9 +84,9 @@ impl Blake3Hash {
 /// Use [`Chunker::new`] with smaller values for testing.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Chunker {
-    pub min_size: usize,
-    pub avg_size: usize,
-    pub max_size: usize,
+    pub min_size: u32,
+    pub avg_size: u32,
+    pub max_size: u32,
 }
 
 impl Default for Chunker {
@@ -101,7 +101,7 @@ impl Default for Chunker {
 
 impl Chunker {
     #[must_use]
-    pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Self {
+    pub fn new(min_size: u32, avg_size: u32, max_size: u32) -> Self {
         Self {
             min_size,
             avg_size,
@@ -111,12 +111,7 @@ impl Chunker {
 
     #[must_use]
     pub fn chunk(&self, data: &[u8]) -> Vec<(usize, usize)> {
-        let chunker = FastCDC::new(
-            data,
-            self.min_size as u32,
-            self.avg_size as u32,
-            self.max_size as u32,
-        );
+        let chunker = FastCDC::new(data, self.min_size, self.avg_size, self.max_size);
         chunker.map(|chunk| (chunk.offset, chunk.length)).collect()
     }
 
@@ -132,19 +127,17 @@ impl Chunker {
         use fastcdc::v2020::AsyncStreamCDC;
         use futures::StreamExt;
 
-        let mut chunker = AsyncStreamCDC::new(
-            reader,
-            self.min_size as u32,
-            self.avg_size as u32,
-            self.max_size as u32,
-        );
+        let mut chunker = AsyncStreamCDC::new(reader, self.min_size, self.avg_size, self.max_size);
         let mut stream = std::pin::pin!(chunker.as_stream());
         let mut boundaries = Vec::new();
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
-                    boundaries.push((chunk.offset as usize, chunk.length));
+                    boundaries.push((
+                        usize::try_from(chunk.offset).expect("chunk offset fits in usize"),
+                        chunk.length,
+                    ));
                 }
                 Err(fastcdc::v2020::Error::Empty) => break,
                 Err(e) => {
@@ -348,7 +341,8 @@ impl MerkleTree {
                         children.push(MerkleChild::Leaf {
                             hash: hash.clone(),
                             length: 0,
-                            chunk_index: (chunk_idx * self.fanout + i) as u32,
+                            chunk_index: u32::try_from(chunk_idx * self.fanout + i)
+                                .expect("leaf index exceeds u32 (max 2^32 leaves)"),
                         });
                     } else {
                         children.push(MerkleChild::Subtree(hash.clone()));
@@ -403,7 +397,7 @@ impl MerkleTree {
                 hash: hash.clone(),
                 offset: chunk_boundaries[i].0 as u64,
                 length: chunk_boundaries[i].1 as u64,
-                chunk_index: i as u32,
+                chunk_index: u32::try_from(i).expect("leaf index exceeds u32 (max 2^32 leaves)"),
             })
             .collect();
 
@@ -599,8 +593,8 @@ mod proptests {
             if chunks.len() > 1 {
                 // All chunks except last should respect size bounds
                 for (_, length) in &chunks[..chunks.len() - 1] {
-                    prop_assert!(*length >= chunker.min_size);
-                    prop_assert!(*length <= chunker.max_size);
+                    prop_assert!(*length >= chunker.min_size as usize);
+                    prop_assert!(*length <= chunker.max_size as usize);
                 }
             }
         }

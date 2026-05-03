@@ -316,7 +316,8 @@ impl Database {
                         hash,
                         offset: offset as u64,
                         length: length as u64,
-                        chunk_index: chunk_index as u32,
+                        chunk_index: u32::try_from(chunk_index)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()
@@ -391,7 +392,8 @@ impl Database {
                 hash: hash_bytes_for_reconstruction,
                 offset: offset as u64,
                 length: length as u64,
-                chunk_index: chunk_index as u32,
+                chunk_index: u32::try_from(chunk_index)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?,
             })),
             Err(e) => {
                 if is_no_rows(&e) {

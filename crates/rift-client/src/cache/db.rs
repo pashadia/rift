@@ -674,7 +674,7 @@ mod tests {
             let hash = *Blake3Hash::new(data).as_bytes();
             cache.put_chunk(&hash, data).await.unwrap();
             chunks.push(ChunkInfo {
-                index: i as u32,
+                index: u32::try_from(i).expect("chunk index fits in u32"),
                 offset,
                 length: size,
                 hash,
@@ -727,7 +727,7 @@ mod tests {
             let hash = *Blake3Hash::new(data).as_bytes();
             cache.put_chunk(&hash, data).await.unwrap();
             chunks.push(ChunkInfo {
-                index: i as u32,
+                index: u32::try_from(i).expect("chunk index fits in u32"),
                 offset,
                 length: size,
                 hash,
