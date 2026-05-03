@@ -50,7 +50,7 @@ pub fn proto_to_fuse3_attr(attrs: &FileAttrs) -> FileAttr {
     }
 }
 
-fn to_errno(e: FsError) -> Errno {
+fn to_errno(e: &FsError) -> Errno {
     Errno::from(e.to_errno())
 }
 
@@ -85,7 +85,11 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     ) -> Fuse3Result<ReplyAttr> {
         let path = path.ok_or_else(|| Errno::from(libc::ENOSYS))?;
         let rust_path = std::path::Path::new(path);
-        let attrs = self.view.getattr(rust_path).await.map_err(to_errno)?;
+        let attrs = self
+            .view
+            .getattr(rust_path)
+            .await
+            .map_err(|e| to_errno(&e))?;
         Ok(ReplyAttr {
             ttl: TTL,
             attr: proto_to_fuse3_attr(&attrs),
@@ -100,7 +104,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
             .view
             .lookup(parent_path, name_str)
             .await
-            .map_err(to_errno)?;
+            .map_err(|e| to_errno(&e))?;
         Ok(ReplyEntry {
             ttl: TTL,
             attr: proto_to_fuse3_attr(&attrs),
@@ -122,7 +126,11 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     ) -> Fuse3Result<ReplyDirectory<impl Stream<Item = Fuse3Result<DirectoryEntry>> + Send + 'a>>
     {
         let rust_path = std::path::Path::new(path);
-        let entries = self.view.readdir(rust_path).await.map_err(to_errno)?;
+        let entries = self
+            .view
+            .readdir(rust_path)
+            .await
+            .map_err(|e| to_errno(&e))?;
 
         let mut all = Vec::with_capacity(entries.len());
         for (i, entry) in entries.into_iter().enumerate() {
@@ -155,7 +163,11 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
         ReplyDirectoryPlus<impl Stream<Item = Fuse3Result<DirectoryEntryPlus>> + Send + 'a>,
     > {
         let rust_path = std::path::Path::new(path);
-        let entries = self.view.readdir(rust_path).await.map_err(to_errno)?;
+        let entries = self
+            .view
+            .readdir(rust_path)
+            .await
+            .map_err(|e| to_errno(&e))?;
 
         let mut all = Vec::with_capacity(entries.len());
         for (i, entry) in entries.into_iter().enumerate() {
@@ -196,7 +208,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
             .view
             .read(path, offset, size.into(), None)
             .await
-            .map_err(to_errno)?;
+            .map_err(|e| to_errno(&e))?;
 
         Ok(ReplyData {
             data: Bytes::from(data),
@@ -214,7 +226,11 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
     #[instrument(skip(self), fields(path = ?path), level = "debug")]
     async fn readlink(&self, _req: Request, path: &OsStr) -> Fuse3Result<ReplyData> {
         let rust_path = std::path::Path::new(path);
-        let target = self.view.readlink(rust_path).await.map_err(to_errno)?;
+        let target = self
+            .view
+            .readlink(rust_path)
+            .await
+            .map_err(|e| to_errno(&e))?;
         Ok(ReplyData {
             data: Bytes::from(target.into_bytes()),
         })

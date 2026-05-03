@@ -251,8 +251,8 @@ where
 
     let tls_config = build_client_tls_config(
         PolicyServerCertVerifier { policy },
-        &endpoint.cert_der,
-        &endpoint.key_der,
+        endpoint.cert_der.as_ref(),
+        endpoint.key_der.as_ref(),
     )?;
 
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -273,8 +273,8 @@ where
 // ---------------------------------------------------------------------------
 fn build_client_tls_config<P>(
     verifier: PolicyServerCertVerifier<P>,
-    cert_der: &Option<Vec<u8>>,
-    key_der: &Option<Zeroizing<Vec<u8>>>,
+    cert_der: Option<&Vec<u8>>,
+    key_der: Option<&Zeroizing<Vec<u8>>>,
 ) -> Result<rustls::ClientConfig, TransportError>
 where
     P: FingerprintPolicy + std::fmt::Debug + 'static,

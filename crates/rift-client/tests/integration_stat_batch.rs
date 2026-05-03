@@ -11,7 +11,7 @@
 mod common;
 use common as helpers;
 
-use rift_protocol::messages::msg;
+use rift_protocol::messages::{msg, FileType};
 use rift_transport::{
     client_endpoint, connect, AcceptAnyPolicy, RecordingConnection, RiftConnection,
 };
@@ -50,7 +50,6 @@ async fn client_stat_batch_returns_results_in_order() {
     assert_eq!(file1_result.size, b"hello rift".len() as u64);
 
     let file2_result = results[1].as_ref().expect("second result should be Ok");
-    use rift_protocol::messages::FileType;
     assert_eq!(file2_result.file_type, FileType::Directory as i32);
 }
 

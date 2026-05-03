@@ -87,8 +87,10 @@ async fn main() -> Result<()> {
     }
 
     let listen_addr: SocketAddr = server_config.listen_addr.parse()?;
-    let (cert_der, key_der) =
-        rift_server::cert::get_or_create_cert(server_config.cert_path, server_config.key_path)?;
+    let (cert_der, key_der) = rift_server::cert::get_or_create_cert(
+        server_config.cert_path.as_ref(),
+        server_config.key_path.as_ref(),
+    )?;
 
     let fingerprint = rift_transport::cert_fingerprint(&cert_der);
     tracing::info!(addr = %listen_addr, "starting rift-server");

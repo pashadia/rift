@@ -99,9 +99,9 @@ fn async_stat<'a, M: MerkleCache>(
         let root_hash = get_or_compute_merkle_root(&resolved.canonical, &meta, db, chunker).await;
 
         let attrs = if let Some(target) = symlink_target {
-            build_attrs_with_symlink_target(&meta, root_hash, target)
+            build_attrs_with_symlink_target(&meta, &root_hash, target)
         } else {
-            build_attrs(&meta, root_hash)
+            build_attrs(&meta, &root_hash)
         };
 
         StatResult {

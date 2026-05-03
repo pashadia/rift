@@ -70,7 +70,7 @@ pub async fn client_handshake<S: RiftStream>(
                     ))
                 });
             }
-            Some(_) => continue, // skip unexpected frames
+            Some(_) => {} // skip unexpected frames
         }
     }
 }

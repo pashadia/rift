@@ -41,6 +41,8 @@ impl ChunkStore {
     /// If a chunk with the same hash already exists, this is idempotent
     /// (the data is identical).
     pub async fn write_chunk(&self, hash: &[u8; 32], data: &[u8]) -> io::Result<()> {
+        // Write to a temp file first, then rename (atomic on same filesystem)
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = hash_to_path(&self.base_dir, hash);
 
         // Fast path: if chunk already exists with correct size, skip rewrite
@@ -53,6 +55,7 @@ impl ChunkStore {
             // Proceed with rewrite (size mismatch is suspicious).
         }
 
+        // Write to a temp file first, then rename (atomic on same filesystem)
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hash path has no parent"))?;
@@ -60,8 +63,6 @@ impl ChunkStore {
         // Create shard directories if needed
         tokio::fs::create_dir_all(parent).await?;
 
-        // Write to a temp file first, then rename (atomic on same filesystem)
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let tmp_name = format!(
             ".tmp_{}_{}",
             std::process::id(),

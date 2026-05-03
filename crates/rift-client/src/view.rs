@@ -1067,7 +1067,7 @@ mod tests {
     /// Returns (`chunk_hashes`, `root_hash`, `chunk_data_vec`).
     /// Each chunk's hash = blake3(data), root = `MerkleTree::build(hashes)`.
     #[allow(clippy::similar_names)] // chunks_data and chunk_data are intentionally similar
-    fn build_mock_chunks(chunks_data: Vec<Vec<u8>>) -> (Vec<[u8; 32]>, [u8; 32], Vec<ChunkData>) {
+    fn build_mock_chunks(chunks_data: &[Vec<u8>]) -> (Vec<[u8; 32]>, [u8; 32], Vec<ChunkData>) {
         use rift_common::crypto::MerkleTree;
         let chunk_hashes: Vec<[u8; 32]> = chunks_data.iter().map(|d| blake3_of(d)).collect();
         let blake_hashes: Vec<_> = chunk_hashes
@@ -1307,7 +1307,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
         let chunk2_data = vec![0xCCu8; 150];
-        let (chunk_hashes, root_hash, _) = build_mock_chunks(vec![
+        let (chunk_hashes, root_hash, _) = build_mock_chunks(&[
             chunk0_data.clone(),
             chunk1_data.clone(),
             chunk2_data.clone(),
@@ -1420,7 +1420,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data: Vec<u8> = (0u8..200u8).collect();
         let (chunk_hashes, root_hash, _) =
-            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+            build_mock_chunks(&[chunk0_data.clone(), chunk1_data.clone()]);
         let sizes = [100u64, 200];
         let file_size: u64 = sizes.iter().sum(); // 300
 
@@ -1496,7 +1496,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xCCu8; 200];
         let (chunk_hashes, root_hash, _all_chunks) =
-            build_mock_chunks(vec![chunk0_data, chunk1_data.clone()]);
+            build_mock_chunks(&[chunk0_data, chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1591,7 +1591,7 @@ mod tests {
         let chunk1_data = vec![0xBBu8; 200];
         let chunk2_data = vec![0xCCu8; 150];
         let (chunk_hashes, root_hash, all_chunks) =
-            build_mock_chunks(vec![chunk0_data, chunk1_data, chunk2_data]);
+            build_mock_chunks(&[chunk0_data, chunk1_data, chunk2_data]);
         let file_size: u64 = 100 + 200 + 150;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1679,7 +1679,7 @@ mod tests {
         let chunk1_data = vec![0xBBu8; 200];
         let chunk2_data = vec![0xCCu8; 150];
         let (chunk_hashes, root_hash, _all_chunks) =
-            build_mock_chunks(vec![chunk0_data, chunk1_data.clone(), chunk2_data]);
+            build_mock_chunks(&[chunk0_data, chunk1_data.clone(), chunk2_data]);
         let file_size: u64 = 100 + 200 + 150;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1781,7 +1781,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
         let (chunk_hashes, root_hash, _) =
-            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+            build_mock_chunks(&[chunk0_data.clone(), chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
         let root = Uuid::now_v7();
@@ -1851,7 +1851,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
         let (chunk_hashes, root_hash, all_chunks) =
-            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+            build_mock_chunks(&[chunk0_data.clone(), chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
         let root = Uuid::now_v7();
@@ -1922,8 +1922,7 @@ mod tests {
     async fn read_offset_within_second_chunk_returns_correct_bytes() {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data: Vec<u8> = (0u8..=199u8).collect();
-        let (chunk_hashes, root_hash, _) =
-            build_mock_chunks(vec![chunk0_data, chunk1_data.clone()]);
+        let (chunk_hashes, root_hash, _) = build_mock_chunks(&[chunk0_data, chunk1_data.clone()]);
         // sizes: chunk0=100, chunk1=200  →  total=300
         let file_size: u64 = 100 + 200;
 
@@ -3082,7 +3081,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
         let (chunk_hashes, root_hash, all_chunks) =
-            build_mock_chunks(vec![chunk0_data, chunk1_data.clone()]);
+            build_mock_chunks(&[chunk0_data, chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3233,7 +3232,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
         let (chunk_hashes, root_hash, _) =
-            build_mock_chunks(vec![chunk0_data.clone(), chunk1_data.clone()]);
+            build_mock_chunks(&[chunk0_data.clone(), chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
         let root = Uuid::now_v7();
@@ -3341,7 +3340,7 @@ mod tests {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
         let chunk2_data = vec![0xCCu8; 150];
-        let (chunk_hashes, root_hash, all_chunks) = build_mock_chunks(vec![
+        let (chunk_hashes, root_hash, all_chunks) = build_mock_chunks(&[
             chunk0_data.clone(),
             chunk1_data.clone(),
             chunk2_data.clone(),
@@ -4249,7 +4248,7 @@ mod tests {
         let chunk1_data = vec![0xBBu8; 150];
         let chunk2_data = vec![0xCCu8; 200];
         let (chunk_hashes, root_hash, _) =
-            build_mock_chunks(vec![chunk0_data, chunk1_data.clone(), chunk2_data]);
+            build_mock_chunks(&[chunk0_data, chunk1_data.clone(), chunk2_data]);
 
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("cache");

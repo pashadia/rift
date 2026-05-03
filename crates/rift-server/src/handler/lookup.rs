@@ -223,7 +223,7 @@ async fn build_symlink_entry(
             handle,
             attrs: Some(build_attrs_with_symlink_target(
                 meta,
-                root_hash,
+                &root_hash,
                 symlink_target_bytes,
             )),
         })),
@@ -248,7 +248,7 @@ async fn build_regular_entry<M: MerkleCache>(
     LookupResponse {
         result: Some(lookup_response::Result::Entry(LookupResult {
             handle,
-            attrs: Some(build_attrs_with_symlink_target(meta, root_hash, vec![])),
+            attrs: Some(build_attrs_with_symlink_target(meta, &root_hash, vec![])),
         })),
     }
 }

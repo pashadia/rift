@@ -7,7 +7,7 @@ use rift_protocol::messages::{FileAttrs, FileType};
 /// a constant hash is used since they don't have content.
 /// This is used by the delta sync protocol to identify file versions.
 #[must_use]
-pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs {
+pub fn build_attrs(meta: &std::fs::Metadata, root_hash: &Blake3Hash) -> FileAttrs {
     build_attrs_with_symlink_target(meta, root_hash, vec![])
 }
 
@@ -19,7 +19,7 @@ pub fn build_attrs(meta: &std::fs::Metadata, root_hash: Blake3Hash) -> FileAttrs
 #[must_use]
 pub fn build_attrs_with_symlink_target(
     meta: &std::fs::Metadata,
-    root_hash: Blake3Hash,
+    root_hash: &Blake3Hash,
     symlink_target: Vec<u8>,
 ) -> FileAttrs {
     use std::os::unix::fs::MetadataExt as _;
@@ -72,7 +72,7 @@ mod tests {
             FileType::Regular
         };
         let root_hash = sentinel_hash_for_non_file(file_type);
-        build_attrs(meta, root_hash)
+        build_attrs(meta, &root_hash)
     }
 
     #[test]
@@ -109,7 +109,7 @@ mod tests {
 
         let meta = std::fs::metadata(&path).unwrap();
         let expected_hash = Blake3Hash::new(b"test");
-        let attrs = build_attrs(&meta, expected_hash.clone());
+        let attrs = build_attrs(&meta, &expected_hash);
 
         assert_eq!(attrs.file_type, FileType::Regular as i32);
         assert_eq!(attrs.size, 5);
@@ -124,7 +124,7 @@ mod tests {
 
         let meta = std::fs::metadata(&path).unwrap();
         let expected_hash = Blake3Hash::new(b"test");
-        let attrs = build_attrs(&meta, expected_hash.clone());
+        let attrs = build_attrs(&meta, &expected_hash);
 
         assert_eq!(attrs.root_hash, expected_hash.as_bytes().to_vec());
     }
@@ -136,7 +136,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
 
         let meta = std::fs::metadata(&path).unwrap();
-        let attrs = build_attrs(&meta, Blake3Hash::new(b"dummy"));
+        let attrs = build_attrs(&meta, &Blake3Hash::new(b"dummy"));
 
         assert_eq!(attrs.size, 0);
     }

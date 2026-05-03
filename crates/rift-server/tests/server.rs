@@ -191,7 +191,7 @@ fn build_attrs_directory() {
     let meta = std::fs::metadata(&root).unwrap();
     let attrs = rift_server::handler::build_attrs(
         &meta,
-        rift_common::crypto::Blake3Hash::new(b"<directory>"),
+        &rift_common::crypto::Blake3Hash::new(b"<directory>"),
     );
     assert_eq!(attrs.file_type, FileType::Directory as i32);
 }
@@ -3723,10 +3723,10 @@ mod cert_tests {
     fn cert_manager_generates_cert_if_none_exist() {
         let tmp_dir = tempfile::tempdir().unwrap();
 
-        let result = rift_server::cert::get_or_create_cert(
-            Some(tmp_dir.path().join("new.cert")),
-            Some(tmp_dir.path().join("new.key")),
-        );
+        let cert_path = tmp_dir.path().join("new.cert");
+        let key_path = tmp_dir.path().join("new.key");
+
+        let result = rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path));
 
         assert!(
             result.is_ok(),
@@ -3749,12 +3749,11 @@ mod cert_tests {
 
         // First, generate a cert
         let (original_cert, original_key) =
-            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()))
-                .unwrap();
+            rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         // Now read it again
         let (read_cert, read_key) =
-            rift_server::cert::get_or_create_cert(Some(cert_path), Some(key_path)).unwrap();
+            rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         assert_eq!(original_cert, read_cert, "cert should be same on re-read");
         assert_eq!(original_key, read_key, "key should be same on re-read");
@@ -3767,14 +3766,13 @@ mod cert_tests {
 
         // Generate cert
         let (cert, _key) =
-            rift_server::cert::get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()))
-                .unwrap();
+            rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         let fp1 = rift_transport::cert_fingerprint(&cert);
 
         // Re-read and check fingerprint
         let (cert2, _key2) =
-            rift_server::cert::get_or_create_cert(Some(cert_path), Some(key_path)).unwrap();
+            rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         let fp2 = rift_transport::cert_fingerprint(&cert2);
         assert_eq!(fp1, fp2, "fingerprint should be stable across re-reads");
@@ -3795,7 +3793,7 @@ mod cert_tests {
         std::fs::write(&key_path, key_pem).unwrap();
 
         // Should now succeed and return DER bytes
-        let result = rift_server::cert::get_or_create_cert(Some(cert_path), Some(key_path));
+        let result = rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path));
 
         assert!(result.is_ok(), "PEM certificates should now be supported");
         let (cert_der, key_der) = result.unwrap();
@@ -3824,7 +3822,7 @@ mod cert_tests {
         std::fs::write(&cert_path, malformed_cert).unwrap();
         std::fs::write(&key_path, malformed_key).unwrap();
 
-        let result = rift_server::cert::get_or_create_cert(Some(cert_path), Some(key_path));
+        let result = rift_server::cert::get_or_create_cert(Some(&cert_path), Some(&key_path));
 
         assert!(result.is_err(), "should fail with malformed PEM");
         let err = result.unwrap_err().to_string();

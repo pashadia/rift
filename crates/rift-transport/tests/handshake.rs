@@ -3,10 +3,11 @@
 //! All tests use `InMemoryConnection` / `InMemoryListener` so no real QUIC or
 //! TLS is needed — the handshake layer only deals with framed messages.
 
-use rift_protocol::messages::{RiftHello, RiftWelcome};
+use prost::Message as _;
+use rift_protocol::messages::{msg, RiftHello, RiftWelcome};
 use rift_transport::{
     client_handshake, recv_hello, send_welcome, InMemoryListener, RiftConnection, RiftListener,
-    RIFT_PROTOCOL_VERSION,
+    RiftStream, RIFT_PROTOCOL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,9 +46,6 @@ async fn client_handshake_sends_hello_server_can_recv_it() {
     // Client: open stream and send hello (no reply yet — just test send)
     let mut cs = client_conn.open_stream().await.unwrap();
     // Manually send just the hello without waiting for welcome
-    use prost::Message as _;
-    use rift_protocol::messages::msg;
-    use rift_transport::RiftStream;
     let hello = RiftHello {
         protocol_version: RIFT_PROTOCOL_VERSION,
         capabilities: vec![],
@@ -78,9 +76,6 @@ async fn server_send_welcome_client_receives_it() {
     // Client: open stream and receive welcome
     let mut cs = client_conn.open_stream().await.unwrap();
     let received = {
-        use prost::Message as _;
-        use rift_protocol::messages::msg;
-        use rift_transport::RiftStream;
         let (t, p) = cs.recv_frame().await.unwrap().unwrap();
         assert_eq!(t, msg::RIFT_WELCOME);
         RiftWelcome::decode(&p[..]).unwrap()
@@ -168,10 +163,10 @@ async fn recv_hello_on_wrong_message_type_returns_error() {
 
     // Client: inject a STAT_REQUEST (wrong message type) instead of RIFT_HELLO.
     // Empty payload is a valid default protobuf, so if the type check is bypassed
+    // Client: inject a STAT_REQUEST (wrong message type) instead of RIFT_HELLO.
+    // Empty payload is a valid default protobuf, so if the type check is bypassed
     // the decode will succeed — exposing the mutant.
     let mut cs = client_conn.open_stream().await.unwrap();
-    use rift_protocol::messages::msg;
-    use rift_transport::RiftStream;
     cs.send_frame(msg::STAT_REQUEST, b"").await.unwrap();
     cs.finish_send().await.unwrap();
 
@@ -204,8 +199,6 @@ async fn recv_hello_on_wrong_message_type_with_garbage_payload_returns_error() {
     });
 
     let mut cs = client_conn.open_stream().await.unwrap();
-    use rift_protocol::messages::msg;
-    use rift_transport::RiftStream;
     cs.send_frame(msg::STAT_REQUEST, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
         .await
         .unwrap();
@@ -229,8 +222,6 @@ async fn client_handshake_rejects_wrong_response_type() {
         // Send wrong message type instead of RIFT_WELCOME.
         // Empty payload is a valid default protobuf, so if the type check is
         // bypassed the decode will succeed — exposing the mutant.
-        use rift_protocol::messages::msg;
-        use rift_transport::RiftStream;
         s.send_frame(msg::STAT_REQUEST, b"").await.unwrap();
         s.finish_send().await.unwrap();
     });

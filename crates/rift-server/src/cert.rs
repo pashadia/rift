@@ -26,10 +26,10 @@ pub fn default_cert_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 ///
 /// Returns `(cert_der, key_der)` where both are DER-encoded bytes.
 pub fn get_or_create_cert(
-    cert_path: Option<std::path::PathBuf>,
-    key_path: Option<std::path::PathBuf>,
+    cert_path: Option<&std::path::PathBuf>,
+    key_path: Option<&std::path::PathBuf>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let (cert_path, key_path) = match (&cert_path, &key_path) {
+    let (cert_path, key_path) = match (cert_path, key_path) {
         (Some(c), Some(k)) => (c.clone(), k.clone()),
         (None, None) => {
             let (default_cert, default_key) = default_cert_paths();
@@ -52,17 +52,16 @@ pub fn get_or_create_cert(
         }
         _ => {
             // Only one exists - this is an error
-            if !cert_exists {
-                anyhow::bail!(
-                    "key file exists but cert file is missing: {}",
-                    cert_path.display()
-                );
-            } else {
+            if cert_exists {
                 anyhow::bail!(
                     "cert file exists but key file is missing: {}",
                     key_path.display()
                 );
             }
+            anyhow::bail!(
+                "key file exists but cert file is missing: {}",
+                cert_path.display()
+            );
         }
     }
 }
@@ -292,7 +291,7 @@ mod tests {
         let cert_path = tmp_dir.path().join("test.cert");
         let key_path = tmp_dir.path().join("test.key");
 
-        get_or_create_cert(Some(cert_path), Some(key_path.clone())).unwrap();
+        get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -307,7 +306,7 @@ mod tests {
         let cert_path = tmp_dir.path().join("test.cert");
         let key_path = tmp_dir.path().join("test.key");
 
-        let result = get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone()));
+        let result = get_or_create_cert(Some(&cert_path), Some(&key_path));
         assert!(result.is_ok());
         assert!(cert_path.exists());
         assert!(key_path.exists());
@@ -320,11 +319,10 @@ mod tests {
         let key_path = tmp_dir.path().join("test.key");
 
         // Create first time
-        let (cert1, key1) =
-            get_or_create_cert(Some(cert_path.clone()), Some(key_path.clone())).unwrap();
+        let (cert1, key1) = get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         // Create second time
-        let (cert2, key2) = get_or_create_cert(Some(cert_path), Some(key_path)).unwrap();
+        let (cert2, key2) = get_or_create_cert(Some(&cert_path), Some(&key_path)).unwrap();
 
         assert_eq!(cert1, cert2);
         assert_eq!(key1, key2);
