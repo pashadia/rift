@@ -30,7 +30,7 @@ pub fn encode_message(type_id: u8, payload: &[u8], buf: &mut BytesMut) -> Result
         return Err(CodecError::MessageTooLarge(payload.len()));
     }
 
-    encode_varint(type_id as u64, buf);
+    encode_varint(type_id.into(), buf);
     encode_varint(payload.len() as u64, buf);
     buf.put_slice(payload);
 
@@ -93,7 +93,7 @@ fn decode_varint_peek(buf: &mut &[u8]) -> Result<Option<u64>, CodecError> {
             return Ok(None);
         }
         let byte = buf[i];
-        value |= ((byte & 0x7F) as u64) << shift;
+        value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             *buf = &buf[i + 1..];
             return Ok(Some(value));
@@ -114,7 +114,7 @@ fn decode_varint(buf: &mut BytesMut) -> Result<Option<u64>, CodecError> {
             return Ok(None);
         }
         let byte = buf[i];
-        value |= ((byte & 0x7F) as u64) << shift;
+        value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             buf.advance(i + 1);
             return Ok(Some(value));

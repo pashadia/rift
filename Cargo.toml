@@ -40,6 +40,7 @@ cognitive_complexity = "warn"
 similar_names = "warn"
 fn_params_excessive_bools = "warn"
 unreadable_literal = "warn"
+cast_lossless = "warn"
 
 # API design & idioms
 must_use_candidate = "warn"

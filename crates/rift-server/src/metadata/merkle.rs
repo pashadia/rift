@@ -191,7 +191,7 @@ impl Database {
                 hash_bytes,
                 info.offset as i64,
                 info.length as i64,
-                info.chunk_index as i64,
+                info.chunk_index.into(),
             ));
         }
 

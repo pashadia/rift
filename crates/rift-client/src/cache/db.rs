@@ -214,7 +214,7 @@ impl FileCache {
             .iter()
             .map(|c| {
                 (
-                    c.index as i64,
+                    c.index.into(),
                     c.offset as i64,
                     c.length as i64,
                     c.hash.to_vec(),

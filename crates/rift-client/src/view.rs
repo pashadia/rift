@@ -2488,7 +2488,7 @@ mod tests {
 
         let n = 67u32;
         let chunk_size: u64 = 128 * 1024; // 128 KB per chunk
-        let file_size = chunk_size * n as u64;
+        let file_size = chunk_size * u64::from(n);
 
         // Build the Merkle tree from actual chunk-data hashes
         let chunk_data_vecs: Vec<Vec<u8>> = (0u8..)

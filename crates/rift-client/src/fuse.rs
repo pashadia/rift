@@ -194,7 +194,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
 
         let data = self
             .view
-            .read(path, offset, size as u64, None)
+            .read(path, offset, size.into(), None)
             .await
             .map_err(to_errno)?;
 
