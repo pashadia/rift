@@ -709,7 +709,7 @@ mod merkle_child_tests {
         let hash = Blake3Hash::new(b"chunk");
         let child = MerkleChild::Leaf {
             hash: hash.clone(),
-            length: 131072,
+            length: 131_072,
             chunk_index: 7,
         };
         let encoded = postcard::to_allocvec(&child).unwrap();
@@ -721,7 +721,7 @@ mod merkle_child_tests {
                 chunk_index,
             } => {
                 assert_eq!(h, hash);
-                assert_eq!(length, 131072);
+                assert_eq!(length, 131_072);
                 assert_eq!(chunk_index, 7);
             }
             MerkleChild::Subtree(_) => panic!("expected Leaf variant"),

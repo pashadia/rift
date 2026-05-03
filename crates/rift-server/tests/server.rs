@@ -3391,7 +3391,7 @@ mod merkle_drill_tests {
         let root = temp_dir.path().to_path_buf();
         let file_path = root.join("large_file.bin");
         // Generate ~20KB of pseudo-random data — enough for 64+ chunks with TEST_CHUNKER
-        let mut rng_state: u64 = 0x123456789ABCDEF0u64;
+        let mut rng_state: u64 = 0x1234_5678_9ABC_DEF0_u64;
         let mut content: Vec<u8> = Vec::with_capacity(20 * 1024);
         while content.len() < 20 * 1024 {
             rng_state ^= rng_state << 13;

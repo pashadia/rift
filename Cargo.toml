@@ -39,6 +39,7 @@ excessive_nesting = "warn"
 cognitive_complexity = "warn"
 similar_names = "warn"
 fn_params_excessive_bools = "warn"
+unreadable_literal = "warn"
 
 # API design & idioms
 must_use_candidate = "warn"

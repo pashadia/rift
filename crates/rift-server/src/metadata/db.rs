@@ -320,7 +320,7 @@ mod tests {
         let result = db.call(|conn| {
             conn.execute(
                 "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
-                ("test.txt", vec![0u8; 32], 0i64, 131072i64, 0i64),
+                ("test.txt", vec![0u8; 32], 0i64, 131_072_i64, 0i64),
             )
         }).await;
         assert!(
@@ -340,7 +340,7 @@ mod tests {
         db.call(move |conn| {
             conn.execute(
                 "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (path2, chunk_hash2, 0i64, 131072i64, 0i64),
+                (path2, chunk_hash2, 0i64, 131_072_i64, 0i64),
             )
         }).await.unwrap();
 
@@ -354,7 +354,7 @@ mod tests {
 
         assert_eq!(result.0, vec![0xCD; 32]);
         assert_eq!(result.1, 0);
-        assert_eq!(result.2, 131072);
+        assert_eq!(result.2, 131_072);
         assert_eq!(result.3, 0);
     }
 

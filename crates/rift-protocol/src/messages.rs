@@ -105,8 +105,8 @@ mod tests {
                 read_only: false,
                 cdc_params: Some(CdcParams {
                     min_chunk_size: 32768,
-                    target_chunk_size: 131072,
-                    max_chunk_size: 524288,
+                    target_chunk_size: 131_072,
+                    max_chunk_size: 524_288,
                 }),
             }),
         };
@@ -311,7 +311,7 @@ mod tests {
             expected_root: vec![0xAB; 32],
             chunks: vec![ChunkInfo {
                 index: 0,
-                length: 131072,
+                length: 131_072,
                 hash: vec![0xCD; 32],
             }],
         };
@@ -403,7 +403,7 @@ mod tests {
         let msg = BlockHeader {
             chunk: Some(ChunkInfo {
                 index: 7,
-                length: 131072,
+                length: 131_072,
                 hash: vec![0xAB; 32],
             }),
         };
@@ -411,7 +411,7 @@ mod tests {
         let decoded = BlockHeader::decode(encoded.as_slice()).unwrap();
         let chunk = decoded.chunk.unwrap();
         assert_eq!(chunk.index, 7);
-        assert_eq!(chunk.length, 131072);
+        assert_eq!(chunk.length, 131_072);
         assert_eq!(chunk.hash, vec![0xAB; 32]);
     }
 
@@ -464,7 +464,7 @@ mod tests {
                 MerkleChildProto {
                     child_type: MerkleChildType::MerkleChildLeaf as i32,
                     hash: vec![0xBB; 32],
-                    length: 131072,
+                    length: 131_072,
                     chunk_index: 7,
                 },
             ],
@@ -482,7 +482,7 @@ mod tests {
             decoded.children[1].child_type,
             MerkleChildType::MerkleChildLeaf as i32
         );
-        assert_eq!(decoded.children[1].length, 131072);
+        assert_eq!(decoded.children[1].length, 131_072);
         assert_eq!(decoded.children[1].chunk_index, 7);
     }
 
@@ -494,7 +494,7 @@ mod tests {
                 chunks: vec![
                     ChunkInfo {
                         index: 768,
-                        length: 131072,
+                        length: 131_072,
                         hash: vec![0xAB; 32],
                     },
                     ChunkInfo {
@@ -531,7 +531,7 @@ mod tests {
             }),
             changed_chunks: vec![ChunkInfo {
                 index: 3,
-                length: 131072,
+                length: 131_072,
                 hash: vec![0xAB; 32],
             }],
             sequence: 42,

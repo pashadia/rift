@@ -154,7 +154,7 @@ Compared to larger chunks (512 KB avg):
 name = "home"
 path = "/home"
 cdc_min = 32768      # 32 KB - aggressive delta sync
-cdc_avg = 131072     # 128 KB
+cdc_avg = 131_072     # 128 KB
 cdc_max = 524288     # 512 KB
 
 [[share]]

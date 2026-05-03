@@ -1573,11 +1573,11 @@ mod tests {
         assert_eq!(manifest.chunks.len(), 2);
         assert_eq!(manifest.chunks[0].index, 0);
         assert_eq!(manifest.chunks[1].index, 1);
-        // Offsets must be position-based: [0, 100], NOT [0, 131072]
+        // Offsets must be position-based: [0, 100], NOT [0, 131_072]
         assert_eq!(manifest.chunks[0].offset, 0, "1st leaf offset must be 0");
         assert_eq!(
             manifest.chunks[1].offset, 100,
-            "2nd leaf offset must be 100 (position-based), not 131072 (chunk_index × 128KB)"
+            "2nd leaf offset must be 100 (position-based), not 131_072 (chunk_index × 128KB)"
         );
     }
 
@@ -1917,7 +1917,7 @@ mod tests {
     /// Read offset=120, length=50 lands entirely inside chunk 1 (byte range 100..300).
     ///
     /// Correct:  `start_offset` = 120 - 100 = 20  →  `chunk1_data`[20..70]
-    /// Broken:   `start_offset` = 120 % 131072 = 120 →  `chunk1_data`[120..170]  (wrong bytes)
+    /// Broken:   `start_offset` = 120 % `131_072` = 120 →  `chunk1_data`[120..170]  (wrong bytes)
     #[tokio::test]
     async fn read_offset_within_second_chunk_returns_correct_bytes() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -3680,7 +3680,7 @@ mod tests {
 
         // stat_batch returns attrs with realistic uid/gid/mtime
         let recent = prost_types::Timestamp {
-            seconds: 1700000000,
+            seconds: 1_700_000_000,
             nanos: 0,
         };
         remote
@@ -3688,7 +3688,7 @@ mod tests {
                 file_type: FileType::Symlink as i32,
                 symlink_target: b"../../foo".to_vec(),
                 size: 10,
-                mode: 0o120777, // symlink mode with S_IFLNK
+                mode: 0o120_777, // symlink mode with S_IFLNK
                 uid: 1000,
                 gid: 1000,
                 mtime: Some(recent),
@@ -3718,7 +3718,7 @@ mod tests {
             "symlink gid should come from stat_batch, not Default (0)"
         );
         assert_eq!(
-            entry.attrs.mode, 0o120777,
+            entry.attrs.mode, 0o120_777,
             "symlink mode should come from stat_batch, not hardcoded 0o777"
         );
         assert!(
@@ -3767,9 +3767,9 @@ mod tests {
                     symlink_target: b"../../foo".to_vec(),
                     uid: 1000,
                     gid: 1000,
-                    mode: 0o120777,
+                    mode: 0o120_777,
                     mtime: Some(prost_types::Timestamp {
-                        seconds: 1700000000,
+                        seconds: 1_700_000_000,
                         nanos: 0,
                     }),
                     ..make_file_attrs(9, [0x01; 32])
@@ -3779,9 +3779,9 @@ mod tests {
                     symlink_target: b"/usr/bin/python3".to_vec(),
                     uid: 1000,
                     gid: 1000,
-                    mode: 0o120777,
+                    mode: 0o120_777,
                     mtime: Some(prost_types::Timestamp {
-                        seconds: 1700000000,
+                        seconds: 1_700_000_000,
                         nanos: 0,
                     }),
                     ..make_file_attrs(15, [0x02; 32])
@@ -3867,7 +3867,7 @@ mod tests {
             symlink_target: b"../../foo".to_vec(),
             uid: 1000,
             gid: 1000,
-            mode: 0o120777,
+            mode: 0o120_777,
             ..make_file_attrs(9, [0x01; 32])
         };
         let file_attrs = make_file_attrs(100, [0x02; 32]);
