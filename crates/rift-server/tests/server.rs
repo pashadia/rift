@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 //! Tests for rift-server.
 //!
 //! Covers two levels:
@@ -2573,7 +2573,7 @@ async fn server_read_multiple_chunks_at_high_offset_returns_correct_data() {
             pattern
                 .into_bytes()
                 .into_iter()
-                .chain(std::iter::repeat_n(i as u8, 24))
+                .chain(std::iter::repeat_n(u8::try_from(i).unwrap(), 24))
         })
         .collect();
     std::fs::write(root.join("many_chunks.bin"), &content).unwrap();
@@ -3141,7 +3141,7 @@ async fn setup_multi_chunk_file() -> (TempDir, PathBuf, Vec<u8>, usize) {
             pattern
                 .into_bytes()
                 .into_iter()
-                .chain(std::iter::repeat_n(i as u8, 16))
+                .chain(std::iter::repeat_n(u8::try_from(i).unwrap(), 16))
         })
         .collect();
     std::fs::write(root.join("multichunk.bin"), &content).unwrap();

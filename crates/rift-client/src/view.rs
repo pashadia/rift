@@ -893,7 +893,7 @@ impl<R: RemoteShare> RiftShareView<R> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::too_many_lines)]
+    #![allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     use super::*;
     use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
     use async_trait::async_trait;
@@ -2171,17 +2171,17 @@ mod tests {
         let remote = Arc::new(MockRemote::new());
 
         let n = 21;
-        let leaf_hashes: Vec<Blake3Hash> = (0..n).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let leaf_hashes: Vec<Blake3Hash> = (0u8..).take(n).map(|b| Blake3Hash::new(&[b])).collect();
         let tree = MerkleTree::new(64);
         let root_hash = tree.build(&leaf_hashes);
 
         let mut children = Vec::new();
-        for i in 0..n {
+        for (i, leaf_hash) in leaf_hashes.iter().enumerate() {
             children.push(MerkleChildInfo {
                 is_subtree: false,
-                hash: leaf_hashes[i as usize].as_bytes().to_vec(),
+                hash: leaf_hash.as_bytes().to_vec(),
                 length: 100,
-                chunk_index: i,
+                chunk_index: u32::try_from(i).expect("chunk index fits in u32"),
             });
         }
 
@@ -2491,8 +2491,10 @@ mod tests {
         let file_size = chunk_size * n as u64;
 
         // Build the Merkle tree from actual chunk-data hashes
-        let chunk_data_vecs: Vec<Vec<u8>> =
-            (0..n).map(|i| vec![i as u8; chunk_size as usize]).collect();
+        let chunk_data_vecs: Vec<Vec<u8>> = (0u8..)
+            .take(n as usize)
+            .map(|b| vec![b; chunk_size as usize])
+            .collect();
         let leaf_hashes: Vec<Blake3Hash> = chunk_data_vecs
             .iter()
             .map(|data| Blake3Hash::new(data))
@@ -2571,12 +2573,12 @@ mod tests {
 
         // Build chunk data for read_chunks
         let mut chunks = Vec::new();
-        for i in 0..n {
+        for i in 0u32..n {
             chunks.push(ChunkData {
                 index: i,
                 length: chunk_size,
                 hash: *leaf_hashes[i as usize].as_bytes(),
-                data: Bytes::from(vec![i as u8; chunk_size as usize]),
+                data: Bytes::from(vec![u8::try_from(i).unwrap(); chunk_size as usize]),
             });
         }
 
@@ -2608,7 +2610,10 @@ mod tests {
         for i in 0..n as usize {
             let start = i * chunk_size as usize;
             let end = start + chunk_size as usize;
-            assert_eq!(data[start..end], vec![i as u8; chunk_size as usize]);
+            assert_eq!(
+                data[start..end],
+                vec![u8::try_from(i).unwrap(); chunk_size as usize]
+            );
         }
     }
 

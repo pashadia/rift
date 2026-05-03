@@ -304,7 +304,8 @@ impl FileCache {
                     let mut hash = [0u8; 32];
                     hash.copy_from_slice(&hash_bytes);
                     Ok(ChunkInfo {
-                        index: row.get::<_, i64>(0)? as u32,
+                        index: u32::try_from(row.get::<_, i64>(0)?)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?,
                         offset: row.get::<_, i64>(1)? as u64,
                         length: row.get::<_, i64>(2)? as u64,
                         hash,
@@ -395,14 +396,17 @@ impl FileCache {
             return Ok(vec![]);
         }
 
-        let mut result = Vec::with_capacity((end - offset) as usize);
+        let mut result =
+            Vec::with_capacity(usize::try_from(end - offset).expect("byte range fits in usize"));
         let mut missing = Vec::new();
         let mut corrupted = Vec::new();
 
         for chunk in &chunks[first_idx..=last_idx] {
             match self.get_chunk(&chunk.hash).await {
                 Ok(Some(data)) => {
-                    if data.len() != chunk.length as usize {
+                    if data.len()
+                        != usize::try_from(chunk.length).expect("chunk length fits in usize")
+                    {
                         tracing::warn!(
                             "cached chunk length mismatch: expected {}, got {}",
                             chunk.length,
@@ -420,8 +424,10 @@ impl FileCache {
                         // Determine the slice of this chunk that falls within [offset, end)
                         let chunk_start = chunk.offset;
                         let chunk_end = chunk_start.saturating_add(chunk.length);
-                        let slice_start = offset.saturating_sub(chunk_start) as usize;
-                        let slice_end = (end.min(chunk_end) - chunk_start) as usize;
+                        let slice_start = usize::try_from(offset.saturating_sub(chunk_start))
+                            .expect("byte offset fits in usize");
+                        let slice_end = usize::try_from(end.min(chunk_end) - chunk_start)
+                            .expect("byte offset fits in usize");
                         result.extend_from_slice(&data[slice_start..slice_end]);
                     }
                 }
@@ -654,11 +660,11 @@ mod tests {
         let file_size: u64 = chunk_sizes.iter().sum(); // 1000
 
         // Build chunk data with distinct patterns per chunk
-        let chunk0_data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
-        let chunk1_data: Vec<u8> = (0..200).map(|i| ((i + 100) % 256) as u8).collect();
-        let chunk2_data: Vec<u8> = (0..150).map(|i| ((i + 200) % 256) as u8).collect();
-        let chunk3_data: Vec<u8> = (0..300).map(|i| ((i + 300) % 256) as u8).collect();
-        let chunk4_data: Vec<u8> = (0..250).map(|i| ((i + 400) % 256) as u8).collect();
+        let chunk0_data: Vec<u8> = (0u8..100).collect();
+        let chunk1_data: Vec<u8> = (0u8..=255).cycle().skip(100).take(200).collect();
+        let chunk2_data: Vec<u8> = (0u8..=255).cycle().skip(200).take(150).collect();
+        let chunk3_data: Vec<u8> = (0u8..=255).cycle().skip(300).take(300).collect();
+        let chunk4_data: Vec<u8> = (0u8..=255).cycle().skip(400).take(250).collect();
 
         let all_chunk_data = [
             &chunk0_data,
@@ -688,10 +694,10 @@ mod tests {
             .await
             .unwrap();
 
-        let expected: Vec<u8> = (150..200).map(|i| ((i + 100) % 256) as u8).collect();
+        let expected: Vec<u8> = (0u8..=255).cycle().skip(250).take(50).collect();
         assert_eq!(
             result, expected,
-            "bytes at file offset 250..300 should match chunk1[150..200]"
+            "reconstruct_range_single_chunk_from_middle: expected bytes 150..200 of chunk 1"
         );
     }
 
@@ -707,11 +713,11 @@ mod tests {
         let file_size: u64 = chunk_sizes.iter().sum(); // 1000
 
         // Build chunk data with distinct patterns per chunk
-        let chunk0_data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
-        let chunk1_data: Vec<u8> = (0..200).map(|i| ((i + 100) % 256) as u8).collect();
-        let chunk2_data: Vec<u8> = (0..150).map(|i| ((i + 200) % 256) as u8).collect();
-        let chunk3_data: Vec<u8> = (0..300).map(|i| ((i + 300) % 256) as u8).collect();
-        let chunk4_data: Vec<u8> = (0..250).map(|i| ((i + 400) % 256) as u8).collect();
+        let chunk0_data: Vec<u8> = (0u8..100).collect();
+        let chunk1_data: Vec<u8> = (0u8..=255).cycle().skip(100).take(200).collect();
+        let chunk2_data: Vec<u8> = (0u8..=255).cycle().skip(200).take(150).collect();
+        let chunk3_data: Vec<u8> = (0u8..=255).cycle().skip(300).take(300).collect();
+        let chunk4_data: Vec<u8> = (0u8..=255).cycle().skip(400).take(250).collect();
 
         let all_chunk_data = [
             &chunk0_data,

@@ -149,7 +149,7 @@ mod tests {
     async fn get_or_compute_merkle_root_uses_streaming() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("merkle_stream.txt");
-        let content: Vec<u8> = (0..300_000).map(|i| (i % 256) as u8).collect();
+        let content: Vec<u8> = (0u8..=255).cycle().take(300_000).collect();
         std::fs::write(&file, &content).unwrap();
 
         let meta = std::fs::metadata(&file).unwrap();

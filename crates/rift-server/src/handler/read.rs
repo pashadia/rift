@@ -92,7 +92,7 @@ async fn cache_merkle_tree<M: MerkleCache>(
     let mtime_ns = match file_meta.modified() {
         Ok(t) => t
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
+            .map(|d| u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64"))
             .unwrap_or(0),
         Err(_) => 0,
     };
@@ -462,6 +462,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_truncation)]
     use super::*;
 
     use prost::Message;
@@ -843,7 +844,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
         let file = share.join("cold_stream.txt");
-        let content: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        let content: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
         std::fs::write(&file, &content).unwrap();
 
         let handle_db = HandleDatabase::new();
@@ -937,7 +938,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let share = tmp.path().to_path_buf();
         let file = share.join("cold_partial.txt");
-        let content: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        let content: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
         std::fs::write(&file, &content).unwrap();
 
         let handle_db = HandleDatabase::new();

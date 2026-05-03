@@ -1110,6 +1110,7 @@ mod merkle_ext_tests {
 
 #[cfg(test)]
 mod merkle_cache_tests {
+    #![allow(clippy::cast_possible_truncation)]
     use super::*;
 
     #[test]
@@ -1132,7 +1133,7 @@ mod merkle_cache_tests {
     fn build_with_cache_two_to_63_leaves_single_level() {
         let tree = MerkleTree::default();
         for n in [2, 5, 32, 63] {
-            let leaves: Vec<_> = (0..n).map(|i| Blake3Hash::new(&[i as u8])).collect();
+            let leaves: Vec<_> = (0u8..).take(n).map(|b| Blake3Hash::new(&[b])).collect();
             let (root, cache) = tree.build_with_cache(&leaves);
             assert_eq!(
                 cache.len(),
@@ -1147,7 +1148,7 @@ mod merkle_cache_tests {
     #[test]
     fn build_with_cache_64_leaves() {
         let tree = MerkleTree::default();
-        let leaves: Vec<_> = (0..64).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let leaves: Vec<_> = (0u8..64).map(|b| Blake3Hash::new(&[b])).collect();
         let (root, cache) = tree.build_with_cache(&leaves);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache[&root].len(), 64);
@@ -1156,7 +1157,7 @@ mod merkle_cache_tests {
     #[test]
     fn build_with_cache_65_leaves_two_intermediates() {
         let tree = MerkleTree::default();
-        let leaves: Vec<_> = (0..65).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let leaves: Vec<_> = (0u8..65).map(|b| Blake3Hash::new(&[b])).collect();
         let (root, cache) = tree.build_with_cache(&leaves);
         assert_eq!(cache.len(), 3);
         assert_eq!(cache[&root].len(), 2);
@@ -1202,7 +1203,7 @@ mod merkle_cache_tests {
     #[test]
     fn build_with_cache_leaf_children_have_correct_index() {
         let tree = MerkleTree::default();
-        let leaves: Vec<_> = (0..5).map(|i| Blake3Hash::new(&[i as u8])).collect();
+        let leaves: Vec<_> = (0u8..5).map(|b| Blake3Hash::new(&[b])).collect();
         let (_, cache) = tree.build_with_cache(&leaves);
         let leaf_children: Vec<_> = cache
             .values()
@@ -1260,12 +1261,13 @@ mod merkle_cache_tests {
 
 #[cfg(test)]
 mod merkle_offset_tests {
+    #![allow(clippy::cast_possible_truncation)]
     use super::*;
 
     #[test]
     fn build_with_offsets_returns_leaf_infos() {
         let tree = MerkleTree::default();
-        let data: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 100]).collect();
+        let data: Vec<Vec<u8>> = (0u8..5).map(|b| vec![b; 100]).collect();
         let leaf_hashes: Vec<Blake3Hash> = data.iter().map(|d| Blake3Hash::new(d)).collect();
         let chunk_boundaries: Vec<(usize, usize)> =
             vec![(0, 100), (100, 100), (200, 100), (300, 100), (400, 100)];
@@ -1314,7 +1316,7 @@ mod verify_node_tests {
     use super::*;
 
     fn test_hashes(count: usize) -> Vec<Blake3Hash> {
-        (0..count).map(|i| Blake3Hash::new(&[i as u8])).collect()
+        (0u8..).take(count).map(|b| Blake3Hash::new(&[b])).collect()
     }
 
     fn extract_hashes(children: &[MerkleChild]) -> Vec<Blake3Hash> {
@@ -1563,7 +1565,7 @@ mod streaming_chunker_tests {
 
     #[tokio::test]
     async fn chunk_stream_random_data_matches_batch() {
-        let data: Vec<u8> = (0..500_000).map(|i| i as u8).collect();
+        let data: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
         let chunker = Chunker::default();
 
         let batch_boundaries = chunker.chunk(&data);

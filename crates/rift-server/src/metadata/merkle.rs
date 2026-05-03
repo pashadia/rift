@@ -46,8 +46,9 @@ impl Database {
         let mtime_ns = meta
             .modified()
             .map(|t| {
-                t.duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos() as u64)
+                t.duration_since(UNIX_EPOCH).map_or(0, |d| {
+                    u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64")
+                })
             })
             .unwrap_or(0);
 
@@ -408,6 +409,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_truncation)]
     use super::*;
     use rift_common::crypto::{Blake3Hash, LeafInfo, MerkleTree};
     use std::collections::HashMap;
