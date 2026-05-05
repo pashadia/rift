@@ -55,9 +55,6 @@ fn verify_signature(key: &[u8; 32], handle: &Uuid, sig: &[u8]) -> bool {
 /// Write handle and its HMAC signature as xattrs on the canonical path.
 /// Logs a warning on unexpected failures, silently ignores expected ones (ENOTSUP).
 fn write_handle_xattr(key: &[u8; 32], canonical: &Path, handle: Uuid) {
-    if !canonical.is_file() {
-        return;
-    }
     if let Err(e) = xattr::set(canonical, RIFT_HANDLE_XATTR, handle.as_bytes()) {
         if !is_expected_xattr_failure(&e) {
             tracing::warn!(path = %canonical.display(), error = %e, "failed to write handle xattr");
@@ -264,15 +261,6 @@ impl HandleDatabase {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
-    }
-}
-
-impl Clone for HandleDatabase {
-    fn clone(&self) -> Self {
-        Self {
-            map: self.map.clone(),
-            signing_key: Self::generate_key(), // new random key for cloned instance
-        }
     }
 }
 

@@ -279,7 +279,7 @@ fn lookup_stored_path(handle: &Uuid, handle_db: &HandleDatabase) -> anyhow::Resu
     match handle_db.get_path(handle) {
         Some(path) => Ok(path),
         None => {
-            tracing::warn!("handle not found in database");
+            tracing::info!("handle not found in database (client may have stale cache)");
             anyhow::bail!("invalid handle: not found");
         }
     }
