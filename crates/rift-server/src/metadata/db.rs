@@ -92,9 +92,50 @@ impl Database {
     }
 }
 
+/// Summary of a cached Merkle entry from the database.
+///
+/// Used by the background integrity check to compare
+/// DB state against current filesystem metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    /// File path as stored in the database (may not match canonical form).
+    pub path: String,
+    /// File modification time in nanoseconds since Unix epoch.
+    pub mtime_ns: u64,
+    /// File size in bytes.
+    pub file_size: u64,
+}
+
+impl Database {
+    /// List all cached Merkle entries from the database.
+    ///
+    /// Returns `(path, mtime_ns, file_size)` for every row in
+    /// the `merkle_cache` table. Used by the background integrity
+    /// check to identify stale, conflicting, or orphaned entries.
+    pub async fn list_cached_entries(&self) -> SqliteResult<Vec<CacheEntry>> {
+        self.call(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT file_path, mtime_ns, file_size FROM merkle_cache")?;
+            let rows = stmt.query_map([], |row| {
+                let path: String = row.get(0)?;
+                let mtime_ns: i64 = row.get(1)?;
+                let file_size: i64 = row.get(2)?;
+                Ok(CacheEntry {
+                    path,
+                    mtime_ns: mtime_ns as u64,
+                    file_size: file_size as u64,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_common::crypto::Blake3Hash;
 
     #[tokio::test]
     async fn database_creates_schema() {
@@ -356,6 +397,96 @@ mod tests {
         assert_eq!(result.1, 0);
         assert_eq!(result.2, 131_072);
         assert_eq!(result.3, 0);
+    }
+
+    #[tokio::test]
+    async fn list_cached_entries_returns_empty_for_fresh_db() {
+        let db = Database::open_in_memory().await.unwrap();
+        let entries = db.list_cached_entries().await.unwrap();
+        assert!(entries.is_empty(), "fresh DB should have no entries");
+    }
+
+    #[tokio::test]
+    async fn list_cached_entries_returns_entries_after_put() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime_ns = u64::try_from(
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .expect("timestamp nanos fit in u64");
+        let file_size = meta.len();
+
+        let root = Blake3Hash::new(b"test_root");
+        let leaf = Blake3Hash::new(b"test_leaf");
+        db.put_merkle(
+            &file_path,
+            mtime_ns,
+            file_size,
+            &root,
+            std::slice::from_ref(&leaf),
+        )
+        .await
+        .unwrap();
+
+        let entries = db.list_cached_entries().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, file_path.to_string_lossy().to_string());
+        assert_eq!(entries[0].mtime_ns, mtime_ns);
+        assert_eq!(entries[0].file_size, file_size);
+    }
+
+    #[tokio::test]
+    async fn list_cached_entries_returns_multiple_entries() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let file_a = temp_dir.path().join("a.txt");
+        let file_b = temp_dir.path().join("b.txt");
+        std::fs::write(&file_a, b"aaa").unwrap();
+        std::fs::write(&file_b, b"bbbb").unwrap();
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+
+        let meta_a = std::fs::metadata(&file_a).unwrap();
+        let mtime_a = u64::try_from(
+            meta_a
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .expect("timestamp nanos fit in u64");
+
+        let meta_b = std::fs::metadata(&file_b).unwrap();
+        let mtime_b = u64::try_from(
+            meta_b
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .expect("timestamp nanos fit in u64");
+
+        db.put_merkle(&file_a, mtime_a, 3, &root, std::slice::from_ref(&leaf))
+            .await
+            .unwrap();
+        db.put_merkle(&file_b, mtime_b, 4, &root, std::slice::from_ref(&leaf))
+            .await
+            .unwrap();
+
+        let entries = db.list_cached_entries().await.unwrap();
+        assert_eq!(entries.len(), 2);
     }
 
     #[tokio::test]
