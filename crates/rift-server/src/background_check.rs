@@ -176,14 +176,13 @@ pub async fn run_background_check(
 }
 
 /// Extract `mtime_ns` and `file_size` from metadata.
-/// Returns (`mtime_ns`, `file_size`).
-fn extract_file_metadata(meta: &std::fs::Metadata) -> (u64, u64) {
+/// Returns (`mtime_ns`, `file_size`). `mtime_ns` is `Some(ns)` if available.
+fn extract_file_metadata(meta: &std::fs::Metadata) -> (Option<u64>, u64) {
     let mtime_ns = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
-        .unwrap_or(0);
+        .and_then(|d| u64::try_from(d.as_nanos()).ok());
     let file_size = meta.len();
     (mtime_ns, file_size)
 }
@@ -192,7 +191,7 @@ fn extract_file_metadata(meta: &std::fs::Metadata) -> (u64, u64) {
 async fn check_cache_status(
     canonical: &Path,
     db: &Database,
-    mtime_ns: u64,
+    mtime_ns: Option<u64>,
     file_size: u64,
 ) -> Option<CacheStatus> {
     match db.cache_status(canonical, mtime_ns, file_size).await {
@@ -346,7 +345,9 @@ mod tests {
         .unwrap_or(0);
         let size_a = meta_a.len();
         assert_eq!(
-            db.cache_status(&file_a, mtime_a, size_a).await.unwrap(),
+            db.cache_status(&file_a, Some(mtime_a), size_a)
+                .await
+                .unwrap(),
             CacheStatus::Complete,
             "file a should be cached after background check"
         );
@@ -366,8 +367,8 @@ mod tests {
         let leaf = Blake3Hash::new(b"wrong_leaf");
         db.put_merkle(
             &file_path,
-            0,   // wrong mtime
-            999, // wrong size
+            Some(0), // wrong mtime
+            999,     // wrong size
             &root,
             std::slice::from_ref(&leaf),
         )
@@ -418,7 +419,7 @@ mod tests {
 
         db.put_tree(
             &file_path,
-            mtime_ns,
+            Some(mtime_ns),
             file_size,
             &root_hash,
             &cache,
@@ -507,7 +508,7 @@ mod tests {
 
         // After recomputation, cache should be complete
         assert_eq!(
-            db.cache_status(&file_path, mtime_ns, file_size)
+            db.cache_status(&file_path, Some(mtime_ns), file_size)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -579,7 +580,7 @@ mod tests {
         .unwrap_or(0);
 
         assert_eq!(
-            db.cache_status(&canonical_inside, mtime_ns, meta.len())
+            db.cache_status(&canonical_inside, Some(mtime_ns), meta.len())
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -697,14 +698,21 @@ mod tests {
             let (root, cache, leaf_infos) =
                 merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
 
-            db.put_tree(&file_path, mtime_v1, size_v1, &root, &cache, &leaf_infos)
-                .await
-                .unwrap();
+            db.put_tree(
+                &file_path,
+                Some(mtime_v1),
+                size_v1,
+                &root,
+                &cache,
+                &leaf_infos,
+            )
+            .await
+            .unwrap();
         }
 
         // Verify cache status before modifications
         assert_eq!(
-            db.cache_status(&file_path, mtime_v1, size_v1)
+            db.cache_status(&file_path, Some(mtime_v1), size_v1)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -759,7 +767,7 @@ mod tests {
 
         // Verify the cache now matches the file's current state
         assert_eq!(
-            db.cache_status(&file_path, mtime_after, size_after)
+            db.cache_status(&file_path, Some(mtime_after), size_after)
                 .await
                 .unwrap(),
             CacheStatus::Complete,

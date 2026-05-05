@@ -130,10 +130,14 @@ impl Database {
     ///
     /// Takes explicit `mtime_ns` and `file_size` rather than reading from the
     /// filesystem, so callers can pass verified/cached values.
+    ///
+    /// `mtime_ns` is `Option<u64>`:
+    /// - `None` means unknown/unavailable mtime (will store NULL in database)
+    /// - `Some(0)` means actual Unix epoch timestamp
     pub async fn put_merkle(
         &self,
         path: &Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
         root: &Blake3Hash,
         leaf_hashes: &[Blake3Hash],
@@ -154,6 +158,8 @@ impl Database {
         // Truncation only possible if usize > i64::MAX, which cannot happen for leaf counts.
         let leaf_count = leaf_hashes.len() as i64;
 
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
+
         self.call(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "INSERT OR REPLACE INTO merkle_cache
@@ -161,7 +167,7 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 (
                     path_str,
-                    mtime_ns as i64,
+                    mtime_ns_i64,
                     file_size as i64,
                     root_bytes,
                     serialized,
@@ -181,10 +187,14 @@ impl Database {
     /// This populates the `merkle_tree_nodes` and `merkle_leaf_info` tables
     /// and also updates the `merkle_cache` table for backward compatibility.
     /// The operation is atomic (wrapped in a transaction).
+    ///
+    /// `mtime_ns` is `Option<u64>`:
+    /// - `None` means unknown/unavailable mtime (will store NULL in database)
+    /// - `Some(0)` means actual Unix epoch timestamp
     pub async fn put_tree(
         &self,
         path: &Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
         root: &Blake3Hash,
         cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
@@ -220,6 +230,8 @@ impl Database {
         let serialized_leaves = merkle.serialize_leaves(&leaf_hashes_for_cache);
         // Truncation only possible if usize > i64::MAX, which cannot happen for leaf counts.
         let leaf_count = leaf_infos.len() as i64;
+
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
 
         self.call(move |conn: &mut rusqlite::Connection| {
             let tx = conn.transaction()?;
@@ -259,7 +271,7 @@ impl Database {
 
                 tx.execute(
                     "INSERT OR REPLACE INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, leaf_count, now],
+                    rusqlite::params![path_str, mtime_ns_i64, file_size as i64, root_bytes, serialized_leaves, leaf_count, now],
                 )?;
             }
 
@@ -386,12 +398,36 @@ impl Database {
     /// `mtime_ns` and `file_size` so the method has no I/O coupling.
     ///
     /// Single SQL round-trip using `EXISTS` subqueries.
+    ///
+    /// `mtime_ns` is `Option<u64>`:
+    /// - `None` means unknown mtime - cannot validate cache freshness, return Stale/Missing
+    /// - `Some(value)` means known mtime - can compare with cache
     pub async fn cache_status(
         &self,
         path: &Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
     ) -> SqliteResult<CacheStatus> {
+        // If mtime is unknown, we cannot validate cache freshness.
+        // Return Missing if no entry exists, Stale otherwise.
+        let Some(mtime_ns) = mtime_ns else {
+            let path_str = path.to_string_lossy().to_string();
+            let any_entry: bool = self
+                .call(move |conn| {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM merkle_cache WHERE file_path = ?1)",
+                        rusqlite::params![path_str],
+                        |row| row.get::<_, bool>(0),
+                    )
+                })
+                .await?;
+            return Ok(if any_entry {
+                CacheStatus::Stale
+            } else {
+                CacheStatus::Missing
+            });
+        };
+
         let path_str = path.to_string_lossy().to_string();
         self.call(move |conn| {
             // Try to get leaf_count from a cache entry with matching key
@@ -461,13 +497,12 @@ mod tests {
     // cache_status tests
     // =======================================================================
 
-    fn file_mtime_ns(path: &Path) -> u64 {
+    fn file_mtime_ns(path: &Path) -> Option<u64> {
         let meta = fs::metadata(path).unwrap();
         meta.modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
     }
 
     fn file_size(path: &Path) -> u64 {
@@ -478,7 +513,7 @@ mod tests {
     async fn cache_status_returns_missing_for_no_entry() {
         let db = Database::open_in_memory().await.unwrap();
         let path = Path::new("/tmp/nonexistent.txt");
-        let result = db.cache_status(path, 0, 0).await.unwrap();
+        let result = db.cache_status(path, None, 0).await.unwrap();
         assert_eq!(result, CacheStatus::Missing, "no entry → Missing");
     }
 
@@ -536,7 +571,7 @@ mod tests {
 
         let root = Blake3Hash::new(b"root");
         let leaf = Blake3Hash::new(b"leaf");
-        let stale_mtime = 0u64;
+        let stale_mtime = Some(0u64); // Store with epoch mtime
         let size = file_size(&file_path);
 
         // Store with stale mtime
@@ -651,16 +686,17 @@ mod tests {
         let file_path = PathBuf::from("test_empty.txt");
 
         let root = Blake3Hash::new(b"root");
-        let mtime_ns = 1000;
+        let mtime_ns = Some(1000u64);
         let size = 0u64;
 
         // Insert merkle_cache row with leaf_count=0, no tree_nodes, no leaf_info
         let path_str = file_path.to_string_lossy().to_string();
         let root_bytes = root.as_bytes().to_vec();
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
         db.call(move |conn| {
             conn.execute(
                 "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![path_str, mtime_ns as i64, size as i64, root_bytes, Vec::<u8>::new(), 0i64, 0i64],
+                rusqlite::params![path_str, mtime_ns_i64, size as i64, root_bytes, Vec::<u8>::new(), 0i64, 0i64],
             )
         }).await.unwrap();
 
@@ -679,18 +715,19 @@ mod tests {
         let file_path = PathBuf::from("test_wrong_count.txt");
 
         let root = Blake3Hash::new(b"root");
-        let mtime_ns = 2000;
+        let mtime_ns = Some(2000u64);
         let size = 100u64;
 
         // Insert merkle_cache with leaf_count=3 but only 2 leaf_info rows
         let path_str = file_path.to_string_lossy().to_string();
         let root_bytes = root.as_bytes().to_vec();
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
         db.call({
             let path_str = path_str.clone();
             move |conn| {
                 conn.execute(
                     "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![path_str, mtime_ns as i64, size as i64, root_bytes, Vec::<u8>::new(), 3i64, 0i64],
+                    rusqlite::params![path_str, mtime_ns_i64, size as i64, root_bytes, Vec::<u8>::new(), 3i64, 0i64],
                 )?;
                 // Insert a tree node so has_nodes is true
                 conn.execute(
@@ -727,7 +764,7 @@ mod tests {
         let chunks = vec![(0usize, 11usize), (11usize, 11usize)];
         let (root, cache, leaf_infos) = tree.build_with_cache_and_offsets(&leaves, &chunks);
 
-        let mtime_ns = 3000u64;
+        let mtime_ns = Some(3000u64);
         let file_size = 22u64;
 
         db.put_tree(&file_path, mtime_ns, file_size, &root, &cache, &leaf_infos)
@@ -916,10 +953,9 @@ mod tests {
         let meta = std::fs::metadata(&file_path).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
 
         db.put_tree(&file_path, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
@@ -939,6 +975,105 @@ mod tests {
         let fake_hash = Blake3Hash::new(b"does not exist");
         let result = db.get_children(&file_path, &fake_hash).await.unwrap();
         assert!(result.is_none(), "Non-existent hash should return None");
+    }
+
+    // =======================================================================
+    // mtime_ns Option<u64> tests - distinguish unknown from epoch
+    // =======================================================================
+
+    /// Test that demonstrates the bug: `mtime_ns=0` from failure vs real epoch.
+    ///
+    /// When `modified()` fails or returns pre-epoch time, the code currently
+    /// falls back to `mtime_ns=0`. But 0 is also a valid timestamp (Unix epoch).
+    /// This conflation causes correctness issues.
+    ///
+    /// The fix: change `mtime_ns` to Option<u64>:
+    /// - None means unknown (failure)
+    /// - Some(0) means actual epoch timestamp
+    #[tokio::test]
+    async fn cache_status_distinguishes_unknown_mtime_from_epoch() {
+        // This test demonstrates that we MUST distinguish between:
+        // - Unknown mtime (None) - cache key is unknown
+        // - Epoch mtime (Some(0)) - cache key is valid and equals 0
+        //
+        // Current implementation conflates both as 0, which is wrong.
+        //
+        // Scenario:
+        // 1. File A has mtime=0 (actual epoch timestamp - unusual but valid)
+        // 2. File B has mtime computation failure (should be None)
+        //
+        // With the bug: both would have mtime_ns=0 in cache
+        // The fix: File A's cache entry has mtime_ns=Some(0), File B's has None
+        //
+        // For now, this test documents the expected behavior after the fix.
+        // When mtime_ns is Option<u64>:
+        // - put_tree with mtime_ns=Some(0) should store 0
+        // - cache_status with mtime_ns=Some(0) should match
+        // - put_tree with mtime_ns=None should store NULL
+        // - cache_status with mtime_ns=None should treat as "unknown"
+
+        let db = Database::open_in_memory().await.unwrap();
+        let file_path = PathBuf::from("/test/epoch_file.txt");
+
+        // Store with actual epoch mtime (Some(0))
+        let root = Blake3Hash::new(b"epoch_root");
+        let leaf = Blake3Hash::new(b"epoch_leaf");
+        let tree = MerkleTree::default();
+        let leaf_infos = vec![LeafInfo {
+            hash: leaf.clone(),
+            offset: 0,
+            length: 5,
+            chunk_index: 0,
+        }];
+        let cache = tree.build_with_cache(std::slice::from_ref(&leaf)).1;
+
+        // mtime_ns = Some(0) means actual epoch timestamp - this should be stored
+        db.put_tree(&file_path, Some(0), 5u64, &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        // Query with same mtime_ns=Some(0) should find the entry
+        let result = db.cache_status(&file_path, Some(0), 5u64).await.unwrap();
+        assert_eq!(
+            result,
+            CacheStatus::Complete,
+            "epoch mtime (Some(0)) should match stored cache entry"
+        );
+
+        // Now test the unknown case: put with None should store NULL
+        let unknown_path = PathBuf::from("/test/unknown_mtime.txt");
+        let unknown_root = Blake3Hash::new(b"unknown_root");
+        let unknown_leaf = Blake3Hash::new(b"unknown_leaf");
+        let unknown_leaf_infos = vec![LeafInfo {
+            hash: unknown_leaf.clone(),
+            offset: 0,
+            length: 10,
+            chunk_index: 0,
+        }];
+        let unknown_cache = tree.build_with_cache(std::slice::from_ref(&unknown_leaf)).1;
+
+        // mtime_ns = None means unknown/failure
+        db.put_tree(
+            &unknown_path,
+            None,
+            10u64,
+            &unknown_root,
+            &unknown_cache,
+            &unknown_leaf_infos,
+        )
+        .await
+        .unwrap();
+
+        // Query with mtime_ns=None should still find the entry (we match on path+size when mtime is unknown)
+        let result = db.cache_status(&unknown_path, None, 10u64).await.unwrap();
+        // Expected: Missing because unknown mtime can never match (no filesystem truth to compare against)
+        // OR: Complete if we decide that unknown matches unknown
+        // The design decision: unknown mtime means we cannot validate cache freshness, so it's always stale/invalid
+        assert_eq!(
+            result,
+            CacheStatus::Stale,
+            "unknown mtime should result in Stale (cannot validate cache freshness without mtime)"
+        );
     }
 
     #[tokio::test]
@@ -969,10 +1104,9 @@ mod tests {
         let meta = std::fs::metadata(&file_path).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
 
         // put_tree should succeed even when two leaves have the same hash
         db.put_tree(&file_path, mtime_ns, meta.len(), &root, &cache, &leaf_infos)

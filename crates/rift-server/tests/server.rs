@@ -1601,13 +1601,12 @@ mod merkle_integration {
     use rift_common::crypto::Blake3Hash;
     use rift_server::metadata::db::Database;
 
-    fn file_mtime_ns(path: &PathBuf) -> u64 {
+    fn file_mtime_ns(path: &PathBuf) -> Option<u64> {
         let meta = std::fs::metadata(path).unwrap();
         meta.modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
     }
 
     fn file_size(path: &PathBuf) -> u64 {
@@ -1773,9 +1772,10 @@ mod merkle_integration {
 
         let stale_root = Blake3Hash::new(b"stale-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        let mtime_ns = file_mtime_ns(&file_path).map(|ns| ns.saturating_sub(1));
         db.put_merkle(
             &file_path,
-            file_mtime_ns(&file_path) - 1,
+            mtime_ns,
             file_size(&file_path),
             &stale_root,
             &leaf_hashes,
@@ -2166,13 +2166,12 @@ mod helpers_with_db {
         .await;
     }
 
-    pub fn file_mtime_ns(path: &std::path::PathBuf) -> u64 {
+    pub fn file_mtime_ns(path: &std::path::PathBuf) -> Option<u64> {
         let meta = std::fs::metadata(path).unwrap();
         meta.modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
     }
 
     pub fn file_size(path: &std::path::PathBuf) -> u64 {
