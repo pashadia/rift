@@ -29,8 +29,9 @@ const SCHEMA_DDL: &str = r"
         chunk_offset INTEGER NOT NULL,
         chunk_length INTEGER NOT NULL,
         chunk_index INTEGER NOT NULL,
-        PRIMARY KEY (file_path, chunk_hash)
+        PRIMARY KEY (file_path, chunk_index)
     );
+    CREATE INDEX IF NOT EXISTS idx_leaf_info_chunk_hash ON merkle_leaf_info(chunk_hash);
 ";
 
 /// A `SQLite` database for storing share metadata.
@@ -360,6 +361,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merkle_leaf_info_duplicate_chunk_hash_allowed() {
+        let db = Database::open_in_memory().await.unwrap();
+        let path = "/tmp/test.txt";
+        let chunk_hash = vec![0xAB; 32];
+
+        // Insert two rows with same file_path, same chunk_hash, different chunk_index
+        db.call({
+            let path = path.to_string();
+            let chunk_hash = chunk_hash.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (&path, &chunk_hash, 0i64, 100i64, 0i64),
+                )?;
+                conn.execute(
+                    "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (&path, &chunk_hash, 100i64, 200i64, 1i64),
+                )?;
+                Ok(())
+            }
+        }).await.unwrap();
+
+        // Verify both rows exist
+        let count: i64 = db
+            .call(move |conn| {
+                conn.query_row(
+                "SELECT COUNT(*) FROM merkle_leaf_info WHERE file_path = ?1 AND chunk_hash = ?2",
+                (path, chunk_hash),
+                |row| row.get::<_, i64>(0),
+            )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count, 2,
+            "Same chunk_hash with different chunk_index should both exist"
+        );
+    }
+
+    #[tokio::test]
     async fn merkle_leaf_info_primary_key_uniqueness() {
         let db = Database::open_in_memory().await.unwrap();
 
@@ -373,13 +415,13 @@ mod tests {
         let result = db.call(|conn| {
             conn.execute(
                 "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
-                ("test.txt", vec![0u8; 32], 100i64, 200i64, 1i64),
+                ("test.txt", vec![0xFFu8; 32], 100i64, 200i64, 0i64),
             )
         }).await;
 
         assert!(
             result.is_err(),
-            "Duplicate (file_path, chunk_hash) should fail"
+            "Duplicate (file_path, chunk_index) should fail"
         );
     }
 }

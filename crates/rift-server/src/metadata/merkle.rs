@@ -380,51 +380,6 @@ impl Database {
         .await
     }
 
-    /// Look up leaf metadata by chunk hash.
-    ///
-    /// Returns `None` if the chunk hash is not found.
-    pub async fn get_leaf_info(
-        &self,
-        path: &Path,
-        chunk_hash: &Blake3Hash,
-    ) -> SqliteResult<Option<LeafInfo>> {
-        let path_str = path.to_string_lossy().to_string();
-        let hash_bytes = chunk_hash.as_bytes().to_vec();
-        let hash_bytes_for_reconstruction = chunk_hash.clone();
-
-        let result = self
-            .call(move |conn: &mut rusqlite::Connection| {
-                conn.query_row(
-                    "SELECT chunk_hash, chunk_offset, chunk_length, chunk_index FROM merkle_leaf_info WHERE file_path = ?1 AND chunk_hash = ?2",
-                    rusqlite::params![path_str, hash_bytes],
-                    |row| {
-                        let offset: i64 = row.get(1)?;
-                        let length: i64 = row.get(2)?;
-                        let chunk_index: i64 = row.get(3)?;
-                        Ok((offset, length, chunk_index))
-                    },
-                )
-            })
-            .await;
-
-        match result {
-            Ok((offset, length, chunk_index)) => Ok(Some(LeafInfo {
-                hash: hash_bytes_for_reconstruction,
-                offset: offset as u64,
-                length: length as u64,
-                chunk_index: u32::try_from(chunk_index)
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?,
-            })),
-            Err(e) => {
-                if is_no_rows(&e) {
-                    Ok(None)
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-
     /// Determine the cache status for a given file path.
     ///
     /// Purely database-based check — caller must supply current filesystem
@@ -987,21 +942,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_leaf_info_by_hash() {
+    async fn put_tree_with_duplicate_chunk_hashes() {
         let db = Database::open_in_memory().await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
+        let file_path = temp_dir.path().join("duplicate_chunks.txt");
+        std::fs::write(&file_path, b"AAAAAA").unwrap();
 
-        let chunk_hash = Blake3Hash::new(b"chunk1");
-        let leaf_infos = vec![LeafInfo {
-            hash: chunk_hash.clone(),
-            offset: 0,
-            length: 100,
-            chunk_index: 0,
-        }];
+        let chunk_hash = Blake3Hash::new(b"same_hash");
+        let leaf_infos = vec![
+            LeafInfo {
+                hash: chunk_hash.clone(),
+                offset: 0,
+                length: 3,
+                chunk_index: 0,
+            },
+            LeafInfo {
+                hash: chunk_hash.clone(),
+                offset: 3,
+                length: 3,
+                chunk_index: 1,
+            },
+        ];
         let root = Blake3Hash::new(b"root");
-        let cache = HashMap::new(); // empty cache for this test
+        let cache = HashMap::new();
 
         let meta = std::fs::metadata(&file_path).unwrap();
         let mtime_ns = meta
@@ -1011,16 +974,36 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
 
+        // put_tree should succeed even when two leaves have the same hash
         db.put_tree(&file_path, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
 
-        let info = db.get_leaf_info(&file_path, &chunk_hash).await.unwrap();
-        assert!(info.is_some(), "Should find leaf info for known chunk hash");
-        let info = info.unwrap();
-        assert_eq!(info.hash, chunk_hash);
-        assert_eq!(info.offset, 0);
-        assert_eq!(info.length, 100);
-        assert_eq!(info.chunk_index, 0);
+        // Verify leaf_count is 2
+        let path_str = file_path.to_string_lossy().to_string();
+        let stored_leaf_count: i64 = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT leaf_count FROM merkle_cache WHERE file_path = ?1",
+                    [path_str],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_leaf_count, 2,
+            "leaf_count should be 2 for file with duplicate chunk hashes"
+        );
+
+        // Verify both leaf_info rows exist
+        let all_leaf_info = db.get_all_leaf_info(&file_path).await.unwrap();
+        assert!(all_leaf_info.is_some(), "should have leaf_info");
+        let infos = all_leaf_info.unwrap();
+        assert_eq!(infos.len(), 2, "both leaf entries should exist");
+        assert_eq!(infos[0].chunk_index, 0);
+        assert_eq!(infos[1].chunk_index, 1);
+        assert_eq!(infos[0].hash, chunk_hash);
+        assert_eq!(infos[1].hash, chunk_hash);
     }
 }
