@@ -38,7 +38,7 @@ fn is_no_rows(e: &tokio_rusqlite::Error) -> bool {
 }
 
 /// A cached Merkle tree entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MerkleEntry {
     /// The root hash of the Merkle tree
     pub root: Blake3Hash,
@@ -52,6 +52,7 @@ impl Database {
     /// Returns `None` if:
     /// - The file has no cached entry
     /// - The cached entry is stale (mtime or size changed)
+    /// - The filesystem mtime is unavailable (cannot validate freshness)
     pub async fn get_merkle(&self, path: &Path) -> SqliteResult<Option<MerkleEntry>> {
         use std::fs;
 
@@ -59,16 +60,24 @@ impl Database {
             return Ok(None);
         };
 
-        let mtime_ns = meta
-            .modified()
-            .map(|t| {
-                t.duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0))
-            })
-            .unwrap_or(0);
+        let mtime_ns = meta.modified().ok().and_then(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        });
 
         let file_size = meta.len();
         let path_str = path.to_string_lossy().to_string();
+
+        // If mtime is unavailable, we cannot validate cache freshness.
+        // Log a warning and return None to avoid incorrect cache hits.
+        let Some(mtime_ns) = mtime_ns else {
+            tracing::warn!(
+                path = %path_str,
+                "file mtime unavailable; treating cache entry as stale"
+            );
+            return Ok(None);
+        };
 
         let result = self
             .call(move |conn: &mut rusqlite::Connection| {
@@ -81,7 +90,7 @@ impl Database {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(2)?,
                             row.get::<_, i64>(3)?,
                         ))
                     },
@@ -91,7 +100,9 @@ impl Database {
 
         match result {
             Ok((root, leaf_hashes, cached_mtime, cached_size)) => {
-                if cached_mtime == mtime_ns as i64 && cached_size == file_size as i64 {
+                // Compare mtime: both must be Some and equal, and size must match.
+                let mtime_matches = cached_mtime.map(|m| m == mtime_ns as i64).unwrap_or(false);
+                if mtime_matches && cached_size == file_size as i64 {
                     let Ok(root) = Blake3Hash::from_slice(&root) else {
                         return Ok(None);
                     };
@@ -1139,5 +1150,66 @@ mod tests {
         assert_eq!(infos[1].chunk_index, 1);
         assert_eq!(infos[0].hash, chunk_hash);
         assert_eq!(infos[1].hash, chunk_hash);
+    }
+
+    #[tokio::test]
+    async fn get_merkle_treats_null_mtime_as_stale() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("null_mtime.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let root = Blake3Hash::new(b"test");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        // Store with mtime_ns = None (NULL in DB)
+        db.put_merkle(&file_path, None, file_size(&file_path), &root, &leaf_hashes)
+            .await
+            .unwrap();
+
+        // get_merkle should return None (stale) rather than erroring
+        let result = db.get_merkle(&file_path).await;
+        assert!(
+            result.is_ok(),
+            "get_merkle should not error on NULL mtime: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "NULL mtime should be treated as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_merkle_matches_epoch_mtime() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("epoch_mtime.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        // Set mtime to Unix epoch (0)
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        filetime::set_file_mtime(&file_path, epoch.into()).unwrap();
+
+        let root = Blake3Hash::new(b"test");
+        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
+        db.put_merkle(
+            &file_path,
+            Some(0),
+            file_size(&file_path),
+            &root,
+            &leaf_hashes,
+        )
+        .await
+        .unwrap();
+
+        let result = db.get_merkle(&file_path).await.unwrap();
+        assert!(
+            result.is_some(),
+            "epoch mtime (Some(0)) should match stored cache entry"
+        );
+        let entry = result.unwrap();
+        assert_eq!(entry.root, root);
+        assert_eq!(entry.leaf_hashes, leaf_hashes);
     }
 }
