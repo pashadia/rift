@@ -398,7 +398,11 @@ mod tests {
 
         let db: Arc<Database> = Arc::new(Database::open_in_memory().await.unwrap());
 
-        // Insert a cache entry with correct mtime/size but NO tree nodes or leaf info
+        // Create a proper incomplete entry: cache row with non-zero leaf_count,
+        // tree nodes present, but leaf_info missing. We use raw SQL because
+        // put_tree would never produce this inconsistent state, and put_merkle
+        // with zero leaves would now correctly be interpreted as Complete for
+        // an empty file.
         let root = Blake3Hash::new(b"incomplete_root");
         let meta = std::fs::metadata(&file_path).unwrap();
         let mtime_ns = u64::try_from(
@@ -410,9 +414,26 @@ mod tests {
         )
         .unwrap_or(0);
         let file_size = meta.len();
-        db.put_merkle(&file_path, mtime_ns, file_size, &root, &[])
-            .await
-            .unwrap();
+
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        db.call({
+            let path_str2 = path_str.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (path_str2, mtime_ns as i64, file_size as i64, root_bytes, Vec::<u8>::new(), 1i64, 0i64),
+                )?;
+                // Insert a tree node so has_nodes is true
+                conn.execute(
+                    "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                    (path_str, vec![0u8; 32], vec![1u8; 64]),
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
 
         let summary = run_background_check(&share, db.clone(), Chunker::default())
             .await
@@ -422,7 +443,7 @@ mod tests {
         assert_eq!(summary.files_stale, 0, "entry should not be stale");
         assert_eq!(
             summary.files_incomplete, 1,
-            "entry with key match but missing tree data should be incomplete"
+            "entry with key match but missing leaf data should be incomplete"
         );
         assert_eq!(summary.errors, 0);
 

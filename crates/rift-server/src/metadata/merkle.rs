@@ -151,17 +151,21 @@ impl Database {
         let root_bytes = root.as_bytes().to_vec();
         let serialized = serialized_leaves;
 
+        // Truncation only possible if usize > i64::MAX, which cannot happen for leaf counts.
+        let leaf_count = leaf_hashes.len() as i64;
+
         self.call(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "INSERT OR REPLACE INTO merkle_cache
-                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, computed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 (
                     path_str,
                     mtime_ns as i64,
                     file_size as i64,
                     root_bytes,
                     serialized,
+                    leaf_count,
                     now,
                 ),
             )
@@ -214,6 +218,8 @@ impl Database {
         let leaf_hashes_for_cache: Vec<Blake3Hash> =
             leaf_infos.iter().map(|info| info.hash.clone()).collect();
         let serialized_leaves = merkle.serialize_leaves(&leaf_hashes_for_cache);
+        // Truncation only possible if usize > i64::MAX, which cannot happen for leaf counts.
+        let leaf_count = leaf_infos.len() as i64;
 
         self.call(move |conn: &mut rusqlite::Connection| {
             let tx = conn.transaction()?;
@@ -252,8 +258,8 @@ impl Database {
                     .map_or(0, |d| d.as_secs()) as i64;
 
                 tx.execute(
-                    "INSERT OR REPLACE INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, now],
+                    "INSERT OR REPLACE INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, leaf_count, now],
                 )?;
             }
 
@@ -433,45 +439,51 @@ impl Database {
     ) -> SqliteResult<CacheStatus> {
         let path_str = path.to_string_lossy().to_string();
         self.call(move |conn| {
-            // 1 = cache entry with matching key exists
-            let cache_hit: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM merkle_cache WHERE file_path = ?1 AND mtime_ns = ?2 AND file_size = ?3)",
-                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64],
-                    |row| row.get::<_, bool>(0),
-                )?;
+            // Try to get leaf_count from a cache entry with matching key
+            let cached_leaf_count_result = conn.query_row(
+                "SELECT leaf_count FROM merkle_cache WHERE file_path = ?1 AND mtime_ns = ?2 AND file_size = ?3",
+                rusqlite::params![path_str, mtime_ns as i64, file_size as i64],
+                |row| row.get::<_, i64>(0),
+            );
 
-            if !cache_hit {
-                // Check if an entry exists with WRONG key → Stale
-                let any_entry: bool = conn
+            let cached_leaf_count = match cached_leaf_count_result {
+                Ok(count) => count,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // Check if an entry exists with WRONG key → Stale
+                    let any_entry: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM merkle_cache WHERE file_path = ?1)",
+                            rusqlite::params![path_str],
+                            |row| row.get::<_, bool>(0),
+                        )?;
+                    return Ok(if any_entry { CacheStatus::Stale } else { CacheStatus::Missing });
+                }
+                Err(e) => return Err(e),
+            };
+
+            // Cache key matches — check completeness
+            // For non-empty files, tree nodes are required
+            if cached_leaf_count > 0 {
+                let has_nodes: bool = conn
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM merkle_cache WHERE file_path = ?1)",
+                        "SELECT EXISTS(SELECT 1 FROM merkle_tree_nodes WHERE file_path = ?1)",
                         rusqlite::params![path_str],
                         |row| row.get::<_, bool>(0),
                     )?;
-                return Ok(if any_entry { CacheStatus::Stale } else { CacheStatus::Missing });
+
+                if !has_nodes {
+                    return Ok(CacheStatus::Incomplete);
+                }
             }
 
-            // Cache key matches — check completeness
-            let has_nodes: bool = conn
+            let actual_leaf_count: i64 = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM merkle_tree_nodes WHERE file_path = ?1)",
+                    "SELECT COUNT(*) FROM merkle_leaf_info WHERE file_path = ?1",
                     rusqlite::params![path_str],
-                    |row| row.get::<_, bool>(0),
+                    |row| row.get::<_, i64>(0),
                 )?;
 
-            if !has_nodes {
-                return Ok(CacheStatus::Incomplete);
-            }
-
-            let has_leaves: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM merkle_leaf_info WHERE file_path = ?1)",
-                    rusqlite::params![path_str],
-                    |row| row.get::<_, bool>(0),
-                )?;
-
-            if has_leaves {
+            if actual_leaf_count == cached_leaf_count {
                 Ok(CacheStatus::Complete)
             } else {
                 Ok(CacheStatus::Incomplete)
@@ -488,6 +500,7 @@ mod tests {
     use rift_common::crypto::{Blake3Hash, LeafInfo, MerkleTree};
     use std::collections::HashMap;
     use std::fs;
+    use std::path::PathBuf;
 
     // =======================================================================
     // cache_status tests
@@ -540,6 +553,23 @@ mod tests {
 
         let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
         assert_eq!(result, CacheStatus::Complete, "fully cached → Complete");
+
+        // Verify leaf_count was stored correctly
+        let path_str = file_path.to_string_lossy().to_string();
+        let stored_leaf_count: i64 = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT leaf_count FROM merkle_cache WHERE file_path = ?1",
+                    [path_str],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_leaf_count, 1,
+            "leaf_count should match number of leaf_infos"
+        );
     }
 
     #[tokio::test]
@@ -656,6 +686,113 @@ mod tests {
             result,
             CacheStatus::Incomplete,
             "missing leaf info → Incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_status_returns_complete_for_empty_file() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Dummy path — no filesystem access needed, we only insert into the DB.
+        let file_path = PathBuf::from("test_empty.txt");
+
+        let root = Blake3Hash::new(b"root");
+        let mtime_ns = 1000;
+        let size = 0u64;
+
+        // Insert merkle_cache row with leaf_count=0, no tree_nodes, no leaf_info
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, size as i64, root_bytes, Vec::<u8>::new(), 0i64, 0i64],
+            )
+        }).await.unwrap();
+
+        let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
+        assert_eq!(
+            result,
+            CacheStatus::Complete,
+            "empty file with leaf_count=0 → Complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_status_returns_incomplete_for_wrong_leaf_count() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Dummy path — no filesystem access needed, we only insert into the DB.
+        let file_path = PathBuf::from("test_wrong_count.txt");
+
+        let root = Blake3Hash::new(b"root");
+        let mtime_ns = 2000;
+        let size = 100u64;
+
+        // Insert merkle_cache with leaf_count=3 but only 2 leaf_info rows
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        db.call({
+            let path_str = path_str.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![path_str, mtime_ns as i64, size as i64, root_bytes, Vec::<u8>::new(), 3i64, 0i64],
+                )?;
+                // Insert a tree node so has_nodes is true
+                conn.execute(
+                    "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![path_str, vec![0u8; 32], vec![1u8; 64]],
+                )?;
+                // Insert only 2 leaf_info rows
+                for i in 0..2 {
+                    conn.execute(
+                        "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![path_str, vec![i as u8; 32], i * 100i64, 100i64, i],
+                    )?;
+                }
+                Ok(())
+            }
+        }).await.unwrap();
+
+        let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
+        assert_eq!(
+            result,
+            CacheStatus::Incomplete,
+            "wrong leaf count → Incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_tree_stores_leaf_count() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Dummy path — no filesystem access needed, we only insert via put_tree.
+        let file_path = PathBuf::from("test_leaf_count.txt");
+
+        let tree = MerkleTree::default();
+        let leaves = vec![Blake3Hash::new(b"chunk1"), Blake3Hash::new(b"chunk2")];
+        let chunks = vec![(0usize, 11usize), (11usize, 11usize)];
+        let (root, cache, leaf_infos) = tree.build_with_cache_and_offsets(&leaves, &chunks);
+
+        let mtime_ns = 3000u64;
+        let file_size = 22u64;
+
+        db.put_tree(&file_path, mtime_ns, file_size, &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        let path_str = file_path.to_string_lossy().to_string();
+        let stored_leaf_count: i64 = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT leaf_count FROM merkle_cache WHERE file_path = ?1",
+                    [path_str],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_leaf_count, 2,
+            "leaf_count should match number of leaf_infos"
         );
     }
 

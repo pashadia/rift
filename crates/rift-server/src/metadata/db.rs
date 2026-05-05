@@ -14,6 +14,7 @@ const SCHEMA_DDL: &str = r"
         file_size  INTEGER NOT NULL,
         root_hash  BLOB NOT NULL,
         leaf_hashes BLOB NOT NULL,
+        leaf_count  INTEGER NOT NULL DEFAULT 0,
         computed_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS merkle_tree_nodes (
