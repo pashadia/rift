@@ -648,26 +648,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_check_toctou_fresh_stat_at_process_time() {
-        // TOCTOU test: verify that background check uses FRESH file metadata
-        // at process time, NOT stale metadata from the walk thread.
+    async fn background_check_detects_mtime_mismatch_on_rewrite() {
+        // Regression test: verify that rewriting a file (even if the final
+        // content matches the cached version) is detected as stale because
+        // the mtime has changed.
         //
-        // This test simulates a race where:
+        // This is NOT a TOCTOU test — it simply verifies that the cache
+        // key (mtime + size) is checked against fresh metadata and that
+        // a mismatch triggers recomputation.
+        //
+        // Sequence:
         // 1. File is cached with content "v1"
-        // 2. File is modified to "v2" (new mtime/size)
-        // 3. Background check walks and stats the file (sees "v1" meta - STALE)
-        // 4. File is modified back to "v1" (restores original mtime/size)
-        // 5. handle_file processes with fresh stat → should NOT mark as stale
-        //
-        // With Option C (send only paths), the cache should remain valid
-        // because we stat fresh at process time, matching the cached key.
-        //
-        // With the old approach (send FileInfo), the stale mtime from walk
-        // would incorrectly mark the entry as Stale and trigger unnecessary recompute.
+        // 2. File is modified to "v2" (new mtime)
+        // 3. File is rewritten back to "v1" (content restored, mtime still new)
+        // 4. Background check stats fresh → sees new mtime → stale → recomputed
 
         let temp_dir = tempfile::tempdir().unwrap();
         let share = temp_dir.path().to_path_buf();
-        let file_path = share.join("toctou_test.txt");
+        let file_path = share.join("rewrite_test.txt");
 
         // Write initial content and get its metadata
         std::fs::write(&file_path, b"v1 content here").unwrap();
@@ -719,23 +717,11 @@ mod tests {
             "cache should be complete for v1 content"
         );
 
-        // Modify file to "v2" - this changes mtime and maybe size
+        // Rewrite file to "v2" then back to "v1" — mtime is now newer
         std::fs::write(&file_path, b"v2 different content").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10)); // ensure mtime differs
-
-        // Modify file back to "v1" - restores original content
-        // After this, the file's mtime will be NEWER, but if we restore
-        // exactly "v1 content here", the content is the same.
-        // To truly test TOCTOU, we need to restore the EXACT same mtime.
-        // We can't do that easily, so instead we'll create a scenario where
-        // the walk thread sees one mtime but the file ends up with another.
-
-        // Actually, let's use a different approach: use a channel intercept
-        // to simulate the race. We'll create a custom walk function that
-        // sends paths, and we'll modify the file between receiving and processing.
-
-        // Restore "v1" content but with a new mtime (can't restore exact mtime)
         std::fs::write(&file_path, b"v1 content here").unwrap();
+
         let meta_after = std::fs::metadata(&file_path).unwrap();
         let mtime_after = u64::try_from(
             meta_after
@@ -748,22 +734,13 @@ mod tests {
         .unwrap_or(0);
         let size_after = meta_after.len();
 
-        // The file now has content matching the cache, but NEW mtime.
-        // With Option C: fresh stat at process time → sees new mtime → cache is stale
-        // With old code: stale mtime from walk → might see old mtime → false "complete"
-        //
-        // This tests that we correctly detect the stale cache entry.
-        // The key difference is that Option C ALWAYS uses fresh metadata.
-
         // Run background check
         let summary = run_background_check(&share, db.clone(), chunker)
             .await
             .unwrap();
 
-        // With fresh stat at process time, we should detect stale and recompute
+        // Fresh stat should detect the mtime mismatch and recompute
         assert_eq!(summary.files_checked, 1);
-        // Note: files_stale or files_added depends on whether mtime differs
-        // The important thing is the cache is properly updated
 
         // Verify the cache now matches the file's current state
         assert_eq!(
@@ -772,6 +749,135 @@ mod tests {
                 .unwrap(),
             CacheStatus::Complete,
             "cache should be complete after background check with fresh stat"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_check_toctou_race_detected_by_fresh_stat() {
+        // TOCTOU test: verify that modifying a file AFTER the walk thread
+        // has sent its path, but BEFORE the async handler processes it,
+        // is detected because the handler stats the file fresh.
+        //
+        // This test intercepts the channel to create a controlled race:
+        // 1. File is cached with content "v1"
+        // 2. walk_share sends only the path through the channel
+        // 3. Test waits for walk to finish, then modifies file to "v2"
+        // 4. Test receives the path and calls handle_file
+        // 5. handle_file stats fresh → sees "v2" metadata → stale → recomputed
+        //
+        // If handle_file used stale metadata from the walk, it would see
+        // the old state and falsely consider the cache complete.
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let share = temp_dir.path().to_path_buf();
+        let file_path = share.join("toctou_race.txt");
+
+        // Write initial content and get its metadata
+        std::fs::write(&file_path, b"v1 content here").unwrap();
+        let meta_v1 = std::fs::metadata(&file_path).unwrap();
+        let mtime_v1 = u64::try_from(
+            meta_v1
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(0);
+        let size_v1 = meta_v1.len();
+
+        let db: Arc<Database> = Arc::new(Database::open_in_memory().await.unwrap());
+        let chunker = Chunker::default();
+
+        // Pre-compute and cache the Merkle tree for "v1" content
+        {
+            let content = std::fs::read(&file_path).unwrap();
+            let chunk_boundaries = chunker.chunk(&content);
+            let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+                .iter()
+                .map(|(offset, length)| Blake3Hash::new(&content[*offset..*offset + *length]))
+                .collect();
+            let merkle = rift_common::crypto::MerkleTree::default();
+            let (root, cache, leaf_infos) =
+                merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+            db.put_tree(
+                &file_path,
+                Some(mtime_v1),
+                size_v1,
+                &root,
+                &cache,
+                &leaf_infos,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Verify cache status before modifications
+        assert_eq!(
+            db.cache_status(&file_path, Some(mtime_v1), size_v1)
+                .await
+                .unwrap(),
+            CacheStatus::Complete,
+            "cache should be complete for v1 content"
+        );
+
+        // Intercept the channel: run walk_share manually so we control timing
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(1);
+        let share_canonical = tokio::fs::canonicalize(&share).await.unwrap();
+        let share_owned = share.clone();
+
+        // Run walk on a blocking thread
+        let walk_handle =
+            tokio::task::spawn_blocking(move || walk_share(share_owned, share_canonical, tx));
+
+        // Wait for walk to finish sending all paths
+        walk_handle.await.unwrap();
+
+        // Race window: the path is in the channel, but handle_file hasn't
+        // run yet. Modify the file NOW.
+        std::fs::write(&file_path, b"v2 different content").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10)); // ensure mtime differs
+
+        // Now drain the channel and process each path with fresh stat
+        let mut summary = BackgroundCheckSummary {
+            files_checked: 0,
+            files_added: 0,
+            files_stale: 0,
+            files_incomplete: 0,
+            errors: 0,
+        };
+
+        while let Some(path) = rx.recv().await {
+            summary.files_checked += 1;
+            handle_file(&path, &db, &chunker, &mut summary).await;
+        }
+
+        // The fresh stat should have detected the stale cache
+        assert_eq!(
+            summary.files_stale, 1,
+            "fresh stat should detect stale cache when file is modified after walk"
+        );
+
+        // Cache should now be complete for the new content
+        let meta_v2 = std::fs::metadata(&file_path).unwrap();
+        let mtime_v2 = u64::try_from(
+            meta_v2
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(0);
+        let size_v2 = meta_v2.len();
+
+        assert_eq!(
+            db.cache_status(&file_path, Some(mtime_v2), size_v2)
+                .await
+                .unwrap(),
+            CacheStatus::Complete,
+            "cache should be complete after recomputation"
         );
     }
 }
