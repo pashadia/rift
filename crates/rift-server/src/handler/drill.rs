@@ -199,12 +199,9 @@ async fn build_tree_and_cache<M: MerkleCache>(
     if let Ok(meta) = tokio::fs::metadata(canonical).await {
         let mtime_ns = meta
             .modified()
-            .map(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let file_size = meta.len();
         if let Err(e) = db
             .put_tree(canonical, mtime_ns, file_size, &root, &cache, &leaf_infos)

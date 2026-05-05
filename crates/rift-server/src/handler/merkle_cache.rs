@@ -118,6 +118,10 @@ pub(crate) async fn compute_file_merkle_tree(
 ///
 /// This is a shared utility used by both request handlers and the
 /// background integrity check.
+///
+/// `mtime_ns` is `Option<u64>`:
+/// - `None` means unknown mtime (will store NULL in database)
+/// - `Some(0)` means actual Unix epoch timestamp
 pub(crate) async fn cache_computed_tree<M: MerkleCache>(
     path: &Path,
     cache: &M,
@@ -133,8 +137,7 @@ pub(crate) async fn cache_computed_tree<M: MerkleCache>(
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
-        .unwrap_or(0);
+        .and_then(|d| u64::try_from(d.as_nanos()).ok());
 
     let file_size = file_meta.len();
 

@@ -45,7 +45,10 @@ struct FileInfo {
     /// Canonicalized absolute path.
     path: PathBuf,
     /// File modification time in nanoseconds since Unix epoch.
-    mtime_ns: u64,
+    /// `None` means mtime could not be determined (e.g., pre-epoch mtime,
+    /// `modified()` call failure, or `duration_since` overflow).
+    /// `Some(0)` means actual Unix epoch timestamp (1970-01-01 00:00:00).
+    mtime_ns: Option<u64>,
     /// File size in bytes.
     file_size: u64,
 }
@@ -84,8 +87,7 @@ fn walk_share(share: PathBuf, tx: tokio::sync::mpsc::Sender<FileInfo>) {
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
-            .unwrap_or(0);
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
 
         let file_size = meta.len();
 
@@ -277,15 +279,11 @@ mod tests {
         // Verify cache was populated — both files should now be Complete
         let file_a = share.join("a.txt");
         let meta_a = std::fs::metadata(&file_a).unwrap();
-        let mtime_a = u64::try_from(
-            meta_a
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_a = meta_a
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let size_a = meta_a.len();
         assert_eq!(
             db.cache_status(&file_a, mtime_a, size_a).await.unwrap(),
@@ -308,8 +306,8 @@ mod tests {
         let leaf = Blake3Hash::new(b"wrong_leaf");
         db.put_merkle(
             &file_path,
-            0,   // wrong mtime
-            999, // wrong size
+            Some(0u64), // wrong mtime
+            999,        // wrong size
             &root,
             std::slice::from_ref(&leaf),
         )
@@ -348,14 +346,11 @@ mod tests {
             merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
 
         let meta = std::fs::metadata(&file_path).unwrap();
-        let mtime_ns = u64::try_from(
-            meta.modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let file_size = meta.len();
 
         db.put_tree(
@@ -405,24 +400,22 @@ mod tests {
         // an empty file.
         let root = Blake3Hash::new(b"incomplete_root");
         let meta = std::fs::metadata(&file_path).unwrap();
-        let mtime_ns = u64::try_from(
-            meta.modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let file_size = meta.len();
 
         let path_str = file_path.to_string_lossy().to_string();
         let root_bytes = root.as_bytes().to_vec();
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
         db.call({
             let path_str2 = path_str.clone();
             move |conn| {
                 conn.execute(
                     "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    (path_str2, mtime_ns as i64, file_size as i64, root_bytes, Vec::<u8>::new(), 1i64, 0i64),
+                    (path_str2, mtime_ns_i64, file_size as i64, root_bytes, Vec::<u8>::new(), 1i64, 0i64),
                 )?;
                 // Insert a tree node so has_nodes is true
                 conn.execute(

@@ -34,7 +34,7 @@ pub trait MerkleCache: Send + Sync {
     fn put_merkle<'a>(
         &'a self,
         path: &'a Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
         root: &'a Blake3Hash,
         leaf_hashes: &'a [Blake3Hash],
@@ -43,7 +43,7 @@ pub trait MerkleCache: Send + Sync {
     fn put_tree<'a>(
         &'a self,
         path: &'a Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
         root: &'a Blake3Hash,
         cache: &'a HashMap<Blake3Hash, Vec<MerkleChild>>,
@@ -69,7 +69,7 @@ impl MerkleCache for Database {
     fn put_merkle<'a>(
         &'a self,
         path: &'a Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
         root: &'a Blake3Hash,
         leaf_hashes: &'a [Blake3Hash],
@@ -80,7 +80,7 @@ impl MerkleCache for Database {
     fn put_tree<'a>(
         &'a self,
         path: &'a Path,
-        mtime_ns: u64,
+        mtime_ns: Option<u64>,
         file_size: u64,
         root: &'a Blake3Hash,
         cache: &'a HashMap<Blake3Hash, Vec<MerkleChild>>,
@@ -113,7 +113,7 @@ impl MerkleCache for NoopCache {
     fn put_merkle<'a>(
         &'a self,
         _path: &'a Path,
-        _mtime_ns: u64,
+        _mtime_ns: Option<u64>,
         _file_size: u64,
         _root: &'a Blake3Hash,
         _leaf_hashes: &'a [Blake3Hash],
@@ -124,7 +124,7 @@ impl MerkleCache for NoopCache {
     fn put_tree<'a>(
         &'a self,
         _path: &'a Path,
-        _mtime_ns: u64,
+        _mtime_ns: Option<u64>,
         _file_size: u64,
         _root: &'a Blake3Hash,
         _cache: &'a HashMap<Blake3Hash, Vec<MerkleChild>>,

@@ -7,10 +7,13 @@ use tokio_rusqlite::Result as SqliteResult;
 
 /// SQL DDL for creating the database schema.
 /// Contains CREATE TABLE statements for all tables.
+///
+/// `mtime_ns` is nullable: NULL means unknown/unavailable mtime,
+/// Some(0) means actual Unix epoch timestamp.
 const SCHEMA_DDL: &str = r"
     CREATE TABLE IF NOT EXISTS merkle_cache (
         file_path   TEXT PRIMARY KEY,
-        mtime_ns   INTEGER NOT NULL,
+        mtime_ns   INTEGER,
         file_size  INTEGER NOT NULL,
         root_hash  BLOB NOT NULL,
         leaf_hashes BLOB NOT NULL,

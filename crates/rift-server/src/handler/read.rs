@@ -83,13 +83,11 @@ async fn cache_merkle_tree<M: MerkleCache>(
     leaf_infos: &[LeafInfo],
 ) -> anyhow::Result<()> {
     let file_meta = tokio::fs::metadata(canonical).await?;
-    let mtime_ns = match file_meta.modified() {
-        Ok(t) => t
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
-            .unwrap_or(0),
-        Err(_) => 0,
-    };
+    let mtime_ns = file_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_nanos()).ok());
     let file_size = file_meta.len();
     db.put_tree(canonical, mtime_ns, file_size, root, cache, leaf_infos)
         .await?;
@@ -674,10 +672,9 @@ mod tests {
         let meta = std::fs::metadata(&canonical).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
@@ -783,10 +780,9 @@ mod tests {
         let meta = std::fs::metadata(&canonical).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
@@ -873,10 +869,9 @@ mod tests {
         let meta = std::fs::metadata(&canonical).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
@@ -966,10 +961,9 @@ mod tests {
         let meta = std::fs::metadata(&canonical).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
@@ -1129,8 +1123,8 @@ mod tests {
         let original_mtime = meta.modified().unwrap();
         let mtime_ns = original_mtime
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
@@ -1375,10 +1369,9 @@ mod tests {
         let meta = std::fs::metadata(&canonical).unwrap();
         let mtime_ns = meta
             .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
             .await
             .unwrap();
