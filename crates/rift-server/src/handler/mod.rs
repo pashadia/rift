@@ -16,6 +16,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::handle::HandleDatabase;
+use crate::security::{is_within_share, normalize_path};
 
 pub mod attrs;
 pub mod drill;
@@ -169,48 +170,6 @@ pub async fn resolve(
 /// Otherwise, canonical is returned as-is.
 pub(crate) fn effective_path(canonical: PathBuf, fd_resolved: Option<PathBuf>) -> PathBuf {
     fd_resolved.unwrap_or(canonical)
-}
-
-/// Normalize a path by resolving `.` and `..` components without filesystem access.
-/// This is purely lexical — it does not follow symlinks.
-///
-/// This is used to check symlink targets for containment within the share root.
-/// Without normalization, a path like "/share/../../etc/passwd" would pass
-/// `starts_with("/share")` because `Path::starts_with` is component-based
-/// and does not resolve `..`.
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {} // skip "."
-            std::path::Component::ParentDir => {
-                match components.last() {
-                    Some(std::path::Component::Normal(_)) => {
-                        components.pop();
-                    }
-                    Some(std::path::Component::RootDir) => {
-                        // Absolute path: can't go above root; skip ".."
-                    }
-                    _ => {
-                        // Relative path with no Normal to pop, or ".." after "..":
-                        // preserve the ".." — it's a leading relative traversal.
-                        components.push(component);
-                    }
-                }
-            }
-            c => components.push(c),
-        }
-    }
-    let mut result = PathBuf::new();
-    for component in components {
-        result.push(component);
-    }
-    result
-}
-
-/// Returns `true` if `path` is within the share root, `false` if it escapes.
-pub(crate) fn is_within_share(path: &Path, share_canonical: &Path) -> bool {
-    path.starts_with(share_canonical)
 }
 
 /// Canonicalize a symlink path, verify the resolved target is within the share,
@@ -474,61 +433,6 @@ mod tests {
     use crate::handle::HandleDatabase;
 
     // ── effective_path tests ──────────────────────────────────────────
-
-    // ── normalize_path tests ──────────────────────────────────────────
-
-    #[test]
-    fn normalize_path_resolves_dotdot() {
-        let path = Path::new("/share/sub/../../etc/passwd");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, Path::new("/etc/passwd"));
-    }
-
-    #[test]
-    fn normalize_path_resolves_curdir() {
-        let path = Path::new("/share/./file.txt");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, Path::new("/share/file.txt"));
-    }
-
-    #[test]
-    fn normalize_path_dotdot_at_root_stays_at_root() {
-        let path = Path::new("/../../etc/passwd");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, Path::new("/etc/passwd"));
-    }
-
-    #[test]
-    fn normalize_path_no_special_components() {
-        let path = Path::new("/share/a/b/c.txt");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, Path::new("/share/a/b/c.txt"));
-    }
-
-    #[test]
-    fn normalize_path_relative_path() {
-        let path = Path::new("a/../b.txt");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, Path::new("b.txt"));
-    }
-
-    #[test]
-    fn normalize_path_relative_dotdot_beyond_start() {
-        // Going above the start of a relative path: ".." pops nothing
-        let path = Path::new("../../etc/passwd");
-        let normalized = normalize_path(path);
-        // Both ".." are at the start, so they can't pop anything
-        assert_eq!(normalized, Path::new("../../etc/passwd"));
-    }
-
-    #[test]
-    fn normalize_path_mixed_dot_and_dotdot() {
-        let path = Path::new("/a/./b/../c/./d.txt");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, Path::new("/a/c/d.txt"));
-    }
-
-    // ── effective_path tests (original) ────────────────────────────────────
 
     #[test]
     fn effective_path_returns_canonical_when_no_fd_resolved() {
