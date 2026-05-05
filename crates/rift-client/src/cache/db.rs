@@ -405,6 +405,11 @@ impl FileCache {
                     if data.len()
                         != usize::try_from(chunk.length).expect("chunk length fits in usize")
                     {
+                        tracing::info!(
+                            expected_len = chunk.length,
+                            actual_len = data.len(),
+                            "chunk length mismatch in cache"
+                        );
                         tracing::warn!(
                             "cached chunk length mismatch: expected {}, got {}",
                             chunk.length,
@@ -412,6 +417,11 @@ impl FileCache {
                         );
                         corrupted.push(chunk.hash);
                     } else if *Blake3Hash::new(&data).as_bytes() != chunk.hash {
+                        tracing::info!(
+                            expected = ?&chunk.hash[..4],
+                            actual = ?&Blake3Hash::new(&data).as_bytes()[..4],
+                            "chunk hash mismatch in cache"
+                        );
                         tracing::warn!(
                             "cached chunk hash mismatch: expected {:?}, got {:?}",
                             &chunk.hash[..4],

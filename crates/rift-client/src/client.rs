@@ -605,6 +605,13 @@ impl<C: RiftConnection> RiftClient<C> {
             .await?;
         stream.finish_send().await?;
 
+        tracing::info!(
+            handle = %handle,
+            start_chunk,
+            chunk_count,
+            "requesting chunks"
+        );
+
         let (_, payload) = stream
             .recv_frame()
             .await?
@@ -663,6 +670,13 @@ impl<C: RiftConnection> RiftClient<C> {
 
         let transfer_complete =
             TransferComplete::decode(root_payload.as_ref()).map_err(|_| FsError::Io)?;
+
+        tracing::info!(
+            handle = %handle,
+            chunk_count = chunks.len(),
+            merkle_root = %hex::encode(&transfer_complete.merkle_root),
+            "read_chunks complete"
+        );
 
         Ok(ChunkReadResult {
             chunks,
@@ -1418,6 +1432,8 @@ mod tests {
     // Group F: ChunkData Bytes type (rift-b0er.2.2)
     // -----------------------------------------------------------------------
 
+    use tracing_test::traced_test;
+
     #[test]
     fn chunk_data_data_field_is_bytes() {
         use bytes::Bytes;
@@ -1438,5 +1454,95 @@ mod tests {
         // Verify Bytes can be cloned cheaply (reference-counted)
         let data_clone = chunk.data.clone();
         assert_eq!(data_clone, chunk.data);
+    }
+
+    // -----------------------------------------------------------------------
+    // Group G: read_chunks INFO log events
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[traced_test]
+    async fn read_chunks_emits_info_logs() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        let chunk_data = b"hello";
+        let chunk_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk_data)
+            .as_bytes()
+            .to_owned();
+        let merkle_root = chunk_hash.to_vec();
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+
+            // Send READ_RESPONSE with chunk_count=1
+            let read_response = ReadResponse {
+                result: Some(read_response::Result::Ok(
+                    rift_protocol::messages::ReadSuccess { chunk_count: 1 },
+                )),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &read_response.encode_to_vec())
+                .await
+                .unwrap();
+
+            // Send BLOCK_HEADER with ChunkInfo
+            let block_header = BlockHeader {
+                chunk: Some(rift_protocol::messages::ChunkInfo {
+                    index: 0,
+                    length: chunk_data.len() as u64,
+                    hash: chunk_hash.to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await
+                .unwrap();
+
+            // Send BLOCK_DATA with chunk bytes
+            stream
+                .send_frame(msg::BLOCK_DATA, chunk_data)
+                .await
+                .unwrap();
+
+            // Send TRANSFER_COMPLETE with merkle_root
+            let transfer_complete = TransferComplete {
+                merkle_root: merkle_root.clone(),
+            };
+            stream
+                .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let uuid = Uuid::from_bytes([0x42u8; 16]);
+        let result = client.read_chunks(uuid, 0, 1).await;
+        assert!(result.is_ok(), "read_chunks should succeed");
+
+        // Check for INFO log with "requesting chunks"
+        logs_assert(|lines: &[&str]| {
+            let has_requesting = lines
+                .iter()
+                .any(|l| l.contains(" INFO ") && l.contains("requesting chunks"));
+            if has_requesting {
+                Ok(())
+            } else {
+                Err("missing INFO log with 'requesting chunks'".to_string())
+            }
+        });
+
+        // Check for INFO log with "read_chunks complete"
+        logs_assert(|lines: &[&str]| {
+            let has_complete = lines
+                .iter()
+                .any(|l| l.contains(" INFO ") && l.contains("read_chunks complete"));
+            if has_complete {
+                Ok(())
+            } else {
+                Err("missing INFO log with 'read_chunks complete'".to_string())
+            }
+        });
     }
 }
