@@ -89,13 +89,13 @@ impl Clone for QuicConnection {
 impl RiftConnection for QuicConnection {
     type Stream = QuicStream;
 
-    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()), err)]
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()))]
     async fn open_stream(&self) -> Result<QuicStream, TransportError> {
         let (send, recv) = self.inner.open_bi().await?;
         Ok(QuicStream::new(send, recv))
     }
 
-    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()), err)]
+    #[instrument(skip(self), fields(peer = %self.peer_fingerprint()))]
     async fn accept_stream(&self) -> Result<QuicStream, TransportError> {
         let (send, recv) = self
             .inner
@@ -151,7 +151,7 @@ impl RiftStream for QuicStream {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self))]
     async fn recv_frame(&mut self) -> Result<Option<(u8, Bytes)>, TransportError> {
         loop {
             // Try to decode a complete frame from the already-buffered bytes.
