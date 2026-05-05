@@ -6,7 +6,7 @@ use crate::metadata::db::Database;
 use rift_common::crypto::{Blake3Hash, LeafInfo, MerkleChild, MerkleTree};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_rusqlite::rusqlite;
 use tokio_rusqlite::Result as SqliteResult;
 
@@ -153,8 +153,6 @@ impl Database {
         root: &Blake3Hash,
         leaf_hashes: &[Blake3Hash],
     ) -> SqliteResult<()> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()) as i64;
@@ -275,7 +273,6 @@ impl Database {
 
             // Also update the legacy merkle_cache table
             {
-                use std::time::{SystemTime, UNIX_EPOCH};
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()) as i64;
