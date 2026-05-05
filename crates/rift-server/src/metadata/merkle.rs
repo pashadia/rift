@@ -403,6 +403,83 @@ impl Database {
             }
         }
     }
+
+    /// Check whether the cache for a given file path is complete and consistent.
+    ///
+    /// Returns `true` only if:
+    /// 1. A `merkle_cache` entry exists for the path with mtime/size matching
+    ///    the current filesystem metadata.
+    /// 2. At least one `merkle_tree_nodes` row exists for the path.
+    /// 3. At least one `merkle_leaf_info` row exists for the path.
+    ///
+    /// Used by the background integrity check to distinguish between
+    /// fully-cached entries, stale entries, and orphaned entries.
+    pub async fn is_cache_complete(&self, path: &Path) -> SqliteResult<bool> {
+        use std::fs;
+
+        // Step 1: verify filesystem metadata matches the cache key
+        let Ok(meta) = fs::metadata(path) else {
+            return Ok(false);
+        };
+
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64"))
+            .unwrap_or(0);
+
+        let file_size = meta.len();
+
+        // Step 2: check merkle_cache has an entry with matching mtime+size
+        let path_str = path.to_string_lossy().to_string();
+        let cache_ok: bool = self
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM merkle_cache WHERE file_path = ?1 AND mtime_ns = ?2 AND file_size = ?3",
+                    rusqlite::params![path_str, mtime_ns as i64, file_size as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+            })
+            .await?;
+
+        if !cache_ok {
+            return Ok(false);
+        }
+
+        // Step 3: check that merkle_tree_nodes has at least one row for this path
+        let path_str = path.to_string_lossy().to_string();
+        let has_nodes: bool = self
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM merkle_tree_nodes WHERE file_path = ?1",
+                    rusqlite::params![path_str],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+            })
+            .await?;
+
+        if !has_nodes {
+            return Ok(false);
+        }
+
+        // Step 4: check that merkle_leaf_info has at least one row for this path
+        let path_str = path.to_string_lossy().to_string();
+        let has_leaves: bool = self
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM merkle_leaf_info WHERE file_path = ?1",
+                    rusqlite::params![path_str],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+            })
+            .await?;
+
+        Ok(has_leaves)
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +489,10 @@ mod tests {
     use rift_common::crypto::{Blake3Hash, LeafInfo, MerkleTree};
     use std::collections::HashMap;
     use std::fs;
+
+    // =======================================================================
+    // is_cache_complete tests
+    // =======================================================================
 
     fn file_mtime_ns(path: &Path) -> u64 {
         let meta = fs::metadata(path).unwrap();
@@ -424,6 +505,147 @@ mod tests {
 
     fn file_size(path: &Path) -> u64 {
         fs::metadata(path).unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn is_cache_complete_returns_false_for_uncached_file() {
+        let db = Database::open_in_memory().await.unwrap();
+        let path = Path::new("/tmp/nonexistent.txt");
+        let result = db.is_cache_complete(path).await.unwrap();
+        assert!(!result, "uncached file should not be complete");
+    }
+
+    #[tokio::test]
+    async fn is_cache_complete_returns_true_for_fully_cached_file() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("complete.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        let mtime_ns = file_mtime_ns(&file_path);
+        let size = file_size(&file_path);
+        let tree = MerkleTree::default();
+        let leaf_infos = vec![LeafInfo {
+            hash: leaf.clone(),
+            offset: 0,
+            length: 5,
+            chunk_index: 0,
+        }];
+        let cache = tree.build_with_cache(std::slice::from_ref(&leaf)).1;
+
+        db.put_tree(&file_path, mtime_ns, size, &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        let result = db.is_cache_complete(&file_path).await.unwrap();
+        assert!(result, "fully cached file should be complete");
+    }
+
+    #[tokio::test]
+    async fn is_cache_complete_returns_false_for_stale_mtime() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("stale_mtime.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        // Use an obviously wrong mtime
+        let stale_mtime = 0u64;
+        let size = file_size(&file_path);
+
+        db.put_merkle(&file_path, stale_mtime, size, &root, &[leaf])
+            .await
+            .unwrap();
+
+        let result = db.is_cache_complete(&file_path).await.unwrap();
+        assert!(!result, "stale mtime should not be complete");
+    }
+
+    #[tokio::test]
+    async fn is_cache_complete_returns_false_for_stale_size() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("stale_size.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        let mtime_ns = file_mtime_ns(&file_path);
+        // Use an obviously wrong size
+        let stale_size = 999u64;
+
+        db.put_merkle(&file_path, mtime_ns, stale_size, &root, &[leaf])
+            .await
+            .unwrap();
+
+        let result = db.is_cache_complete(&file_path).await.unwrap();
+        assert!(!result, "stale size should not be complete");
+    }
+
+    #[tokio::test]
+    async fn is_cache_complete_returns_false_with_missing_tree_nodes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("missing_nodes.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        let mtime_ns = file_mtime_ns(&file_path);
+        let size = file_size(&file_path);
+
+        // Only put the merkle_cache row, but NOT merkle_tree_nodes or merkle_leaf_info
+        db.put_merkle(&file_path, mtime_ns, size, &root, &[leaf])
+            .await
+            .unwrap();
+
+        // merkle_cache has the entry but merkle_tree_nodes is empty
+        let result = db.is_cache_complete(&file_path).await.unwrap();
+        assert!(!result, "missing tree nodes should not be complete");
+    }
+
+    #[tokio::test]
+    async fn is_cache_complete_returns_false_with_missing_leaf_info() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("missing_leaf_info.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        let mtime_ns = file_mtime_ns(&file_path);
+        let size = file_size(&file_path);
+        let tree = MerkleTree::default();
+        let cache = tree.build_with_cache(std::slice::from_ref(&leaf)).1;
+
+        // Put merkle_cache + merkle_tree_nodes but NOT merkle_leaf_info
+        // We use put_tree which inserts all three, then manually delete leaf_info
+        let leaf_infos = vec![LeafInfo {
+            hash: leaf.clone(),
+            offset: 0,
+            length: 5,
+            chunk_index: 0,
+        }];
+        db.put_tree(&file_path, mtime_ns, size, &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        // Delete merkle_leaf_info rows to simulate incomplete cache
+        let path_str = file_path.to_string_lossy().to_string();
+        db.call(move |conn| {
+            conn.execute(
+                "DELETE FROM merkle_leaf_info WHERE file_path = ?1",
+                [path_str],
+            )
+        })
+        .await
+        .unwrap();
+
+        let result = db.is_cache_complete(&file_path).await.unwrap();
+        assert!(!result, "missing leaf info should not be complete");
     }
 
     #[tokio::test]
