@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rift_common::crypto::Chunker;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::handler::merkle_cache::cache_computed_tree;
@@ -187,7 +187,7 @@ fn record_status_counts(status: &CacheStatus, summary: &mut BackgroundCheckSumma
     match status {
         CacheStatus::Missing => {
             summary.files_added += 1;
-            info!(path = %path.display(), "missing cache entry, computing");
+            debug!(path = %path.display(), "missing cache entry, computing");
         }
         CacheStatus::Stale => {
             summary.files_stale += 1;
