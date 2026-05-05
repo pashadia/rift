@@ -10,6 +10,22 @@ use std::time::UNIX_EPOCH;
 use tokio_rusqlite::rusqlite;
 use tokio_rusqlite::Result as SqliteResult;
 
+/// Status of a file's Merkle cache entry.
+///
+/// Returned by [`Database::cache_status`] — a pure-DB check that accepts
+/// `mtime_ns` and `file_size` from the caller so it has no filesystem I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    /// Cache entry exists with matching key + tree nodes + leaf info.
+    Complete,
+    /// Cache entry exists but mtime/size differ from the supplied key.
+    Stale,
+    /// No cache entry at all for this path.
+    Missing,
+    /// Cache entry exists with matching key but `tree_nodes` or `leaf_info` are absent.
+    Incomplete,
+}
+
 /// Check if an error is `QueryReturnedNoRows`.
 ///
 /// This helper avoids fragile string matching and uses proper
@@ -46,9 +62,8 @@ impl Database {
         let mtime_ns = meta
             .modified()
             .map(|t| {
-                t.duration_since(UNIX_EPOCH).map_or(0, |d| {
-                    u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64")
-                })
+                t.duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0))
             })
             .unwrap_or(0);
 
@@ -404,81 +419,65 @@ impl Database {
         }
     }
 
-    /// Check whether the cache for a given file path is complete and consistent.
+    /// Determine the cache status for a given file path.
     ///
-    /// Returns `true` only if:
-    /// 1. A `merkle_cache` entry exists for the path with mtime/size matching
-    ///    the current filesystem metadata.
-    /// 2. At least one `merkle_tree_nodes` row exists for the path.
-    /// 3. At least one `merkle_leaf_info` row exists for the path.
+    /// Purely database-based check — caller must supply current filesystem
+    /// `mtime_ns` and `file_size` so the method has no I/O coupling.
     ///
-    /// Used by the background integrity check to distinguish between
-    /// fully-cached entries, stale entries, and orphaned entries.
-    pub async fn is_cache_complete(&self, path: &Path) -> SqliteResult<bool> {
-        use std::fs;
-
-        // Step 1: verify filesystem metadata matches the cache key
-        let Ok(meta) = fs::metadata(path) else {
-            return Ok(false);
-        };
-
-        let mtime_ns = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64"))
-            .unwrap_or(0);
-
-        let file_size = meta.len();
-
-        // Step 2: check merkle_cache has an entry with matching mtime+size
+    /// Single SQL round-trip using `EXISTS` subqueries.
+    pub async fn cache_status(
+        &self,
+        path: &Path,
+        mtime_ns: u64,
+        file_size: u64,
+    ) -> SqliteResult<CacheStatus> {
         let path_str = path.to_string_lossy().to_string();
-        let cache_ok: bool = self
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM merkle_cache WHERE file_path = ?1 AND mtime_ns = ?2 AND file_size = ?3",
+        self.call(move |conn| {
+            // 1 = cache entry with matching key exists
+            let cache_hit: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM merkle_cache WHERE file_path = ?1 AND mtime_ns = ?2 AND file_size = ?3)",
                     rusqlite::params![path_str, mtime_ns as i64, file_size as i64],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|count| count > 0)
-            })
-            .await?;
+                    |row| row.get::<_, bool>(0),
+                )?;
 
-        if !cache_ok {
-            return Ok(false);
-        }
+            if !cache_hit {
+                // Check if an entry exists with WRONG key → Stale
+                let any_entry: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM merkle_cache WHERE file_path = ?1)",
+                        rusqlite::params![path_str],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                return Ok(if any_entry { CacheStatus::Stale } else { CacheStatus::Missing });
+            }
 
-        // Step 3: check that merkle_tree_nodes has at least one row for this path
-        let path_str = path.to_string_lossy().to_string();
-        let has_nodes: bool = self
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM merkle_tree_nodes WHERE file_path = ?1",
+            // Cache key matches — check completeness
+            let has_nodes: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM merkle_tree_nodes WHERE file_path = ?1)",
                     rusqlite::params![path_str],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|count| count > 0)
-            })
-            .await?;
+                    |row| row.get::<_, bool>(0),
+                )?;
 
-        if !has_nodes {
-            return Ok(false);
-        }
+            if !has_nodes {
+                return Ok(CacheStatus::Incomplete);
+            }
 
-        // Step 4: check that merkle_leaf_info has at least one row for this path
-        let path_str = path.to_string_lossy().to_string();
-        let has_leaves: bool = self
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM merkle_leaf_info WHERE file_path = ?1",
+            let has_leaves: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM merkle_leaf_info WHERE file_path = ?1)",
                     rusqlite::params![path_str],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|count| count > 0)
-            })
-            .await?;
+                    |row| row.get::<_, bool>(0),
+                )?;
 
-        Ok(has_leaves)
+            if has_leaves {
+                Ok(CacheStatus::Complete)
+            } else {
+                Ok(CacheStatus::Incomplete)
+            }
+        })
+        .await
     }
 }
 
@@ -491,7 +490,7 @@ mod tests {
     use std::fs;
 
     // =======================================================================
-    // is_cache_complete tests
+    // cache_status tests
     // =======================================================================
 
     fn file_mtime_ns(path: &Path) -> u64 {
@@ -508,15 +507,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_cache_complete_returns_false_for_uncached_file() {
+    async fn cache_status_returns_missing_for_no_entry() {
         let db = Database::open_in_memory().await.unwrap();
         let path = Path::new("/tmp/nonexistent.txt");
-        let result = db.is_cache_complete(path).await.unwrap();
-        assert!(!result, "uncached file should not be complete");
+        let result = db.cache_status(path, 0, 0).await.unwrap();
+        assert_eq!(result, CacheStatus::Missing, "no entry → Missing");
     }
 
     #[tokio::test]
-    async fn is_cache_complete_returns_true_for_fully_cached_file() {
+    async fn cache_status_returns_complete_for_fully_cached_file() {
         let db = Database::open_in_memory().await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("complete.txt");
@@ -539,12 +538,12 @@ mod tests {
             .await
             .unwrap();
 
-        let result = db.is_cache_complete(&file_path).await.unwrap();
-        assert!(result, "fully cached file should be complete");
+        let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
+        assert_eq!(result, CacheStatus::Complete, "fully cached → Complete");
     }
 
     #[tokio::test]
-    async fn is_cache_complete_returns_false_for_stale_mtime() {
+    async fn cache_status_returns_stale_for_wrong_mtime() {
         let db = Database::open_in_memory().await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("stale_mtime.txt");
@@ -552,20 +551,22 @@ mod tests {
 
         let root = Blake3Hash::new(b"root");
         let leaf = Blake3Hash::new(b"leaf");
-        // Use an obviously wrong mtime
         let stale_mtime = 0u64;
         let size = file_size(&file_path);
 
+        // Store with stale mtime
         db.put_merkle(&file_path, stale_mtime, size, &root, &[leaf])
             .await
             .unwrap();
 
-        let result = db.is_cache_complete(&file_path).await.unwrap();
-        assert!(!result, "stale mtime should not be complete");
+        // Query with the CORRECT mtime → should see Stale (entry exists but key differs)
+        let real_mtime = file_mtime_ns(&file_path);
+        let result = db.cache_status(&file_path, real_mtime, size).await.unwrap();
+        assert_eq!(result, CacheStatus::Stale, "wrong mtime → Stale");
     }
 
     #[tokio::test]
-    async fn is_cache_complete_returns_false_for_stale_size() {
+    async fn cache_status_returns_stale_for_wrong_size() {
         let db = Database::open_in_memory().await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("stale_size.txt");
@@ -574,19 +575,24 @@ mod tests {
         let root = Blake3Hash::new(b"root");
         let leaf = Blake3Hash::new(b"leaf");
         let mtime_ns = file_mtime_ns(&file_path);
-        // Use an obviously wrong size
         let stale_size = 999u64;
 
+        // Store with stale size
         db.put_merkle(&file_path, mtime_ns, stale_size, &root, &[leaf])
             .await
             .unwrap();
 
-        let result = db.is_cache_complete(&file_path).await.unwrap();
-        assert!(!result, "stale size should not be complete");
+        // Query with the CORRECT size → should see Stale
+        let real_size = file_size(&file_path);
+        let result = db
+            .cache_status(&file_path, mtime_ns, real_size)
+            .await
+            .unwrap();
+        assert_eq!(result, CacheStatus::Stale, "wrong size → Stale");
     }
 
     #[tokio::test]
-    async fn is_cache_complete_returns_false_with_missing_tree_nodes() {
+    async fn cache_status_returns_incomplete_for_missing_tree_nodes() {
         let db = Database::open_in_memory().await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("missing_nodes.txt");
@@ -597,18 +603,21 @@ mod tests {
         let mtime_ns = file_mtime_ns(&file_path);
         let size = file_size(&file_path);
 
-        // Only put the merkle_cache row, but NOT merkle_tree_nodes or merkle_leaf_info
+        // Only put the merkle_cache row, NOT merkle_tree_nodes or merkle_leaf_info
         db.put_merkle(&file_path, mtime_ns, size, &root, &[leaf])
             .await
             .unwrap();
 
-        // merkle_cache has the entry but merkle_tree_nodes is empty
-        let result = db.is_cache_complete(&file_path).await.unwrap();
-        assert!(!result, "missing tree nodes should not be complete");
+        let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
+        assert_eq!(
+            result,
+            CacheStatus::Incomplete,
+            "missing tree nodes → Incomplete"
+        );
     }
 
     #[tokio::test]
-    async fn is_cache_complete_returns_false_with_missing_leaf_info() {
+    async fn cache_status_returns_incomplete_for_missing_leaf_info() {
         let db = Database::open_in_memory().await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("missing_leaf_info.txt");
@@ -621,8 +630,7 @@ mod tests {
         let tree = MerkleTree::default();
         let cache = tree.build_with_cache(std::slice::from_ref(&leaf)).1;
 
-        // Put merkle_cache + merkle_tree_nodes but NOT merkle_leaf_info
-        // We use put_tree which inserts all three, then manually delete leaf_info
+        // Put all three, then manually delete leaf_info
         let leaf_infos = vec![LeafInfo {
             hash: leaf.clone(),
             offset: 0,
@@ -633,7 +641,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete merkle_leaf_info rows to simulate incomplete cache
         let path_str = file_path.to_string_lossy().to_string();
         db.call(move |conn| {
             conn.execute(
@@ -644,8 +651,12 @@ mod tests {
         .await
         .unwrap();
 
-        let result = db.is_cache_complete(&file_path).await.unwrap();
-        assert!(!result, "missing leaf info should not be complete");
+        let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
+        assert_eq!(
+            result,
+            CacheStatus::Incomplete,
+            "missing leaf info → Incomplete"
+        );
     }
 
     #[tokio::test]

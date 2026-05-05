@@ -6,4 +6,4 @@
 pub mod db;
 pub mod merkle;
 
-pub use db::CacheEntry;
+pub use merkle::CacheStatus;

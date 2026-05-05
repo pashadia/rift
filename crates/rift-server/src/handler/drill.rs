@@ -201,7 +201,7 @@ async fn build_tree_and_cache<M: MerkleCache>(
             .modified()
             .map(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| u64::try_from(d.as_nanos()).expect("timestamp nanos fit in u64"))
+                    .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
                     .unwrap_or(0)
             })
             .unwrap_or(0);
