@@ -30,6 +30,7 @@ tempfile.workspace = true
 bytes.workspace = true
 zeroize.workspace = true
 arc-swap.workspace = true
+hex = "0.4"
 
 rift-common = { path = "../rift-common" }
 rift-protocol = { path = "../rift-protocol" }
@@ -52,6 +53,7 @@ rift-server = { path = "../rift-server" }
 prost-types.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-test = "0.2"
 
 [lints]
 workspace = true

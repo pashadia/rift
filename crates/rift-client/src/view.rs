@@ -131,6 +131,7 @@ impl<R: RemoteShare> RiftShareView<R> {
 
     /// Recursively drills into the Merkle tree, verifying hashes at each level,
     /// and returns all resolved leaf nodes sorted by `chunk_index`.
+    #[allow(clippy::cognitive_complexity)]
     async fn resolve_merkle_tree(
         &self,
         handle: Uuid,
@@ -148,6 +149,11 @@ impl<R: RemoteShare> RiftShareView<R> {
             Blake3Hash::from_slice(&drill.parent_hash).map_err(|_| FsError::Io)?;
 
         if root_hash_from_drill != *root_hash {
+            tracing::info!(
+                expected = ?root_hash,
+                actual = ?root_hash_from_drill,
+                "merkle root mismatch: server vs cache"
+            );
             tracing::error!("merkle root hash mismatch");
             return Err(FsError::Io);
         }
@@ -163,6 +169,11 @@ impl<R: RemoteShare> RiftShareView<R> {
                 .collect();
 
             if !MerkleTree::verify_node(&parent_hash, &child_hashes) {
+                tracing::info!(
+                    parent_hash = ?parent_hash,
+                    child_count = child_hashes.len(),
+                    "merkle verification failed — cache conflict"
+                );
                 tracing::error!("merkle verification failed at node");
                 return Err(FsError::Io);
             }

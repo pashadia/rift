@@ -49,6 +49,7 @@ rcgen.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 filetime = "0.2"
+tracing-test = "0.2"
 
 [lints]
 workspace = true
