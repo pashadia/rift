@@ -1,5 +1,6 @@
 //! Rift Server Library
 
+pub mod background_check;
 pub mod cert;
 pub mod config;
 pub mod handle;

@@ -71,7 +71,10 @@ fn classify_file_type(meta: &std::fs::Metadata) -> FileType {
 
 /// Compute the Merkle tree for a regular file by chunking and hashing.
 /// Returns the root hash, the tree cache, and leaf infos for caching.
-async fn compute_file_merkle_tree(
+///
+/// This is a shared utility used by both request handlers and the
+/// background integrity check.
+pub(crate) async fn compute_file_merkle_tree(
     path: &Path,
     chunker: &Chunker,
 ) -> Option<(
@@ -112,7 +115,10 @@ async fn compute_file_merkle_tree(
 }
 
 /// Cache a computed Merkle tree with current file metadata.
-async fn cache_computed_tree<M: MerkleCache>(
+///
+/// This is a shared utility used by both request handlers and the
+/// background integrity check.
+pub(crate) async fn cache_computed_tree<M: MerkleCache>(
     path: &Path,
     cache: &M,
     root: &Blake3Hash,
