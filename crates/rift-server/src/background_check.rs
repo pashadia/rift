@@ -235,6 +235,7 @@ mod tests {
     use crate::metadata::db::Database;
     use crate::metadata::merkle::CacheStatus;
     use rift_common::crypto::Blake3Hash;
+    use tokio_rusqlite::rusqlite;
 
     #[tokio::test]
     async fn background_check_caches_empty_share() {
@@ -303,16 +304,19 @@ mod tests {
 
         let db: Arc<Database> = Arc::new(Database::open_in_memory().await.unwrap());
 
-        // Pre-populate cache with WRONG mtime (simulates stale entry)
+        // Pre-populate cache with WRONG mtime (simulates stale entry) using direct SQL
         let root = Blake3Hash::new(b"wrong_root");
         let leaf = Blake3Hash::new(b"wrong_leaf");
-        db.put_merkle(
-            &file_path,
-            0,   // wrong mtime
-            999, // wrong size
-            &root,
-            std::slice::from_ref(&leaf),
-        )
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let serialized_leaves =
+            rift_common::crypto::MerkleTree::default().serialize_leaves(&[leaf]);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, 0i64, 999i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
         .await
         .unwrap();
 
@@ -400,9 +404,7 @@ mod tests {
 
         // Create a proper incomplete entry: cache row with non-zero leaf_count,
         // tree nodes present, but leaf_info missing. We use raw SQL because
-        // put_tree would never produce this inconsistent state, and put_merkle
-        // with zero leaves would now correctly be interpreted as Complete for
-        // an empty file.
+        // put_tree would never produce this inconsistent state.
         let root = Blake3Hash::new(b"incomplete_root");
         let meta = std::fs::metadata(&file_path).unwrap();
         let mtime_ns = u64::try_from(

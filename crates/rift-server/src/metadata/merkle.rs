@@ -122,59 +122,6 @@ impl Database {
     ///
     /// Overwrites any existing entry for this file.
     ///
-    /// `path` must be a canonical path (i.e. the result of `canonicalize()`).
-    /// The handler always canonicalises paths before calling this function.
-    /// Tests that pre-populate the cache must do the same, or cache lookups
-    /// will silently miss on systems where temp directories involve symlinks
-    /// (e.g. macOS `/var` → `/private/var`).
-    ///
-    /// Takes explicit `mtime_ns` and `file_size` rather than reading from the
-    /// filesystem, so callers can pass verified/cached values.
-    pub async fn put_merkle(
-        &self,
-        path: &Path,
-        mtime_ns: u64,
-        file_size: u64,
-        root: &Blake3Hash,
-        leaf_hashes: &[Blake3Hash],
-    ) -> SqliteResult<()> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()) as i64;
-
-        let merkle = MerkleTree::default();
-        let serialized_leaves = merkle.serialize_leaves(leaf_hashes);
-
-        let path_str = path.to_string_lossy().to_string();
-        let root_bytes = root.as_bytes().to_vec();
-        let serialized = serialized_leaves;
-
-        // Truncation only possible if usize > i64::MAX, which cannot happen for leaf counts.
-        let leaf_count = leaf_hashes.len() as i64;
-
-        self.call(move |conn: &mut rusqlite::Connection| {
-            conn.execute(
-                "INSERT OR REPLACE INTO merkle_cache
-                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                (
-                    path_str,
-                    mtime_ns as i64,
-                    file_size as i64,
-                    root_bytes,
-                    serialized,
-                    leaf_count,
-                    now,
-                ),
-            )
-        })
-        .await?;
-
-        Ok(())
-    }
-
     /// Store a complete Merkle tree for a file, including intermediate
     /// nodes and leaf metadata.
     ///
@@ -539,10 +486,18 @@ mod tests {
         let stale_mtime = 0u64;
         let size = file_size(&file_path);
 
-        // Store with stale mtime
-        db.put_merkle(&file_path, stale_mtime, size, &root, &[leaf])
-            .await
-            .unwrap();
+        // Store with stale mtime using direct SQL
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let serialized_leaves = MerkleTree::default().serialize_leaves(&[leaf]);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, stale_mtime as i64, size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
+        .await
+        .unwrap();
 
         // Query with the CORRECT mtime → should see Stale (entry exists but key differs)
         let real_mtime = file_mtime_ns(&file_path);
@@ -562,10 +517,18 @@ mod tests {
         let mtime_ns = file_mtime_ns(&file_path);
         let stale_size = 999u64;
 
-        // Store with stale size
-        db.put_merkle(&file_path, mtime_ns, stale_size, &root, &[leaf])
-            .await
-            .unwrap();
+        // Store with stale size using direct SQL
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let serialized_leaves = MerkleTree::default().serialize_leaves(&[leaf]);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, stale_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
+        .await
+        .unwrap();
 
         // Query with the CORRECT size → should see Stale
         let real_size = file_size(&file_path);
@@ -588,10 +551,19 @@ mod tests {
         let mtime_ns = file_mtime_ns(&file_path);
         let size = file_size(&file_path);
 
-        // Only put the merkle_cache row, NOT merkle_tree_nodes or merkle_leaf_info
-        db.put_merkle(&file_path, mtime_ns, size, &root, &[leaf])
-            .await
-            .unwrap();
+        // Only insert merkle_cache row, NOT merkle_tree_nodes or merkle_leaf_info
+        // This creates an Incomplete entry
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let serialized_leaves = MerkleTree::default().serialize_leaves(&[leaf]);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
+        .await
+        .unwrap();
 
         let result = db.cache_status(&file_path, mtime_ns, size).await.unwrap();
         assert_eq!(
@@ -751,34 +723,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn merkle_cache_stores_and_retrieves() {
-        let db = Database::open_in_memory().await.unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.txt");
-
-        fs::write(&file_path, b"hello").unwrap();
-
-        let root = Blake3Hash::new(b"test");
-        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path),
-            file_size(&file_path),
-            &root,
-            &leaf_hashes,
-        )
-        .await
-        .unwrap();
-
-        let result = db.get_merkle(&file_path).await.unwrap();
-        assert!(result.is_some());
-
-        let entry = result.unwrap();
-        assert_eq!(entry.root, root);
-        assert_eq!(entry.leaf_hashes, leaf_hashes);
-    }
-
     // Unit tests for is_no_rows helper
     #[test]
     fn is_no_rows_detects_query_returned_no_rows() {
@@ -795,92 +739,6 @@ mod tests {
 
         let err = tokio_rusqlite::Error::ConnectionClosed;
         assert!(!is_no_rows(&err), "Should not match ConnectionClosed");
-    }
-
-    #[tokio::test]
-    async fn merkle_cache_stale_on_mtime_change() {
-        let db = Database::open_in_memory().await.unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.txt");
-
-        fs::write(&file_path, b"hello").unwrap();
-
-        let root = Blake3Hash::new(b"test");
-        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path),
-            file_size(&file_path),
-            &root,
-            &leaf_hashes,
-        )
-        .await
-        .unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        fs::write(&file_path, b"modified").unwrap();
-
-        let result = db.get_merkle(&file_path).await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn merkle_cache_stale_on_size_change() {
-        let db = Database::open_in_memory().await.unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.txt");
-
-        fs::write(&file_path, b"hello").unwrap();
-
-        let root = Blake3Hash::new(b"test");
-        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path),
-            file_size(&file_path),
-            &root,
-            &leaf_hashes,
-        )
-        .await
-        .unwrap();
-
-        fs::write(&file_path, b"much longer content").unwrap();
-
-        let result = db.get_merkle(&file_path).await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn merkle_cache_persists_across_reopen() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let file_path = temp_dir.path().join("test.txt");
-
-        fs::write(&file_path, b"hello").unwrap();
-
-        let root = Blake3Hash::new(b"test");
-        let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        {
-            let db = Database::open(&db_path).await.unwrap();
-            db.put_merkle(
-                &file_path,
-                file_mtime_ns(&file_path),
-                file_size(&file_path),
-                &root,
-                &leaf_hashes,
-            )
-            .await
-            .unwrap();
-        }
-
-        {
-            let db = Database::open(&db_path).await.unwrap();
-            let result = db.get_merkle(&file_path).await.unwrap();
-            assert!(result.is_some());
-
-            let entry = result.unwrap();
-            assert_eq!(entry.root, root);
-        }
     }
 
     #[tokio::test]

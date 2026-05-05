@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use prost::Message as _;
 use tempfile::TempDir;
+use tokio_rusqlite::rusqlite;
 use uuid::Uuid;
 
 use rift_protocol::messages::{
@@ -1628,13 +1629,20 @@ mod merkle_integration {
 
         let root_hash = Blake3Hash::new(b"test-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path),
-            file_size(&file_path),
-            &root_hash,
-            &leaf_hashes,
-        )
+
+        // Insert into cache using direct SQL
+        let mtime_ns = file_mtime_ns(&file_path);
+        let file_size = file_size(&file_path);
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root_hash.as_bytes().to_vec();
+        let serialized_leaves =
+            rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
         .await
         .unwrap();
 
@@ -1732,13 +1740,20 @@ mod merkle_integration {
 
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path),
-            file_size(&file_path),
-            &cached_root,
-            &leaf_hashes,
-        )
+
+        // Insert into cache using direct SQL
+        let mtime_ns = file_mtime_ns(&file_path);
+        let file_size = file_size(&file_path);
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = cached_root.as_bytes().to_vec();
+        let serialized_leaves =
+            rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
         .await
         .unwrap();
 
@@ -1773,13 +1788,20 @@ mod merkle_integration {
 
         let stale_root = Blake3Hash::new(b"stale-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path) - 1,
-            file_size(&file_path),
-            &stale_root,
-            &leaf_hashes,
-        )
+
+        // Insert into cache with STALE mtime using direct SQL
+        let mtime_ns = file_mtime_ns(&file_path) - 1; // stale mtime
+        let file_size = file_size(&file_path);
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = stale_root.as_bytes().to_vec();
+        let serialized_leaves =
+            rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
         .await
         .unwrap();
 
@@ -1953,13 +1975,20 @@ mod merkle_integration {
 
         let root_hash = Blake3Hash::new(b"hello-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file_path,
-            file_mtime_ns(&file_path),
-            file_size(&file_path),
-            &root_hash,
-            &leaf_hashes,
-        )
+
+        // Insert into cache using direct SQL
+        let mtime_ns = file_mtime_ns(&file_path);
+        let file_size = file_size(&file_path);
+        let path_str = file_path.to_string_lossy().to_string();
+        let root_bytes = root_hash.as_bytes().to_vec();
+        let serialized_leaves =
+            rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
         .await
         .unwrap();
 
@@ -2032,13 +2061,20 @@ mod merkle_integration {
 
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
-            &file1,
-            file_mtime_ns(&file1),
-            file_size(&file1),
-            &cached_root,
-            &leaf_hashes,
-        )
+
+        // Insert into cache using direct SQL
+        let mtime_ns = file_mtime_ns(&file1);
+        let file_size = file_size(&file1);
+        let path_str = file1.to_string_lossy().to_string();
+        let root_bytes = cached_root.as_bytes().to_vec();
+        let serialized_leaves =
+            rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+            )
+        })
         .await
         .unwrap();
 
@@ -2139,7 +2175,7 @@ mod helpers_with_db {
             .expect("sabotage SQL should succeed");
     }
 
-    /// Drop the `merkle_cache` table, causing `put_merkle` to fail.
+    /// Drop the `merkle_cache` table, causing DB writes to fail.
     /// stat and read still return correct data; they just can't cache.
     pub async fn drop_merkle_cache(db: &Database) {
         sabotage_db(db, "DROP TABLE IF EXISTS merkle_cache").await;
@@ -2194,13 +2230,20 @@ async fn server_sends_root_hash_when_db_configured() {
     let db = Database::open_in_memory().await.unwrap();
     let root_hash = Blake3Hash::new(b"test-content");
     let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-    db.put_merkle(
-        &file_path,
-        helpers_with_db::file_mtime_ns(&file_path),
-        helpers_with_db::file_size(&file_path),
-        &root_hash,
-        &leaf_hashes,
-    )
+
+    // Insert into cache using direct SQL
+    let mtime_ns = helpers_with_db::file_mtime_ns(&file_path);
+    let file_size = helpers_with_db::file_size(&file_path);
+    let path_str = file_path.to_string_lossy().to_string();
+    let root_bytes = root_hash.as_bytes().to_vec();
+    let serialized_leaves =
+        rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+        )
+    })
     .await
     .unwrap();
 
@@ -2318,13 +2361,20 @@ async fn stat_uses_cached_root_when_file_unchanged() {
     let db = Database::open_in_memory().await.unwrap();
     let cached_root = Blake3Hash::new(b"my-cached-root-hash");
     let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-    db.put_merkle(
-        &file_path,
-        helpers_with_db::file_mtime_ns(&file_path),
-        helpers_with_db::file_size(&file_path),
-        &cached_root,
-        &leaf_hashes,
-    )
+
+    // Insert into cache using direct SQL
+    let mtime_ns = helpers_with_db::file_mtime_ns(&file_path);
+    let file_size = helpers_with_db::file_size(&file_path);
+    let path_str = file_path.to_string_lossy().to_string();
+    let root_bytes = cached_root.as_bytes().to_vec();
+    let serialized_leaves =
+        rift_common::crypto::MerkleTree::default().serialize_leaves(&leaf_hashes);
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![path_str, mtime_ns as i64, file_size as i64, root_bytes, serialized_leaves, 1i64, 0i64],
+        )
+    })
     .await
     .unwrap();
 
@@ -3625,7 +3675,7 @@ mod db_failure_resilience_tests {
     use super::*;
     use rift_server::metadata::db::Database;
 
-    /// Stat must return a correct `root_hash` even when `put_merkle` fails.
+    /// Stat must return a correct `root_hash` even when DB writes fail.
     /// The root hash is computed from file content regardless of DB state.
     #[tokio::test]
     async fn stat_returns_correct_root_hash_despite_db_write_failure() {
@@ -3664,7 +3714,7 @@ mod db_failure_resilience_tests {
         assert_eq!(attrs.size, 10, "file size should be 10 bytes");
     }
 
-    /// Read must return correct chunk data even when `put_merkle` fails.
+    /// Read must return correct chunk data even when DB writes fail.
     /// The read handler computes content/chunks from the file regardless of DB state.
     #[tokio::test]
     async fn read_returns_correct_data_despite_db_write_failure() {
