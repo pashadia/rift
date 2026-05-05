@@ -334,20 +334,14 @@ mod tests {
         // Verify cache was populated — both files should now be Complete
         let file_a = share.join("a.txt");
         let meta_a = std::fs::metadata(&file_a).unwrap();
-        let mtime_a = u64::try_from(
-            meta_a
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_a = meta_a
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let size_a = meta_a.len();
         assert_eq!(
-            db.cache_status(&file_a, Some(mtime_a), size_a)
-                .await
-                .unwrap(),
+            db.cache_status(&file_a, mtime_a, size_a).await.unwrap(),
             CacheStatus::Complete,
             "file a should be cached after background check"
         );
@@ -407,19 +401,16 @@ mod tests {
             merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
 
         let meta = std::fs::metadata(&file_path).unwrap();
-        let mtime_ns = u64::try_from(
-            meta.modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let file_size = meta.len();
 
         db.put_tree(
             &file_path,
-            Some(mtime_ns),
+            mtime_ns,
             file_size,
             &root_hash,
             &cache,
@@ -464,14 +455,11 @@ mod tests {
         // an empty file.
         let root = Blake3Hash::new(b"incomplete_root");
         let meta = std::fs::metadata(&file_path).unwrap();
-        let mtime_ns = u64::try_from(
-            meta.modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let file_size = meta.len();
 
         let path_str = file_path.to_string_lossy().to_string();
@@ -481,7 +469,7 @@ mod tests {
             move |conn| {
                 conn.execute(
                     "INSERT INTO merkle_cache (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    (path_str2, mtime_ns as i64, file_size as i64, root_bytes, Vec::<u8>::new(), 1i64, 0i64),
+                    (path_str2, mtime_ns.map(|ns| ns as i64), file_size as i64, root_bytes, Vec::<u8>::new(), 1i64, 0i64),
                 )?;
                 // Insert a tree node so has_nodes is true
                 conn.execute(
@@ -507,8 +495,15 @@ mod tests {
         assert_eq!(summary.errors, 0);
 
         // After recomputation, cache should be complete
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
+        let file_size = meta.len();
         assert_eq!(
-            db.cache_status(&file_path, Some(mtime_ns), file_size)
+            db.cache_status(&file_path, mtime_ns, file_size)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -570,17 +565,14 @@ mod tests {
         let inside_path = share.join("inside.txt");
         let canonical_inside = inside_path.canonicalize().unwrap();
         let meta = std::fs::metadata(&canonical_inside).unwrap();
-        let mtime_ns = u64::try_from(
-            meta.modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
 
         assert_eq!(
-            db.cache_status(&canonical_inside, Some(mtime_ns), meta.len())
+            db.cache_status(&canonical_inside, mtime_ns, meta.len())
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -670,15 +662,11 @@ mod tests {
         // Write initial content and get its metadata
         std::fs::write(&file_path, b"v1 content here").unwrap();
         let meta_v1 = std::fs::metadata(&file_path).unwrap();
-        let mtime_v1 = u64::try_from(
-            meta_v1
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_v1 = meta_v1
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let size_v1 = meta_v1.len();
 
         let db: Arc<Database> = Arc::new(Database::open_in_memory().await.unwrap());
@@ -696,21 +684,14 @@ mod tests {
             let (root, cache, leaf_infos) =
                 merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
 
-            db.put_tree(
-                &file_path,
-                Some(mtime_v1),
-                size_v1,
-                &root,
-                &cache,
-                &leaf_infos,
-            )
-            .await
-            .unwrap();
+            db.put_tree(&file_path, mtime_v1, size_v1, &root, &cache, &leaf_infos)
+                .await
+                .unwrap();
         }
 
         // Verify cache status before modifications
         assert_eq!(
-            db.cache_status(&file_path, Some(mtime_v1), size_v1)
+            db.cache_status(&file_path, mtime_v1, size_v1)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -723,15 +704,11 @@ mod tests {
         std::fs::write(&file_path, b"v1 content here").unwrap();
 
         let meta_after = std::fs::metadata(&file_path).unwrap();
-        let mtime_after = u64::try_from(
-            meta_after
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_after = meta_after
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let size_after = meta_after.len();
 
         // Run background check
@@ -744,7 +721,7 @@ mod tests {
 
         // Verify the cache now matches the file's current state
         assert_eq!(
-            db.cache_status(&file_path, Some(mtime_after), size_after)
+            db.cache_status(&file_path, mtime_after, size_after)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -775,15 +752,11 @@ mod tests {
         // Write initial content and get its metadata
         std::fs::write(&file_path, b"v1 content here").unwrap();
         let meta_v1 = std::fs::metadata(&file_path).unwrap();
-        let mtime_v1 = u64::try_from(
-            meta_v1
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_v1 = meta_v1
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let size_v1 = meta_v1.len();
 
         let db: Arc<Database> = Arc::new(Database::open_in_memory().await.unwrap());
@@ -801,21 +774,14 @@ mod tests {
             let (root, cache, leaf_infos) =
                 merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
 
-            db.put_tree(
-                &file_path,
-                Some(mtime_v1),
-                size_v1,
-                &root,
-                &cache,
-                &leaf_infos,
-            )
-            .await
-            .unwrap();
+            db.put_tree(&file_path, mtime_v1, size_v1, &root, &cache, &leaf_infos)
+                .await
+                .unwrap();
         }
 
         // Verify cache status before modifications
         assert_eq!(
-            db.cache_status(&file_path, Some(mtime_v1), size_v1)
+            db.cache_status(&file_path, mtime_v1, size_v1)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
@@ -861,19 +827,15 @@ mod tests {
 
         // Cache should now be complete for the new content
         let meta_v2 = std::fs::metadata(&file_path).unwrap();
-        let mtime_v2 = u64::try_from(
-            meta_v2
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap_or(0);
+        let mtime_v2 = meta_v2
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok());
         let size_v2 = meta_v2.len();
 
         assert_eq!(
-            db.cache_status(&file_path, Some(mtime_v2), size_v2)
+            db.cache_status(&file_path, mtime_v2, size_v2)
                 .await
                 .unwrap(),
             CacheStatus::Complete,
