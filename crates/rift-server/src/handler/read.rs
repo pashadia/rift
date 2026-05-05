@@ -144,6 +144,11 @@ async fn send_cached_chunk_frames<S: RiftStream>(
     end: usize,
     buf: &mut BytesMut,
 ) -> anyhow::Result<()> {
+    tracing::info!(
+        chunk_count = end - start,
+        start_chunk = start,
+        "sending chunks (warm path)"
+    );
     for (i, info) in leaf_infos[start..end].iter().enumerate() {
         let chunk_idx = start + i;
         let expected_hash = &leaf_hashes[chunk_idx];
@@ -319,6 +324,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
 
     // Try warm path: use cached chunk boundaries for incremental read.
     if let Some(cached) = db.get_merkle(&canonical).await.ok().flatten() {
+        tracing::info!(path = %canonical.display(), chunks = cached.leaf_hashes.len(), "warm path cache hit");
         match stream_cached_read(
             stream,
             &canonical,
@@ -350,6 +356,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     };
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
     let chunk_boundaries = chunker.chunk_stream(reader).await;
+    tracing::info!(path = %canonical.display(), chunk_count = chunk_boundaries.len(), file_size = meta.len(), "chunking file (cold path)");
 
     if req.start_chunk as usize >= chunk_boundaries.len() {
         return send_read_error(stream, ErrorCode::ErrorNotFound).await;
@@ -424,7 +431,10 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     let (leaf_hashes, _chunk_boundaries, root, cache, leaf_infos, chunk_data_for_range) =
         cold_result;
 
+    tracing::info!(path = %canonical.display(), leaf_count = leaf_hashes.len(), merkle_root = %format!("{:?}", root), "merkle tree built (cold path)");
+
     // Phase 3: Send frames (async) and cache tree
+    tracing::info!(path = %canonical.display(), chunk_count = chunk_data_for_range.len(), "sending chunks");
     for (i, buf) in chunk_data_for_range {
         let hash = &leaf_hashes[i];
         let block_header = BlockHeader {
@@ -460,9 +470,11 @@ mod tests {
     use super::*;
 
     use prost::Message;
+
     use rift_common::crypto::{Blake3Hash, Chunker, MerkleTree};
     use rift_transport::connection::InMemoryConnection;
     use rift_transport::RiftConnection;
+    use tracing_test::traced_test;
 
     use crate::handle::HandleDatabase;
     use crate::handler::NoopCache;
@@ -1187,5 +1199,221 @@ mod tests {
             &new_content[..],
             "fallback must return modified content after hash mismatch"
         );
+    }
+
+    /// Log 1: Cold path must emit an INFO log after chunking completes.
+    #[tokio::test]
+    #[traced_test]
+    async fn cold_path_emits_info_log_for_chunking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("chunking_log.txt");
+        // ~1 MB file
+        let content: Vec<u8> = (0u8..=255).cycle().take(1_000_000).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let _frames = collect_frames(&mut client_stream).await;
+
+        logs_assert(|lines: &[&str]| {
+            let has = lines
+                .iter()
+                .any(|l| l.contains(" INFO ") && l.contains("chunking file"));
+            if !has {
+                return Err("missing INFO 'chunking file' log".to_string());
+            }
+            Ok(())
+        });
+    }
+
+    /// Log 2: Cold path must emit an INFO log after Merkle tree is built.
+    #[tokio::test]
+    #[traced_test]
+    async fn cold_path_emits_info_log_for_merkle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("merkle_log.txt");
+        // ~1 MB file
+        let content: Vec<u8> = (0u8..=255).cycle().take(1_000_000).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let _frames = collect_frames(&mut client_stream).await;
+
+        logs_assert(|lines: &[&str]| {
+            let has = lines
+                .iter()
+                .any(|l| l.contains(" INFO ") && l.contains("merkle tree built"));
+            if !has {
+                return Err("missing INFO 'merkle tree built' log".to_string());
+            }
+            Ok(())
+        });
+    }
+
+    /// Log 3: Cold path must emit an INFO log before sending chunk frames.
+    #[tokio::test]
+    #[traced_test]
+    async fn serving_chunks_emits_info_log() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("serving_log.txt");
+        // ~1 MB file
+        let content: Vec<u8> = (0u8..=255).cycle().take(1_000_000).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let _frames = collect_frames(&mut client_stream).await;
+
+        logs_assert(|lines: &[&str]| {
+            let has = lines
+                .iter()
+                .any(|l| l.contains(" INFO ") && l.contains("sending chunks"));
+            if !has {
+                return Err("missing INFO 'sending chunks' log".to_string());
+            }
+            Ok(())
+        });
+    }
+
+    /// Log 4: Warm path must emit an INFO log when cache hit is detected.
+    #[tokio::test]
+    #[traced_test]
+    async fn warm_path_hit_emits_info_log() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("warm_hit_log.txt");
+        let content = b"hello world warm path hit";
+        std::fs::write(&file, content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
+
+        // Pre-populate cache so the warm path is taken
+        let db = Database::open_in_memory().await.unwrap();
+        let file_content = std::fs::read(&file).unwrap();
+        let chunker = Chunker::default();
+        let chunk_boundaries = chunker.chunk(&file_content);
+        let leaf_hashes: Vec<Blake3Hash> = chunk_boundaries
+            .iter()
+            .map(|(offset, length)| Blake3Hash::new(&file_content[*offset..*offset + *length]))
+            .collect();
+        let merkle = MerkleTree::default();
+        let (root, cache, leaf_infos) =
+            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries);
+
+        let meta = std::fs::metadata(&canonical).unwrap();
+        let mtime_ns = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        db.put_tree(&canonical, mtime_ns, meta.len(), &root, &cache, &leaf_infos)
+            .await
+            .unwrap();
+
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &db,
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let _frames = collect_frames(&mut client_stream).await;
+
+        logs_assert(|lines: &[&str]| {
+            let has = lines
+                .iter()
+                .any(|l| l.contains(" INFO ") && l.contains("warm path cache hit"));
+            if !has {
+                return Err("missing INFO 'warm path cache hit' log".to_string());
+            }
+            Ok(())
+        });
     }
 }
