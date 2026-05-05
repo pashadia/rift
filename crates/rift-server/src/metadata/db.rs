@@ -130,6 +130,52 @@ impl Database {
         })
         .await
     }
+
+    /// Delete all cache entries (`merkle_cache`, `merkle_tree_nodes`, `merkle_leaf_info`)
+    /// where the `file_path` is NOT in the provided `existing_paths` set.
+    ///
+    /// Returns the number of orphaned file paths removed.
+    /// Used by the background integrity check to clean up entries for files
+    /// that have been deleted from the share.
+    pub async fn delete_orphaned_entries(&self, existing_paths: &[String]) -> SqliteResult<u64> {
+        // Collect all distinct file_paths in the DB that are NOT in existing_paths
+        let existing = existing_paths.to_vec();
+        let deleted: u64 = self
+            .call(move |conn| {
+                // Find orphan paths first
+                let mut orphan_paths: Vec<String> = Vec::new();
+                let mut stmt = conn.prepare("SELECT DISTINCT file_path FROM merkle_cache")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let path = row?;
+                    if !existing.contains(&path) {
+                        orphan_paths.push(path);
+                    }
+                }
+
+                let count = orphan_paths.len() as u64;
+
+                // Delete from all three tables
+                for path in &orphan_paths {
+                    conn.execute(
+                        "DELETE FROM merkle_cache WHERE file_path = ?1",
+                        rusqlite::params![path],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM merkle_tree_nodes WHERE file_path = ?1",
+                        rusqlite::params![path],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM merkle_leaf_info WHERE file_path = ?1",
+                        rusqlite::params![path],
+                    )?;
+                }
+
+                Ok(count)
+            })
+            .await?;
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
@@ -511,5 +557,103 @@ mod tests {
             result.is_err(),
             "Duplicate (file_path, chunk_hash) should fail"
         );
+    }
+
+    // =======================================================================
+    // delete_orphaned_entries tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn delete_orphaned_entries_removes_stale_entries() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Insert a cache entry for a file that doesn't exist on disk
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        db.put_merkle(
+            Path::new("/nonexistent/file.txt"),
+            100,
+            50,
+            &root,
+            std::slice::from_ref(&leaf),
+        )
+        .await
+        .unwrap();
+
+        // Also insert tree nodes and leaf info for the nonexistent file
+        let hash_bytes = root.as_bytes().to_vec();
+        let children_bytes = postcard::to_allocvec(&vec![rift_common::crypto::MerkleChild::Leaf {
+            hash: leaf.clone(),
+            length: 50,
+            chunk_index: 0,
+        }])
+        .unwrap();
+        let path_str = "/nonexistent/file.txt".to_string();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_tree_nodes (file_path, node_hash, children) VALUES (?1, ?2, ?3)",
+                rusqlite::params![path_str, hash_bytes, children_bytes],
+            )
+        }).await.unwrap();
+
+        let path_str2 = "/nonexistent/file.txt".to_string();
+        let chunk_hash2 = leaf.as_bytes().to_vec();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO merkle_leaf_info (file_path, chunk_hash, chunk_offset, chunk_length, chunk_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![path_str2, chunk_hash2, 0i64, 50i64, 0i64],
+            )
+        }).await.unwrap();
+
+        // Verify entries exist
+        let entries = db.list_cached_entries().await.unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Delete orphaned entries, keeping only paths that exist
+        let existing_paths: Vec<String> = vec!["/real/existing.txt".to_string()];
+        let deleted = db.delete_orphaned_entries(&existing_paths).await.unwrap();
+
+        assert_eq!(deleted, 1, "should have deleted 1 orphaned entry");
+        let entries = db.list_cached_entries().await.unwrap();
+        assert!(entries.is_empty(), "all entries should be removed");
+    }
+
+    #[tokio::test]
+    async fn delete_orphaned_entries_keeps_existing_entries() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("exists.txt");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime_ns = u64::try_from(
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .expect("timestamp nanos fit in u64");
+
+        let root = Blake3Hash::new(b"root");
+        let leaf = Blake3Hash::new(b"leaf");
+        db.put_merkle(&file_path, mtime_ns, 4, &root, std::slice::from_ref(&leaf))
+            .await
+            .unwrap();
+
+        let existing_paths: Vec<String> = vec![file_path.to_string_lossy().to_string()];
+        let deleted = db.delete_orphaned_entries(&existing_paths).await.unwrap();
+
+        assert_eq!(deleted, 0, "no entries should be deleted");
+        let entries = db.list_cached_entries().await.unwrap();
+        assert_eq!(entries.len(), 1, "existing entry should remain");
+    }
+
+    #[tokio::test]
+    async fn delete_orphaned_entries_returns_zero_on_empty_db() {
+        let db = Database::open_in_memory().await.unwrap();
+        let existing_paths: Vec<String> = vec!["/some/path.txt".to_string()];
+        let deleted = db.delete_orphaned_entries(&existing_paths).await.unwrap();
+        assert_eq!(deleted, 0, "empty db should have no orphans");
     }
 }
