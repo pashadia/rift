@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use rift_common::crypto::{Blake3Hash, LeafInfo, MerkleChild};
 
-use crate::metadata::db::Database;
+use crate::metadata::db::{CacheEntry, Database};
 use crate::metadata::merkle::MerkleEntry;
 
 pub type SqliteResult<T> = Result<T, tokio_rusqlite::Error>;
@@ -19,6 +19,10 @@ pub type GetChildrenFut<'a> =
 pub type GetAllLeafInfoFut<'a> =
     Pin<Box<dyn Future<Output = SqliteResult<Option<Vec<LeafInfo>>>> + Send + 'a>>;
 pub type DeleteMerkleFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + Send + 'a>>;
+pub type ListCachedEntriesFut<'a> =
+    Pin<Box<dyn Future<Output = SqliteResult<Vec<CacheEntry>>> + Send + 'a>>;
+pub type IsCacheCompleteFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<bool>> + Send + 'a>>;
+pub type DeleteOrphanedFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<u64>> + Send + 'a>>;
 
 /// Trait abstracting Merkle tree cache operations.
 ///
@@ -51,6 +55,17 @@ pub trait MerkleCache: Send + Sync {
     ) -> PutTreeFut<'a>;
 
     fn get_children<'a>(&'a self, path: &'a Path, node_hash: &'a Blake3Hash) -> GetChildrenFut<'a>;
+
+    /// List all cached entries for the background integrity check.
+    fn list_cached_entries<'a>(&'a self) -> ListCachedEntriesFut<'a>;
+
+    /// Check whether the cache for a given file path is complete and consistent.
+    fn is_cache_complete<'a>(&'a self, path: &'a Path) -> IsCacheCompleteFut<'a>;
+
+    /// Delete all cache entries where `file_path` is NOT in `existing_paths`.
+    /// Returns the number of orphaned paths removed.
+    fn delete_orphaned_entries<'a>(&'a self, existing_paths: &'a [String])
+        -> DeleteOrphanedFut<'a>;
 }
 
 impl MerkleCache for Database {
@@ -91,6 +106,21 @@ impl MerkleCache for Database {
 
     fn get_children<'a>(&'a self, path: &'a Path, node_hash: &'a Blake3Hash) -> GetChildrenFut<'a> {
         Box::pin(self.get_children(path, node_hash))
+    }
+
+    fn list_cached_entries<'a>(&'a self) -> ListCachedEntriesFut<'a> {
+        Box::pin(self.list_cached_entries())
+    }
+
+    fn is_cache_complete<'a>(&'a self, path: &'a Path) -> IsCacheCompleteFut<'a> {
+        Box::pin(self.is_cache_complete(path))
+    }
+
+    fn delete_orphaned_entries<'a>(
+        &'a self,
+        existing_paths: &'a [String],
+    ) -> DeleteOrphanedFut<'a> {
+        Box::pin(self.delete_orphaned_entries(existing_paths))
     }
 }
 
@@ -139,5 +169,20 @@ impl MerkleCache for NoopCache {
         _node_hash: &'a Blake3Hash,
     ) -> GetChildrenFut<'a> {
         Box::pin(async { Ok(None) })
+    }
+
+    fn list_cached_entries<'a>(&'a self) -> ListCachedEntriesFut<'a> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn is_cache_complete<'a>(&'a self, _path: &'a Path) -> IsCacheCompleteFut<'a> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn delete_orphaned_entries<'a>(
+        &'a self,
+        _existing_paths: &'a [String],
+    ) -> DeleteOrphanedFut<'a> {
+        Box::pin(async { Ok(0) })
     }
 }
