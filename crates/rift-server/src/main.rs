@@ -6,6 +6,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use rift_common::crypto::Chunker;
+use rift_server::metadata::db::Database;
+use rift_server::server::RequestContext;
 
 #[derive(Parser)]
 #[command(name = "rift-server")]
@@ -119,12 +122,14 @@ async fn main() -> Result<()> {
 
     let share_path = server_config.shares[0].path.clone();
 
-    let ctx = rift_server::server::RequestContext {
-        share: share_path,
-        db,
+    let ctx = RequestContext {
+        share: share_path.clone(),
+        db: db.clone(),
         handle_db,
         chunker: server_config.chunker,
     };
+
+    spawn_background_check(db, share_path, server_config.chunker);
 
     tokio::select! {
         result = rift_server::server::accept_loop(listener, ctx) => result,
@@ -133,4 +138,29 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Spawn the background cache integrity check as a separate tokio task.
+///
+/// The check walks the share once on startup, recomputing any missing or
+/// stale Merkle tree entries and cleaning up orphaned DB rows.
+fn spawn_background_check(db: Arc<Database>, share: PathBuf, chunker: Chunker) {
+    tokio::spawn(async move {
+        tracing::info!(share = %share.display(), "starting background cache integrity check");
+        match rift_server::background_check::run_background_check(&share, db, chunker).await {
+            Ok(summary) => {
+                tracing::info!(
+                    files_checked = summary.files_checked,
+                    files_added = summary.files_added,
+                    files_conflict = summary.files_conflict,
+                    files_cleaned = summary.files_cleaned,
+                    errors = summary.errors,
+                    "background check complete"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "background cache integrity check failed");
+            }
+        }
+    });
 }
