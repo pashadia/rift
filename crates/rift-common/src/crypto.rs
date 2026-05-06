@@ -133,15 +133,13 @@ impl Chunker {
             let mut chunker =
                 AsyncStreamCDC::new(reader, self.min_size, self.avg_size, self.max_size);
             loop {
-                // Scope the stream to avoid holding the mutable borrow on
-                // `chunker` across the `yield` suspension point.
+                // Scope the stream borrow to avoid holding it across the yield suspension point.
                 let chunk = {
                     let mut stream = std::pin::pin!(chunker.as_stream());
                     match stream.next().await {
                         Some(Ok(chunk)) => chunk,
-                        Some(Err(CdcError::Empty)) => break,
+                        Some(Err(CdcError::Empty)) | None => break,
                         Some(Err(e)) => Err(e)?,
-                        None => break,
                     }
                 };
                 let offset = usize::try_from(chunk.offset)

@@ -145,9 +145,17 @@ impl QuicStream {
 impl RiftStream for QuicStream {
     #[instrument(skip(self), fields(type_id = type_id, payload_len = payload.len()), err)]
     async fn send_frame(&mut self, type_id: u8, payload: &[u8]) -> Result<(), TransportError> {
-        let mut buf = BytesMut::new();
-        codec::encode_message(type_id, payload, &mut buf)?;
-        self.send.write_all(&buf).await?;
+        // Encode header (varint type_id + varint length) to a small stack buffer,
+        // then write header and payload separately — avoids per-frame BytesMut alloc
+        // and eliminates a copy of the payload.
+        const MAX_HEADER_SIZE: usize = 20; // 2 varints × 10 bytes max
+        let mut header = [0u8; MAX_HEADER_SIZE];
+        let mut remaining: &mut [u8] = &mut header;
+        codec::encode_header(type_id, payload.len(), &mut remaining)?;
+        let header_len = MAX_HEADER_SIZE - remaining.len();
+
+        self.send.write_all(&header[..header_len]).await?;
+        self.send.write_all(payload).await?;
         Ok(())
     }
 

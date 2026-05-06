@@ -288,7 +288,10 @@ async fn recompute_file(
     // INSERT OR REPLACE atomically — no separate delete needed.
     match compute_file_merkle_tree(canonical, chunker).await {
         Some((root, tree_cache, leaf_infos)) => {
-            cache_computed_tree(canonical, db, &root, tree_cache, leaf_infos).await;
+            if let Err(e) = cache_computed_tree(canonical, db, &root, tree_cache, leaf_infos).await
+            {
+                warn!(path = %canonical.display(), error = %e, "failed to cache computed merkle tree");
+            }
         }
         None => {
             warn!(path = %canonical.display(), "failed to compute Merkle tree");

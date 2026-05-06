@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::io::{Seek, SeekFrom};
+use std::io::SeekFrom;
 use std::path::Path;
 
 use bytes::BytesMut;
@@ -9,7 +8,7 @@ use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 
-use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleChild, MerkleTree};
+use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleTree};
 use rift_protocol::messages::{
     msg, read_response, BlockHeader, ChunkInfo, ErrorCode, ReadRequest, ReadResponse, ReadSuccess,
     TransferComplete,
@@ -74,26 +73,6 @@ async fn validate_handle<S: RiftStream>(stream: &mut S, req: &ReadRequest) -> an
         anyhow::bail!("invalid handle UUID");
     };
     Ok(handle)
-}
-
-/// Update the Merkle cache with the computed root, tree nodes, and leaf info.
-async fn cache_merkle_tree<M: MerkleCache>(
-    db: &M,
-    canonical: &Path,
-    root: &Blake3Hash,
-    cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
-    leaf_infos: &[LeafInfo],
-) -> anyhow::Result<()> {
-    let file_meta = tokio::fs::metadata(canonical).await?;
-    let mtime_ns = file_meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| u64::try_from(d.as_nanos()).ok());
-    let file_size = file_meta.len();
-    db.put_tree(canonical, mtime_ns, file_size, root, cache, leaf_infos)
-        .await?;
-    Ok(())
 }
 
 /// Verify all cached chunks in [start, end) by reading from disk and
@@ -346,8 +325,9 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     }
 
-    // Cold path: stream chunks incrementally.
-    // Phase 1: Get chunk boundaries using async I/O
+    // Cold path: two-pass streaming.
+    // Pass 1: chunk boundaries (data dropped, O(N) boundaries).
+    // Pass 2: stream chunks, send each immediately, accumulate hashes.
     let file = match tokio::fs::File::open(&canonical).await {
         Ok(f) => f,
         Err(e) => {
@@ -382,79 +362,62 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
         .await?;
 
-    // Phase 2: CPU-bound work (hashing + Merkle tree) in spawn_blocking
-    let canonical_owned = canonical.to_path_buf();
-    let chunk_boundaries_clone = chunk_boundaries.clone();
-    let cold_result = tokio::task::spawn_blocking(move || {
-        // All sync from here - use std::fs instead of tokio::fs
-        let file = match std::fs::File::open(&canonical_owned) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(anyhow::anyhow!("failed to open file: {}", e));
-            }
-        };
-        let mut file = std::io::BufReader::with_capacity(512 * 1024, file);
-
-        let mut leaf_hashes = Vec::with_capacity(chunk_boundaries_clone.len());
-        let mut chunk_data_for_range: Vec<(usize, Vec<u8>)> = Vec::new();
-
-        for (i, (offset, length)) in chunk_boundaries_clone.iter().enumerate() {
-            let mut buf = vec![0u8; *length];
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(*offset as u64)) {
-                return Err(anyhow::anyhow!("failed to seek: {}", e));
-            }
-            if let Err(e) = std::io::Read::read_exact(&mut file, &mut buf) {
-                return Err(anyhow::anyhow!("failed to read: {}", e));
-            }
-            let hash = Blake3Hash::new(&buf);
-            leaf_hashes.push(hash.clone());
-
-            // Store chunk data for the requested range
-            if i >= start && i < end {
-                chunk_data_for_range.push((i, buf));
-            }
+    // Pass 2: stream chunks, hash and send each in-range chunk immediately.
+    tracing::info!(path = %canonical.display(), chunk_count = end - start, "sending chunks (cold path streaming)");
+    let file2 = match tokio::fs::File::open(&canonical).await {
+        Ok(f) => f,
+        Err(e) => {
+            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
         }
+    };
+    let reader2 = tokio::io::BufReader::with_capacity(512 * 1024, file2);
+    let stream2 = chunker.chunk_stream(reader2);
 
-        // Build Merkle tree (CPU-bound)
-        let merkle = MerkleTree::default();
-        let (root, cache, leaf_infos) =
-            merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries_clone);
+    let mut leaf_hashes = Vec::with_capacity(chunk_boundaries.len());
+    let mut chunk_idx: usize = 0;
 
-        Ok((
-            leaf_hashes,
-            chunk_boundaries_clone,
-            root,
-            cache,
-            leaf_infos,
-            chunk_data_for_range,
-        ))
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking task failed: {}", e))??;
+    futures::pin_mut!(stream2);
+    while let Some(chunk_result) = stream2.next().await {
+        let (_offset, length, data) = chunk_result?;
+        let hash = Blake3Hash::new(&data);
+        leaf_hashes.push(hash.clone());
 
-    let (leaf_hashes, _chunk_boundaries, root, cache, leaf_infos, chunk_data_for_range) =
-        cold_result;
+        // Send immediately if in requested range
+        if chunk_idx >= start && chunk_idx < end {
+            let block_header = BlockHeader {
+                chunk: Some(ChunkInfo {
+                    index: u32::try_from(chunk_idx)
+                        .expect("chunk index exceeds u32 (max 256 chunks/request)"),
+                    length: length as u64,
+                    hash: hash.as_bytes().to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await?;
+            stream.send_frame(msg::BLOCK_DATA, &data).await?;
+        }
+        // data is dropped here — O(max_chunk_size) peak memory
 
-    tracing::info!(path = %canonical.display(), leaf_count = leaf_hashes.len(), merkle_root = %format!("{:?}", root), "merkle tree built (cold path)");
-
-    // Phase 3: Send frames (async) and cache tree
-    tracing::info!(path = %canonical.display(), chunk_count = chunk_data_for_range.len(), "sending chunks");
-    for (i, buf) in chunk_data_for_range {
-        let hash = &leaf_hashes[i];
-        let block_header = BlockHeader {
-            chunk: Some(ChunkInfo {
-                index: u32::try_from(i).expect("chunk index exceeds u32 (max 256 chunks/request)"),
-                length: buf.len() as u64,
-                hash: hash.as_bytes().to_vec(),
-            }),
-        };
-        stream
-            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
-            .await?;
-        stream.send_frame(msg::BLOCK_DATA, &buf).await?;
+        chunk_idx += 1;
     }
 
-    if let Err(e) = cache_merkle_tree(db, &canonical, &root, &cache, &leaf_infos).await {
+    tracing::info!(path = %canonical.display(), leaf_count = leaf_hashes.len(), "streaming send complete, building merkle tree");
+
+    // Build Merkle tree (CPU-bound) from collected hashes
+    let (root, cache, leaf_infos) = tokio::task::spawn_blocking(move || {
+        let merkle = MerkleTree::default();
+        merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking task failed: {}", e))?;
+
+    tracing::info!(path = %canonical.display(), merkle_root = %format!("{:?}", root), "merkle tree built (cold path)");
+
+    if let Err(e) =
+        crate::handler::merkle_cache::cache_computed_tree(&canonical, db, &root, cache, leaf_infos)
+            .await
+    {
         tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
     }
     let transfer_complete = TransferComplete {
