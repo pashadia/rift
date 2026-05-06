@@ -4,9 +4,9 @@
 //! verifies that every regular file has a complete, consistent Merkle
 //! tree cache entry. Missing or stale entries are recomputed and stored.
 //!
-//! The filesystem walk runs on a blocking thread via `spawn_blocking`
-//! and streams file paths through an MPSC channel to the async consumer,
-//! which yields every 64 files to avoid starving request handlers.
+//! The filesystem walk uses `async-walkdir` and streams file paths
+//! through an MPSC channel to the async consumer, which yields every
+//! 64 files to avoid starving request handlers.
 //!
 //! ## TOCTOU Safety
 //!
@@ -33,6 +33,8 @@ use crate::handler::merkle_cache::compute_file_merkle_tree;
 use crate::metadata::db::Database;
 use crate::metadata::merkle::CacheStatus;
 use crate::security::canonicalize_within_share;
+use async_walkdir::{Filtering, WalkDir};
+use futures::StreamExt;
 
 /// How many files to process before yielding back to the tokio runtime.
 const YIELD_EVERY: usize = 64;
@@ -57,8 +59,10 @@ pub struct BackgroundCheckSummary {
 /// Walk `share` recursively and send one `PathBuf` per regular file
 /// through `tx`.
 ///
-/// Skips directories and symlinks. Paths are canonicalized and verified
-/// to stay within the share boundary.
+/// Skips symlinks. Paths are canonicalized and verified to stay within
+/// the share boundary.
+///
+/// Uses `async-walkdir` for async directory traversal.
 ///
 /// # Security
 ///
@@ -79,40 +83,35 @@ async fn walk_share(
     share_canonical: PathBuf,
     tx: tokio::sync::mpsc::Sender<PathBuf>,
 ) {
-    let mut queue = vec![share];
+    let mut entries = WalkDir::new(&share).filter(|entry| async move {
+        let Ok(file_type) = entry.file_type().await else {
+            return Filtering::Ignore;
+        };
 
-    while let Some(dir) = queue.pop() {
-        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        if !file_type.is_file() {
+            return Filtering::Ignore;
+        }
+
+        Filtering::Continue
+    });
+
+    while let Some(result) = entries.next().await {
+        let Ok(entry) = result else {
             continue;
         };
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let Ok(file_type) = entry.file_type().await else {
-                continue;
-            };
+        let path = entry.path();
 
-            if file_type.is_symlink() {
-                continue;
+        // SECURITY: Use TOCTOU-safe canonicalization with containment check
+        if let Some(canonical) = canonicalize_within_share(&path, &share_canonical).await {
+            if tx.send(canonical).await.is_err() {
+                return;
             }
-
-            let path = entry.path();
-
-            if file_type.is_dir() {
-                queue.push(path);
-                continue;
-            }
-
-            // SECURITY: Use TOCTOU-safe canonicalization with containment check
-            if let Some(canonical) = canonicalize_within_share(&path, &share_canonical).await {
-                if tx.send(canonical).await.is_err() {
-                    return;
-                }
-            } else {
-                debug!(
-                    path = %path.display(),
-                    "path escapes share root after canonicalization, skipping"
-                );
-            }
+        } else {
+            debug!(
+                path = %path.display(),
+                "path escapes share root after canonicalization, skipping"
+            );
         }
     }
 }

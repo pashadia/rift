@@ -1,10 +1,11 @@
+use async_walkdir::{Filtering, WalkDir};
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use rift_common::handle_map::BidirectionalMap;
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -199,14 +200,22 @@ impl HandleDatabase {
     }
 
     pub async fn populate_from_share(&self, share_root: &Path) -> std::io::Result<()> {
-        for entry in WalkDir::new(share_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() {
-                let _ = self.get_or_create_handle(path).await;
+        let mut entries = WalkDir::new(share_root).filter(|entry| async move {
+            let Ok(file_type) = entry.file_type().await else {
+                return Filtering::Ignore;
+            };
+
+            if !file_type.is_file() {
+                return Filtering::Ignore;
+            }
+
+            Filtering::Continue
+        });
+
+        while let Some(result) = entries.next().await {
+            if let Ok(entry) = result {
+                let path = entry.path();
+                let _ = self.get_or_create_handle(&path).await;
             }
         }
         Ok(())
