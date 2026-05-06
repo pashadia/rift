@@ -257,6 +257,7 @@ fn calculate_chunk_range(chunk_starts: &[u64], offset: u64, end: u64) -> (u32, u
 ///
 /// The `root_hash` parameter is the expected root hash (from the stat response).
 /// The `merkle_root` in `result` must match it.
+#[allow(dead_code)]
 fn verify_chunks_integrity(
     chunks: &[crate::client::ChunkData],
     root_hash: &Blake3Hash,
@@ -518,24 +519,67 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        let read_result = self
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(
+            chunk_count as usize,
+        )));
+        let collected_for_cb = std::sync::Arc::clone(&collected);
+        let cache_for_cb = self.cache.clone();
+        let no_cache = self.no_cache;
+
+        let returned_merkle = self
             .remote
-            .read_chunks(handle, start_chunk, chunk_count)
+            .read_chunks_streaming(
+                handle,
+                start_chunk,
+                chunk_count,
+                Box::new(move |chunk| {
+                    // Cache individual chunk data as it arrives
+                    if !no_cache {
+                        if let Some(ref cache) = cache_for_cb {
+                            let cache = std::sync::Arc::clone(cache);
+                            let hash = chunk.hash;
+                            let data = chunk.data.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = cache.put_chunk(&hash, &data).await {
+                                    tracing::warn!("failed to cache chunk: {}", e);
+                                }
+                            });
+                        }
+                    }
+                    collected_for_cb.lock().expect("lock poisoned").push(chunk);
+                    Ok(())
+                }),
+            )
             .await
             .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
 
-        verify_chunks_integrity(&read_result.chunks, &root_hash, &read_result.merkle_root)?;
+        let chunks: Vec<crate::client::ChunkData> = std::sync::Arc::try_unwrap(collected)
+            .expect("Arc should have exactly one reference")
+            .into_inner()
+            .expect("mutex lock poisoned");
 
-        self.cache_fetched_chunks(
-            &handle,
-            &merkle_root,
-            &read_result.chunks,
-            &resolved.leaves,
-            &chunk_starts,
-        )
-        .await;
+        // Verify the returned Merkle root matches the stat root hash
+        let computed_root = Blake3Hash::from_slice(&returned_merkle).map_err(|_| FsError::Io)?;
+        if computed_root != root_hash {
+            tracing::error!("transfer root hash mismatch");
+            return Err(FsError::Io);
+        }
 
-        assemble_byte_range(read_result.chunks, start_chunk, &chunk_starts, offset, end)
+        // Cache the manifest (chunk data already cached incrementally above)
+        if !self.no_cache {
+            if let Some(ref cache) = self.cache {
+                RiftShareView::<R>::cache_manifest(
+                    cache.as_ref(),
+                    &handle,
+                    &merkle_root,
+                    &resolved.leaves,
+                    &chunk_starts,
+                )
+                .await;
+            }
+        }
+
+        assemble_byte_range(chunks, start_chunk, &chunk_starts, offset, end)
     }
 
     #[instrument(skip(self), fields(path = %path.display()))]
@@ -762,6 +806,7 @@ impl<R: RemoteShare> RiftShareView<R> {
     /// * `chunks` — Fetched chunk data from the server.
     /// * `leaves` — Resolved Merkle leaf nodes.
     /// * `chunk_starts` — File offsets for each chunk.
+    #[allow(dead_code)]
     async fn cache_fetched_chunks(
         &self,
         handle: &Uuid,
@@ -1040,6 +1085,25 @@ mod tests {
                 .await
                 .take()
                 .unwrap_or_else(|| Err(anyhow::anyhow!("no read_chunks result set")))
+        }
+
+        async fn read_chunks_streaming(
+            &self,
+            handle: Uuid,
+            start_chunk: u32,
+            chunk_count: u32,
+            mut on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
+        ) -> anyhow::Result<Vec<u8>> {
+            let result = self.read_chunks(handle, start_chunk, chunk_count).await?;
+            for chunk in &result.chunks {
+                on_chunk(ChunkData {
+                    index: chunk.index,
+                    length: chunk.length,
+                    hash: chunk.hash,
+                    data: chunk.data.clone(),
+                })?;
+            }
+            Ok(result.merkle_root)
         }
 
         async fn merkle_drill(
