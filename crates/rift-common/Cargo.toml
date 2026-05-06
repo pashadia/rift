@@ -20,6 +20,7 @@ uuid.workspace = true
 scc.workspace = true
 tokio.workspace = true
 futures.workspace = true
+async-stream = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

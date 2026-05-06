@@ -123,27 +123,30 @@ impl Chunker {
     pub fn chunk_stream<R: tokio::io::AsyncRead + Unpin>(
         &self,
         reader: R,
-    ) -> impl futures::Stream<Item = std::io::Result<(usize, usize, Vec<u8>)>> {
+    ) -> impl futures::Stream<Item = std::io::Result<(usize, usize, Vec<u8>)>> + use<'_, R> {
+        use async_stream::try_stream;
         use fastcdc::v2020::AsyncStreamCDC;
-        use futures::stream::unfold;
+        use fastcdc::v2020::Error as CdcError;
         use futures::StreamExt;
 
-        let chunker = AsyncStreamCDC::new(reader, self.min_size, self.avg_size, self.max_size);
-        unfold(chunker, |mut chunker| async move {
-            let item = {
-                let mut stream = std::pin::pin!(chunker.as_stream());
-                stream.next().await
-            };
-            match item {
-                Some(Ok(chunk)) => {
-                    let offset = usize::try_from(chunk.offset).expect("chunk offset fits in usize");
-                    Some((Ok((offset, chunk.length, chunk.data)), chunker))
-                }
-                Some(Err(fastcdc::v2020::Error::Empty)) => None,
-                Some(Err(e)) => Some((Err(e.into()), chunker)),
-                None => None,
+        try_stream! {
+            let mut chunker =
+                AsyncStreamCDC::new(reader, self.min_size, self.avg_size, self.max_size);
+            loop {
+                // Scope the stream borrow to avoid holding it across the yield suspension point.
+                let chunk = {
+                    let mut stream = std::pin::pin!(chunker.as_stream());
+                    match stream.next().await {
+                        Some(Ok(chunk)) => chunk,
+                        Some(Err(CdcError::Empty)) | None => break,
+                        Some(Err(e)) => Err(e)?,
+                    }
+                };
+                let offset = usize::try_from(chunk.offset)
+                    .expect("chunk offset fits in usize");
+                yield (offset, chunk.length, chunk.data);
             }
-        })
+        }
     }
 }
 
