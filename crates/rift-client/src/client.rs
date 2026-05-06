@@ -210,7 +210,7 @@ pub struct ChunkReadResult {
 }
 
 /// A single chunk's data.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChunkData {
     pub index: u32,
     pub length: u64,
@@ -684,6 +684,131 @@ impl<C: RiftConnection> RiftClient<C> {
         })
     }
 
+    /// Read chunks from a file with streaming callback.
+    ///
+    /// Each chunk is hash-verified immediately after receipt. The callback
+    /// `on_chunk` is called for every verified chunk, allowing incremental
+    /// processing (e.g., caching to disk) without buffering all chunks in memory.
+    ///
+    /// - `handle`: The file handle
+    /// - `start_chunk`: First chunk index (0 = from beginning)
+    /// - `chunk_count`: Number of chunks to read (0 = all remaining)
+    /// - `on_chunk`: Callback invoked for each verified chunk
+    ///
+    /// Returns the file's Merkle root hash from `TRANSFER_COMPLETE`.
+    #[instrument(skip(self, on_chunk))]
+    pub async fn read_chunks_streaming<F>(
+        &self,
+        handle: Uuid,
+        start_chunk: u32,
+        chunk_count: u32,
+        mut on_chunk: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(ChunkData) -> anyhow::Result<()>,
+    {
+        let mut stream =
+            self.conn.open_stream().await.map_err(|e| {
+                anyhow::Error::from(e).context("read_chunks_streaming: open stream")
+            })?;
+
+        let req = ReadRequest {
+            handle: handle.as_bytes().to_vec(),
+            start_chunk,
+            chunk_count,
+        };
+        stream
+            .send_frame(msg::READ_REQUEST, &req.encode_to_vec())
+            .await?;
+        stream.finish_send().await?;
+
+        tracing::info!(
+            handle = %handle,
+            start_chunk,
+            chunk_count,
+            "requesting chunks (streaming)"
+        );
+
+        let (_, payload) = stream.recv_frame().await?.ok_or_else(|| {
+            anyhow::anyhow!("read_chunks_streaming: server closed stream without response")
+        })?;
+
+        let response =
+            ReadResponse::decode(payload.as_ref()).map_err(|_| anyhow::Error::from(FsError::Io))?;
+
+        let chunk_count = match response.result {
+            Some(read_response::Result::Ok(success)) => success.chunk_count,
+            Some(read_response::Result::Error(e)) => return Err(map_proto_error(e.code)),
+            None => return Err(anyhow::Error::from(FsError::Io)),
+        };
+
+        for _i in 0..chunk_count {
+            let header_frame = stream
+                .recv_frame()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("read_chunks_streaming: missing BLOCK_HEADER"))?;
+            let (_header_type, header_payload) = header_frame;
+
+            let block_header = BlockHeader::decode(header_payload.as_ref())
+                .map_err(|_| anyhow::Error::from(FsError::Io))?;
+            let chunk_info = block_header
+                .chunk
+                .ok_or_else(|| anyhow::anyhow!("read_chunks_streaming: missing ChunkInfo"))?;
+
+            let index = chunk_info.index;
+            let length = chunk_info.length;
+            let hash: [u8; 32] = chunk_info
+                .hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("read_chunks_streaming: invalid hash length"))?;
+
+            let data_frame = stream
+                .recv_frame()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("read_chunks_streaming: missing BLOCK_DATA"))?;
+            let (_data_type, data_payload) = data_frame;
+
+            // Verify hash immediately before callback
+            let computed_hash = rift_common::crypto::Blake3Hash::new(&data_payload);
+            let expected_hash = rift_common::crypto::Blake3Hash::from_slice(&hash)
+                .map_err(|e| anyhow::anyhow!("read_chunks_streaming: {}", e))?;
+            if computed_hash != expected_hash {
+                return Err(anyhow::anyhow!(
+                    "read_chunks_streaming: hash mismatch for chunk {}",
+                    index
+                ));
+            }
+
+            let chunk = ChunkData {
+                index,
+                length,
+                hash,
+                data: data_payload,
+            };
+
+            on_chunk(chunk)?;
+        }
+
+        let root_frame = stream
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("read_chunks_streaming: missing TRANSFER_COMPLETE"))?;
+        let (_root_type, root_payload) = root_frame;
+
+        let transfer_complete =
+            TransferComplete::decode(root_payload.as_ref()).map_err(|_| FsError::Io)?;
+
+        tracing::info!(
+            handle = %handle,
+            chunk_count,
+            merkle_root = %hex::encode(&transfer_complete.merkle_root),
+            "read_chunks_streaming complete"
+        );
+
+        Ok(transfer_complete.merkle_root)
+    }
+
     // ---------------------------------------------------------------------------
     // MerkleDrill
     // ---------------------------------------------------------------------------
@@ -906,6 +1031,17 @@ impl crate::remote::RemoteShare for RiftClient<QuicConnection> {
         chunk_count: u32,
     ) -> anyhow::Result<ChunkReadResult> {
         self.read_chunks(handle, start_chunk, chunk_count).await
+    }
+
+    async fn read_chunks_streaming(
+        &self,
+        handle: Uuid,
+        start_chunk: u32,
+        chunk_count: u32,
+        on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.read_chunks_streaming(handle, start_chunk, chunk_count, on_chunk)
+            .await
     }
 
     async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
@@ -1544,5 +1680,289 @@ mod tests {
                 Err("missing INFO log with 'read_chunks complete'".to_string())
             }
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Group H: read_chunks_streaming (rift-b0er.2.6)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_chunks_streaming_callback_invoked_exactly_chunk_count_times() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        let chunk1_data = b"chunk one";
+        let chunk2_data = b"chunk two";
+        let chunk3_data = b"chunk three";
+        let chunk1_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk1_data)
+            .as_bytes()
+            .to_owned();
+        let chunk2_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk2_data)
+            .as_bytes()
+            .to_owned();
+        let chunk3_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk3_data)
+            .as_bytes()
+            .to_owned();
+        let merkle_root = chunk1_hash.to_vec();
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+
+            // Send READ_RESPONSE with chunk_count=3
+            let read_response = ReadResponse {
+                result: Some(read_response::Result::Ok(
+                    rift_protocol::messages::ReadSuccess { chunk_count: 3 },
+                )),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &read_response.encode_to_vec())
+                .await
+                .unwrap();
+
+            // Send 3 chunks
+            for (i, (data, hash)) in [
+                (chunk1_data.as_slice(), &chunk1_hash),
+                (chunk2_data.as_slice(), &chunk2_hash),
+                (chunk3_data.as_slice(), &chunk3_hash),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let block_header = BlockHeader {
+                    chunk: Some(rift_protocol::messages::ChunkInfo {
+                        index: u32::try_from(i).expect("chunk index fits in u32"),
+                        length: data.len() as u64,
+                        hash: hash.to_vec(),
+                    }),
+                };
+                stream
+                    .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                    .await
+                    .unwrap();
+                stream.send_frame(msg::BLOCK_DATA, data).await.unwrap();
+            }
+
+            // Send TRANSFER_COMPLETE
+            let transfer_complete = TransferComplete {
+                merkle_root: merkle_root.clone(),
+            };
+            stream
+                .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let uuid = Uuid::from_bytes([0x42u8; 16]);
+        let mut call_count = 0u32;
+        let result = client
+            .read_chunks_streaming(uuid, 0, 3, |_chunk| {
+                call_count += 1;
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_ok(), "read_chunks_streaming should succeed");
+        assert_eq!(call_count, 3, "callback should be invoked exactly 3 times");
+    }
+
+    #[tokio::test]
+    async fn read_chunks_streaming_verifies_hash_before_callback() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        let chunk_data = b"valid data here";
+        let correct_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk_data)
+            .as_bytes()
+            .to_owned();
+        let wrong_hash: [u8; 32] = [0xFF; 32];
+        let merkle_root = correct_hash.to_vec();
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+
+            let read_response = ReadResponse {
+                result: Some(read_response::Result::Ok(
+                    rift_protocol::messages::ReadSuccess { chunk_count: 1 },
+                )),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &read_response.encode_to_vec())
+                .await
+                .unwrap();
+
+            // Send chunk with WRONG hash
+            let block_header = BlockHeader {
+                chunk: Some(rift_protocol::messages::ChunkInfo {
+                    index: 0,
+                    length: chunk_data.len() as u64,
+                    hash: wrong_hash.to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await
+                .unwrap();
+            stream
+                .send_frame(msg::BLOCK_DATA, chunk_data)
+                .await
+                .unwrap();
+
+            let transfer_complete = TransferComplete {
+                merkle_root: merkle_root.clone(),
+            };
+            stream
+                .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let uuid = Uuid::from_bytes([0x42u8; 16]);
+        let mut callback_was_called = false;
+        let result = client
+            .read_chunks_streaming(uuid, 0, 1, |_chunk| {
+                callback_was_called = true;
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "read_chunks_streaming should fail on hash mismatch"
+        );
+        assert!(
+            !callback_was_called,
+            "callback must NOT be called when hash verification fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_chunks_streaming_returns_merkle_root() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        let chunk_data = b"single chunk";
+        let chunk_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk_data)
+            .as_bytes()
+            .to_owned();
+        let merkle_root = chunk_hash.to_vec();
+        let expected_root = merkle_root.clone();
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+
+            let read_response = ReadResponse {
+                result: Some(read_response::Result::Ok(
+                    rift_protocol::messages::ReadSuccess { chunk_count: 1 },
+                )),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &read_response.encode_to_vec())
+                .await
+                .unwrap();
+
+            let block_header = BlockHeader {
+                chunk: Some(rift_protocol::messages::ChunkInfo {
+                    index: 0,
+                    length: chunk_data.len() as u64,
+                    hash: chunk_hash.to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await
+                .unwrap();
+            stream
+                .send_frame(msg::BLOCK_DATA, chunk_data)
+                .await
+                .unwrap();
+
+            let transfer_complete = TransferComplete {
+                merkle_root: merkle_root.clone(),
+            };
+            stream
+                .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let uuid = Uuid::from_bytes([0x42u8; 16]);
+        let result = client
+            .read_chunks_streaming(uuid, 0, 1, |_chunk| Ok(()))
+            .await;
+
+        assert!(result.is_ok(), "read_chunks_streaming should succeed");
+        assert_eq!(
+            result.unwrap(),
+            expected_root,
+            "should return the merkle_root from TRANSFER_COMPLETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_read_chunks_still_works_after_streaming_added() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        let chunk_data = b"hello";
+        let chunk_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk_data)
+            .as_bytes()
+            .to_owned();
+        let merkle_root = chunk_hash.to_vec();
+        let expected_root = merkle_root.clone();
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+
+            let read_response = ReadResponse {
+                result: Some(read_response::Result::Ok(
+                    rift_protocol::messages::ReadSuccess { chunk_count: 1 },
+                )),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &read_response.encode_to_vec())
+                .await
+                .unwrap();
+
+            let block_header = BlockHeader {
+                chunk: Some(rift_protocol::messages::ChunkInfo {
+                    index: 0,
+                    length: chunk_data.len() as u64,
+                    hash: chunk_hash.to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await
+                .unwrap();
+            stream
+                .send_frame(msg::BLOCK_DATA, chunk_data)
+                .await
+                .unwrap();
+
+            let transfer_complete = TransferComplete {
+                merkle_root: merkle_root.clone(),
+            };
+            stream
+                .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let uuid = Uuid::from_bytes([0x42u8; 16]);
+        let result = client.read_chunks(uuid, 0, 1).await;
+
+        assert!(result.is_ok(), "old read_chunks should still work");
+        let chunk_result = result.unwrap();
+        assert_eq!(chunk_result.chunks.len(), 1);
+        assert_eq!(&chunk_result.chunks[0].data[..], chunk_data);
+        assert_eq!(chunk_result.merkle_root, expected_root);
     }
 }

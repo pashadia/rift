@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use rift_client::client::{ChunkReadResult, MerkleDrillResult};
+use rift_client::client::{ChunkData, ChunkReadResult, MerkleDrillResult};
 use rift_client::fuse::RiftFilesystem;
 use rift_client::remote::RemoteShare;
 use rift_client::view::{RiftShareView, ShareView};
@@ -117,6 +117,15 @@ impl RemoteShare for MockRemoteShare {
             chunks: vec![],
             merkle_root: vec![],
         })
+    }
+    async fn read_chunks_streaming(
+        &self,
+        _handle: Uuid,
+        _start_chunk: u32,
+        _chunk_count: u32,
+        mut _on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
+    ) -> anyhow::Result<Vec<u8>> {
+        Ok(vec![])
     }
     async fn merkle_drill(&self, _handle: Uuid, _hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
         Ok(MerkleDrillResult {

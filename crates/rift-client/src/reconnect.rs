@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 
-use crate::client::{ChunkReadResult, MerkleDrillResult, RiftClient};
+use crate::client::{ChunkData, ChunkReadResult, MerkleDrillResult, RiftClient};
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use rift_common::FsError;
@@ -208,6 +208,21 @@ impl RemoteShare for ReconnectingClient {
             client.read_chunks(handle, start_chunk, chunk_count).await
         })
         .await
+    }
+
+    async fn read_chunks_streaming(
+        &self,
+        handle: Uuid,
+        start_chunk: u32,
+        chunk_count: u32,
+        mut on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
+    ) -> anyhow::Result<Vec<u8>> {
+        // Fall back to read_chunks since reconnection breaks streaming.
+        let result = self.read_chunks(handle, start_chunk, chunk_count).await?;
+        for chunk in &result.chunks {
+            on_chunk(chunk.clone())?;
+        }
+        Ok(result.merkle_root)
     }
 
     async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
