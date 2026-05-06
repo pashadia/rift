@@ -3,6 +3,8 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use bytes::BytesMut;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
@@ -353,7 +355,11 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     };
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
-    let chunk_boundaries = chunker.chunk_stream(reader).await;
+    let chunk_boundaries: Vec<(usize, usize)> = chunker
+        .chunk_stream(reader)
+        .map(|r| r.map(|(o, l, _)| (o, l)))
+        .try_collect()
+        .await?;
     tracing::info!(path = %canonical.display(), chunk_count = chunk_boundaries.len(), file_size = meta.len(), "chunking file (cold path)");
 
     if req.start_chunk as usize >= chunk_boundaries.len() {

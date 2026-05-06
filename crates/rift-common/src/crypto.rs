@@ -117,39 +117,41 @@ impl Chunker {
 
     /// Stream chunks from an `AsyncRead` source.
     ///
-    /// Yields `(offset, length)` tuples incrementally, matching the exact same
+    /// Yields `(offset, length, data)` tuples incrementally, matching the exact same
     /// boundaries that `chunk()` would produce for the same data.
     /// Only holds `max_size` bytes in memory at a time.
-    pub async fn chunk_stream<R: tokio::io::AsyncRead + Unpin>(
+    pub fn chunk_stream<R: tokio::io::AsyncRead + Unpin>(
         &self,
         reader: R,
-    ) -> Vec<(usize, usize)> {
+    ) -> impl futures::Stream<Item = std::io::Result<(usize, usize, Vec<u8>)>> {
         use fastcdc::v2020::AsyncStreamCDC;
+        use futures::stream::unfold;
         use futures::StreamExt;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
 
-        let mut chunker = AsyncStreamCDC::new(reader, self.min_size, self.avg_size, self.max_size);
-        let mut stream = std::pin::pin!(chunker.as_stream());
-        let mut boundaries = Vec::new();
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(chunk) => {
-                    boundaries.push((
-                        usize::try_from(chunk.offset).expect("chunk offset fits in usize"),
-                        chunk.length,
-                    ));
+        let chunker = Arc::new(Mutex::new(AsyncStreamCDC::new(
+            reader,
+            self.min_size,
+            self.avg_size,
+            self.max_size,
+        )));
+        unfold(chunker, |chunker| async move {
+            let item = {
+                let mut guard = chunker.lock().await;
+                let mut stream = std::pin::pin!(guard.as_stream());
+                stream.next().await
+            };
+            match item {
+                Some(Ok(chunk)) => {
+                    let offset = usize::try_from(chunk.offset).expect("chunk offset fits in usize");
+                    Some((Ok((offset, chunk.length, chunk.data)), chunker))
                 }
-                Err(fastcdc::v2020::Error::Empty) => break,
-                Err(e) => {
-                    // Log or handle unexpected errors; for now, panic in test/dev
-                    // but in production we'd want a Result type.
-                    // Given the current API returns Vec, we panic on real errors.
-                    panic!("chunk_stream error: {e}");
-                }
+                Some(Err(fastcdc::v2020::Error::Empty)) => None,
+                Some(Err(e)) => Some((Err(e.into()), chunker)),
+                None => None,
             }
-        }
-
-        boundaries
+        })
     }
 }
 
@@ -638,13 +640,22 @@ mod proptests {
         fn prop_chunk_stream_matches_chunk(data in proptest::collection::vec(any::<u8>(), 0..200_000)) {
             let chunker = Chunker::default();
             let batch = chunker.chunk(&data);
-            let stream = {
+            let stream_chunks: Vec<(usize, usize, Vec<u8>)> = {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    chunker.chunk_stream(std::io::Cursor::new(data.clone())).await
+                    use futures::TryStreamExt;
+                    chunker.chunk_stream(std::io::Cursor::new(data.clone()))
+                        .try_collect()
+                        .await
+                        .unwrap()
                 })
             };
-            prop_assert_eq!(batch, stream);
+            prop_assert_eq!(batch.len(), stream_chunks.len());
+            for (i, (offset, length, chunk_data)) in stream_chunks.iter().enumerate() {
+                prop_assert_eq!(*offset, batch[i].0);
+                prop_assert_eq!(*length, batch[i].1);
+                prop_assert_eq!(&data[*offset..*offset + *length], chunk_data.as_slice());
+            }
         }
 
         #[test]
@@ -1511,6 +1522,7 @@ mod verify_node_tests {
 #[cfg(test)]
 mod streaming_chunker_tests {
     use super::*;
+    use futures::TryStreamExt;
 
     #[tokio::test]
     async fn chunk_stream_produces_identical_boundaries_to_chunk() {
@@ -1522,7 +1534,12 @@ mod streaming_chunker_tests {
 
         // Streaming boundaries
         let cursor = std::io::Cursor::new(data.clone());
-        let stream_boundaries = chunker.chunk_stream(cursor).await;
+        let stream = chunker.chunk_stream(cursor);
+        let stream_boundaries: Vec<(usize, usize)> =
+            futures::StreamExt::map(stream, |r| r.map(|(o, l, _)| (o, l)))
+                .try_collect()
+                .await
+                .unwrap();
 
         assert_eq!(batch_boundaries, stream_boundaries);
     }
@@ -1533,7 +1550,12 @@ mod streaming_chunker_tests {
         let chunker = Chunker::default();
 
         let cursor = std::io::Cursor::new(data);
-        let stream_boundaries = chunker.chunk_stream(cursor).await;
+        let stream = chunker.chunk_stream(cursor);
+        let stream_boundaries: Vec<(usize, usize)> =
+            futures::StreamExt::map(stream, |r| r.map(|(o, l, _)| (o, l)))
+                .try_collect()
+                .await
+                .unwrap();
 
         assert!(stream_boundaries.is_empty());
     }
@@ -1544,7 +1566,12 @@ mod streaming_chunker_tests {
         let chunker = Chunker::default();
 
         let cursor = std::io::Cursor::new(data);
-        let stream_boundaries = chunker.chunk_stream(cursor).await;
+        let stream = chunker.chunk_stream(cursor);
+        let stream_boundaries: Vec<(usize, usize)> =
+            futures::StreamExt::map(stream, |r| r.map(|(o, l, _)| (o, l)))
+                .try_collect()
+                .await
+                .unwrap();
 
         assert_eq!(stream_boundaries.len(), 1);
         assert_eq!(stream_boundaries[0], (0, 1024));
@@ -1557,7 +1584,12 @@ mod streaming_chunker_tests {
 
         let batch_boundaries = chunker.chunk(&data);
         let cursor = std::io::Cursor::new(data);
-        let stream_boundaries = chunker.chunk_stream(cursor).await;
+        let stream = chunker.chunk_stream(cursor);
+        let stream_boundaries: Vec<(usize, usize)> =
+            futures::StreamExt::map(stream, |r| r.map(|(o, l, _)| (o, l)))
+                .try_collect()
+                .await
+                .unwrap();
 
         assert_eq!(batch_boundaries, stream_boundaries);
         assert!(stream_boundaries.len() > 1, "should have multiple chunks");
@@ -1570,9 +1602,36 @@ mod streaming_chunker_tests {
 
         let batch_boundaries = chunker.chunk(&data);
         let cursor = std::io::Cursor::new(data);
-        let stream_boundaries = chunker.chunk_stream(cursor).await;
+        let stream = chunker.chunk_stream(cursor);
+        let stream_boundaries: Vec<(usize, usize)> =
+            futures::StreamExt::map(stream, |r| r.map(|(o, l, _)| (o, l)))
+                .try_collect()
+                .await
+                .unwrap();
 
         assert_eq!(batch_boundaries, stream_boundaries);
+    }
+
+    #[tokio::test]
+    async fn chunk_stream_yields_data_and_boundaries_matching_batch() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(200_000).collect();
+        let chunker = Chunker::default();
+
+        let batch = chunker.chunk(&data);
+        let cursor = std::io::Cursor::new(data.clone());
+        let stream = chunker.chunk_stream(cursor);
+        let chunks: Vec<(usize, usize, Vec<u8>)> = stream.try_collect().await.unwrap();
+
+        assert_eq!(chunks.len(), batch.len(), "number of chunks should match");
+        for (i, (offset, length, chunk_data)) in chunks.iter().enumerate() {
+            assert_eq!(*offset, batch[i].0, "offset mismatch at chunk {i}");
+            assert_eq!(*length, batch[i].1, "length mismatch at chunk {i}");
+            assert_eq!(
+                &data[*offset..*offset + *length],
+                chunk_data.as_slice(),
+                "data mismatch at chunk {i}"
+            );
+        }
     }
 }
 
@@ -1624,6 +1683,20 @@ mod streaming_hash_tests {
 
         let mut hasher = Blake3Hash::hasher();
         hasher.update(data);
+        let streaming = hasher.finalize();
+
+        assert_eq!(one_shot, streaming);
+    }
+
+    #[test]
+    fn streaming_hash_byte_by_byte() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        let one_shot = Blake3Hash::new(&data);
+
+        let mut hasher = StreamingHash::new();
+        for byte in &data {
+            hasher.update(std::slice::from_ref(byte));
+        }
         let streaming = hasher.finalize();
 
         assert_eq!(one_shot, streaming);
