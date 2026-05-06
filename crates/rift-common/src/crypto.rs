@@ -127,19 +127,11 @@ impl Chunker {
         use fastcdc::v2020::AsyncStreamCDC;
         use futures::stream::unfold;
         use futures::StreamExt;
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
 
-        let chunker = Arc::new(Mutex::new(AsyncStreamCDC::new(
-            reader,
-            self.min_size,
-            self.avg_size,
-            self.max_size,
-        )));
-        unfold(chunker, |chunker| async move {
+        let chunker = AsyncStreamCDC::new(reader, self.min_size, self.avg_size, self.max_size);
+        unfold(chunker, |mut chunker| async move {
             let item = {
-                let mut guard = chunker.lock().await;
-                let mut stream = std::pin::pin!(guard.as_stream());
+                let mut stream = std::pin::pin!(chunker.as_stream());
                 stream.next().await
             };
             match item {
