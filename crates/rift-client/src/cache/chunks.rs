@@ -3,6 +3,7 @@
 //! Stores chunk data (binary blobs addressed by BLAKE3 hash) as individual files
 //! on disk with directory sharding, replacing the previous `SQLite` BLOB storage.
 
+use bytes::Bytes;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -101,6 +102,11 @@ impl ChunkStore {
     pub async fn chunk_exists(&self, hash: &[u8; 32]) -> io::Result<bool> {
         let path = hash_to_path(&self.base_dir, hash);
         Ok(tokio::fs::metadata(&path).await.is_ok())
+    }
+
+    /// Write a chunk from `Bytes`. Thin wrapper around [`write_chunk`].
+    pub async fn write_chunk_from_bytes(&self, hash: &[u8; 32], data: Bytes) -> io::Result<()> {
+        self.write_chunk(hash, &data).await
     }
 
     /// Delete a chunk from disk. No-op if the chunk doesn't exist.
@@ -447,5 +453,70 @@ mod tests {
             "chunks directory should be created: {:?}",
             chunks_dir
         );
+    }
+
+    // ── write_chunk_from_bytes tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn write_chunk_from_bytes_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
+
+        let hash = make_hash(0xFE);
+        let data = Bytes::from_static(b"bytes-based chunk data!");
+
+        store
+            .write_chunk_from_bytes(&hash, data.clone())
+            .await
+            .unwrap();
+        let result = store.read_chunk(&hash).await.unwrap();
+        assert_eq!(result, Some(data.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn write_chunk_from_bytes_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = ChunkStore::open(tmp.path()).await.unwrap();
+
+        let hash = make_hash(0xFD);
+        let data = Bytes::from_static(b"idempotent bytes test");
+
+        store
+            .write_chunk_from_bytes(&hash, data.clone())
+            .await
+            .unwrap();
+        store
+            .write_chunk_from_bytes(&hash, data.clone())
+            .await
+            .unwrap();
+
+        let result = store.read_chunk(&hash).await.unwrap();
+        assert_eq!(result, Some(data.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn write_chunk_from_bytes_vs_slice_equivalence() {
+        let tmp = TempDir::new().unwrap();
+        let store1 = ChunkStore::open(tmp.path()).await.unwrap();
+
+        let data = b"same data, different wrappers";
+        let bytes = Bytes::from_static(data);
+        let hash = make_hash(0xFC);
+
+        // Write via bytes path
+        store1
+            .write_chunk_from_bytes(&hash, bytes)
+            .await
+            .unwrap();
+        let result1 = store1.read_chunk(&hash).await.unwrap();
+
+        // Delete and re-write via slice path
+        store1.delete_chunk(&hash).await.unwrap();
+        store1.write_chunk(&hash, data).await.unwrap();
+        let result2 = store1.read_chunk(&hash).await.unwrap();
+
+        // Both paths should produce identical on-disk data
+        assert_eq!(result1, result2);
+        assert_eq!(result1, Some(data.to_vec()));
     }
 }

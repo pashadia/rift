@@ -10,6 +10,7 @@
 //!   rift config get `client.cache_size`
 //!   rift config set `client.cache_size` 2GB
 
+use bytes::Bytes;
 use rift_common::crypto::Blake3Hash;
 use std::path::Path;
 use tokio_rusqlite::rusqlite;
@@ -354,6 +355,23 @@ impl FileCache {
         Ok(store.read_chunk(hash).await.map_err(|e| {
             rusqlite::Error::InvalidParameterName(format!("chunk I/O error: {}", e))
         })?)
+    }
+
+    /// Store chunk data from `Bytes`. Thin wrapper around [`put_chunk`].
+    pub async fn put_chunk_bytes(&self, hash: &[u8; 32], data: Bytes) -> SqliteResult<()> {
+        let store = self.chunk_store.as_ref().ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(
+                "put_chunk_bytes requires a ChunkStore; use FileCache::open(), not open_in_memory()"
+                    .to_string(),
+            )
+        })?;
+        store
+            .write_chunk_from_bytes(hash, data)
+            .await
+            .map_err(|e| {
+                rusqlite::Error::InvalidParameterName(format!("chunk I/O error: {}", e))
+            })?;
+        Ok(())
     }
 
     /// Reconstruct only the byte range [offset, offset+length) from cached chunks.
@@ -1154,6 +1172,36 @@ mod tests {
             result, chunk0_data,
             "full file read with u64::MAX length should work"
         );
+    }
+
+    // ── put_chunk_bytes tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn put_chunk_bytes_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let data = Bytes::from_static(b"chunk data via bytes");
+        let hash = *Blake3Hash::new(&data).as_bytes();
+
+        cache
+            .put_chunk_bytes(&hash, data.clone())
+            .await
+            .unwrap();
+        let result = cache.get_chunk(&hash).await.unwrap();
+        assert_eq!(result, Some(data.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn put_chunk_bytes_vs_put_chunk_equivalence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hash = *Blake3Hash::new(b"equiv test").as_bytes();
+        let data_bytes = Bytes::from_static(b"equiv test");
+
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+        cache.put_chunk_bytes(&hash, data_bytes).await.unwrap();
+        let result = cache.get_chunk(&hash).await.unwrap();
+        assert_eq!(result, Some(b"equiv test".to_vec()));
     }
 
     #[tokio::test]
