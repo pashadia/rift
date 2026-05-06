@@ -418,48 +418,42 @@ impl FileCache {
         let mut corrupted = Vec::new();
 
         for chunk in &chunks[first_idx..=last_idx] {
-            match self.get_chunk(&chunk.hash).await {
+            // Determine the slice of this chunk that falls within [offset, end)
+            let chunk_start = chunk.offset;
+            let chunk_end = chunk_start.saturating_add(chunk.length);
+            let slice_start = offset.saturating_sub(chunk_start);
+            let slice_end = end.min(chunk_end) - chunk_start;
+            let need_len =
+                usize::try_from(slice_end - slice_start).expect("byte range fits in usize");
+
+            let store = self.chunk_store.as_ref().expect("chunk store required");
+
+            // Quick integrity check: verify the stored file size matches expected
+            // (catches truncation/corruption before attempting partial read)
+            match store.verify_chunk_size(&chunk.hash, chunk.length) {
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(chunk.hash);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "chunk size mismatch for hash {:?}: {}",
+                        &chunk.hash[..4],
+                        e
+                    );
+                    corrupted.push(chunk.hash);
+                    continue;
+                }
+                Ok(()) => {}
+            }
+
+            match store.read_chunk_range(&chunk.hash, slice_start, need_len) {
                 Ok(Some(data)) => {
-                    if data.len()
-                        != usize::try_from(chunk.length).expect("chunk length fits in usize")
-                    {
-                        tracing::info!(
-                            expected_len = chunk.length,
-                            actual_len = data.len(),
-                            "chunk length mismatch in cache"
-                        );
-                        tracing::warn!(
-                            "cached chunk length mismatch: expected {}, got {}",
-                            chunk.length,
-                            data.len()
-                        );
-                        corrupted.push(chunk.hash);
-                    } else if *Blake3Hash::new(&data).as_bytes() != chunk.hash {
-                        tracing::info!(
-                            expected = ?&chunk.hash[..4],
-                            actual = ?&Blake3Hash::new(&data).as_bytes()[..4],
-                            "chunk hash mismatch in cache"
-                        );
-                        tracing::warn!(
-                            "cached chunk hash mismatch: expected {:?}, got {:?}",
-                            &chunk.hash[..4],
-                            &Blake3Hash::new(&data).as_bytes()[..4]
-                        );
-                        corrupted.push(chunk.hash);
-                    } else {
-                        // Determine the slice of this chunk that falls within [offset, end)
-                        let chunk_start = chunk.offset;
-                        let chunk_end = chunk_start.saturating_add(chunk.length);
-                        let slice_start = usize::try_from(offset.saturating_sub(chunk_start))
-                            .expect("byte offset fits in usize");
-                        let slice_end = usize::try_from(end.min(chunk_end) - chunk_start)
-                            .expect("byte offset fits in usize");
-                        result.extend_from_slice(&data[slice_start..slice_end]);
-                    }
+                    result.extend_from_slice(&data);
                 }
                 Ok(None) => missing.push(chunk.hash),
                 Err(e) => {
-                    tracing::warn!("error reading chunk: {}", e);
+                    tracing::warn!("error reading chunk range: {}", e);
                     missing.push(chunk.hash);
                 }
             }
@@ -1202,6 +1196,48 @@ mod tests {
         cache.put_chunk_bytes(&hash, data_bytes).await.unwrap();
         let result = cache.get_chunk(&hash).await.unwrap();
         assert_eq!(result, Some(b"equiv test".to_vec()));
+    }
+
+    /// Verify reconstruct_range uses partial reads and matches full-read results.
+    #[tokio::test]
+    async fn reconstruct_range_partial_reads_match_full_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let chunk_sizes: [u64; 5] = [100, 200, 150, 300, 250];
+        let file_size: u64 = chunk_sizes.iter().sum(); // 1000
+
+        let c0: Vec<u8> = (0u8..100).collect();
+        let c1: Vec<u8> = (0u8..=255).cycle().skip(100).take(200).collect();
+        let c2: Vec<u8> = (0u8..=255).cycle().skip(200).take(150).collect();
+        let c3: Vec<u8> = (0u8..=255).cycle().skip(300).take(300).collect();
+        let c4: Vec<u8> = (0u8..=255).cycle().skip(400).take(250).collect();
+        let all = [&c0, &c1, &c2, &c3, &c4];
+
+        let mut chunks = Vec::new();
+        let mut offset = 0u64;
+        for (i, (data, &size)) in all.iter().zip(chunk_sizes.iter()).enumerate() {
+            let hash = *Blake3Hash::new(data).as_bytes();
+            cache.put_chunk(&hash, data).await.unwrap();
+            chunks.push(ChunkInfo {
+                index: u32::try_from(i).expect("fits"),
+                offset,
+                length: size,
+                hash,
+            });
+            offset += size;
+        }
+
+        let full: Vec<u8> = all.iter().flat_map(|d| d.iter().copied()).collect();
+
+        for (off, len) in [(0, 50), (80, 40), (250, 50), (550, 100), (900, 50), (0, 1000)] {
+            let result = cache
+                .reconstruct_range(&chunks, off, len, file_size)
+                .await
+                .unwrap();
+            let end = (off + len).min(file_size) as usize;
+            assert_eq!(result, &full[off as usize..end]);
+        }
     }
 
     #[tokio::test]

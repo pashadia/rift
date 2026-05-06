@@ -109,6 +109,55 @@ impl ChunkStore {
         self.write_chunk(hash, &data).await
     }
 
+    /// Read a byte range from a chunk on disk.
+    ///
+    /// Uses `File::open` + `seek` + `read_exact` for partial reads,
+    /// avoiding the full-file read of [`read_chunk`].
+    /// Returns `None` if the chunk doesn't exist, or `Err` if the range
+    /// extends past the end of the stored file.
+    pub fn read_chunk_range(
+        &self,
+        hash: &[u8; 32],
+        range_offset: u64,
+        len: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = hash_to_path(&self.base_dir, hash);
+
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        file.seek(SeekFrom::Start(range_offset))?;
+
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)?;
+
+        Ok(Some(buf))
+    }
+
+    /// Verify a stored chunk's file size matches `expected_len`.
+    ///
+    /// Returns `Ok(())` if the file exists with the correct size,
+    /// or an `io::Error` if the file is missing, truncated, or extended.
+    pub fn verify_chunk_size(&self, hash: &[u8; 32], expected_len: u64) -> io::Result<()> {
+        let path = hash_to_path(&self.base_dir, hash);
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "chunk size mismatch: expected {}, got {}",
+                    expected_len,
+                    metadata.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Delete a chunk from disk. No-op if the chunk doesn't exist.
     pub async fn delete_chunk(&self, hash: &[u8; 32]) -> io::Result<()> {
         let path = hash_to_path(&self.base_dir, hash);
@@ -518,5 +567,101 @@ mod tests {
         // Both paths should produce identical on-disk data
         assert_eq!(result1, result2);
         assert_eq!(result1, Some(data.to_vec()));
+    }
+
+    // ── read_chunk_range tests ───────────────────────────────────────
+
+    #[test]
+    fn read_chunk_range_middle_of_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(ChunkStore::open(tmp.path())).unwrap();
+
+        let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let hash = make_hash(0xE0);
+        rt.block_on(store.write_chunk(&hash, &data)).unwrap();
+
+        let result = store
+            .read_chunk_range(&hash, 1024, 1024)
+            .unwrap()
+            .expect("chunk exists");
+        assert_eq!(result, &data[1024..2048]);
+    }
+
+    #[test]
+    fn read_chunk_range_from_offset_zero() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(ChunkStore::open(tmp.path())).unwrap();
+
+        let data = b"hello from the beginning";
+        let hash = make_hash(0xE1);
+        rt.block_on(store.write_chunk(&hash, data)).unwrap();
+
+        let result = store
+            .read_chunk_range(&hash, 0, 5)
+            .unwrap()
+            .expect("chunk exists");
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn read_chunk_range_past_end_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(ChunkStore::open(tmp.path())).unwrap();
+
+        let data = b"short";
+        let hash = make_hash(0xE2);
+        rt.block_on(store.write_chunk(&hash, data)).unwrap();
+
+        let result = store.read_chunk_range(&hash, 3, 100);
+        assert!(result.is_err(), "read past end should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn read_chunk_range_offset_past_file_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(ChunkStore::open(tmp.path())).unwrap();
+
+        let data = b"tiny";
+        let hash = make_hash(0xE3);
+        rt.block_on(store.write_chunk(&hash, data)).unwrap();
+
+        let result = store.read_chunk_range(&hash, 100, 10);
+        assert!(result.is_err(), "offset past end should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn read_chunk_range_nonexistent_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(ChunkStore::open(tmp.path())).unwrap();
+
+        let hash = make_hash(0xE4);
+        let result = store.read_chunk_range(&hash, 0, 100).unwrap();
+        assert!(result.is_none(), "non-existent chunk should return None");
+    }
+
+    #[test]
+    fn read_chunk_range_full_chunk_matches_read_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(ChunkStore::open(tmp.path())).unwrap();
+
+        let data: Vec<u8> = (b'A'..=b'Z').cycle().take(1000).collect();
+        let hash = make_hash(0xE5);
+        rt.block_on(store.write_chunk(&hash, &data)).unwrap();
+
+        let full_range = store
+            .read_chunk_range(&hash, 0, data.len())
+            .unwrap()
+            .expect("chunk exists");
+        let full = rt
+            .block_on(store.read_chunk(&hash))
+            .unwrap()
+            .expect("chunk exists");
+        assert_eq!(full_range, full);
     }
 }
