@@ -27,7 +27,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use rift_common::crypto::Chunker;
 use tracing::{debug, info, warn};
-use walkdir::WalkDir;
 
 use crate::handler::merkle_cache::cache_computed_tree;
 use crate::handler::merkle_cache::compute_file_merkle_tree;
@@ -55,8 +54,8 @@ pub struct BackgroundCheckSummary {
     pub errors: usize,
 }
 
-/// Walk `share` on the calling (blocking) thread and send one `PathBuf`
-/// per regular file through `tx`.
+/// Walk `share` recursively and send one `PathBuf` per regular file
+/// through `tx`.
 ///
 /// Skips directories and symlinks. Paths are canonicalized and verified
 /// to stay within the share boundary.
@@ -75,34 +74,45 @@ pub struct BackgroundCheckSummary {
 ///
 /// IMPORTANT: This function does NOT stat files. It only sends paths.
 /// The receiver must stat files fresh to avoid TOCTOU bugs.
-///
-/// Takes owned params because `spawn_blocking` requires `'static + Send`.
-#[allow(clippy::needless_pass_by_value)]
-fn walk_share(share: PathBuf, share_canonical: PathBuf, tx: tokio::sync::mpsc::Sender<PathBuf>) {
-    for entry in WalkDir::new(&share).follow_links(false) {
-        let Ok(entry) = entry else {
-            tracing::debug!("walk_dir entry failed, skipping");
+async fn walk_share(
+    share: PathBuf,
+    share_canonical: PathBuf,
+    tx: tokio::sync::mpsc::Sender<PathBuf>,
+) {
+    let mut queue = vec![share];
+
+    while let Some(dir) = queue.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
             continue;
         };
 
-        // Only process regular files (skip dirs, symlinks)
-        if !entry.file_type().is_file() {
-            continue;
-        }
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
 
-        // SECURITY: Use TOCTOU-safe canonicalization with containment check
-        let Some(canonical) = canonicalize_within_share(entry.path(), &share_canonical) else {
-            debug!(
-                path = %entry.path().display(),
-                "path escapes share root after canonicalization, skipping"
-            );
-            continue;
-        };
+            if file_type.is_symlink() {
+                continue;
+            }
 
-        // Send only the path — stat happens at process time for TOCTOU safety
-        if tx.blocking_send(canonical).is_err() {
-            // Receiver dropped — shutdown
-            return;
+            let path = entry.path();
+
+            if file_type.is_dir() {
+                queue.push(path);
+                continue;
+            }
+
+            // SECURITY: Use TOCTOU-safe canonicalization with containment check
+            if let Some(canonical) = canonicalize_within_share(&path, &share_canonical).await {
+                if tx.send(canonical).await.is_err() {
+                    return;
+                }
+            } else {
+                debug!(
+                    path = %path.display(),
+                    "path escapes share root after canonicalization, skipping"
+                );
+            }
         }
     }
 }
@@ -148,7 +158,9 @@ pub async fn run_background_check(
 
     let share_owned = share.to_path_buf();
     let share_canonical_owned = share_canonical.clone();
-    tokio::task::spawn_blocking(move || walk_share(share_owned, share_canonical_owned, tx));
+    tokio::spawn(async move {
+        walk_share(share_owned, share_canonical_owned, tx).await;
+    });
 
     let mut files_since_yield: usize = 0;
 
@@ -793,9 +805,10 @@ mod tests {
         let share_canonical = tokio::fs::canonicalize(&share).await.unwrap();
         let share_owned = share.clone();
 
-        // Run walk on a blocking thread
-        let walk_handle =
-            tokio::task::spawn_blocking(move || walk_share(share_owned, share_canonical, tx));
+        // Run walk on a spawned async task
+        let walk_handle = tokio::spawn(async move {
+            walk_share(share_owned, share_canonical, tx).await;
+        });
 
         // Wait for walk to finish sending all paths
         walk_handle.await.unwrap();
