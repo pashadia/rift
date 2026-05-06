@@ -3,6 +3,8 @@ use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::StreamExt;
+use futures::TryStreamExt;
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Semaphore;
@@ -236,7 +238,12 @@ async fn build_and_cache_tree<M: MerkleCache>(
         .inspect_err(|e| tracing::warn!(path = %canonical.display(), error = %e, "failed to open file for tree build"))
         .ok()?;
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
-    let chunk_boundaries = chunker.chunk_stream(reader).await;
+    let chunk_boundaries: Vec<(usize, usize)> = chunker
+        .chunk_stream(reader)
+        .map(|r| r.map(|(o, l, _)| (o, l)))
+        .try_collect()
+        .await
+        .ok()?;
 
     let indexed_results = read_and_hash_chunks(canonical, &chunk_boundaries).await?;
     let leaf_hashes: Vec<Blake3Hash> = indexed_results.iter().map(|(_, h, _)| h.clone()).collect();

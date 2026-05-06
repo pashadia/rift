@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::io::SeekFrom;
 use std::path::Path;
 
+use futures::TryStreamExt;
 use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleChild, MerkleTree};
 use rift_protocol::messages::FileType;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 
 use super::merkle_cache_trait::MerkleCache;
@@ -85,19 +84,12 @@ pub(crate) async fn compute_file_merkle_tree(
     // Open file and compute chunk boundaries using streaming
     let file = tokio::fs::File::open(path).await.ok()?;
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
-    let chunk_boundaries = chunker.chunk_stream(reader).await;
+    let chunks: Vec<(usize, usize, Vec<u8>)> =
+        chunker.chunk_stream(reader).try_collect().await.ok()?;
+    let chunk_boundaries: Vec<(usize, usize)> = chunks.iter().map(|(o, l, _)| (*o, *l)).collect();
 
-    // Re-open for reading chunk data
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-
-    // Read all chunk data
-    let mut chunk_data: Vec<Vec<u8>> = Vec::with_capacity(chunk_boundaries.len());
-    for (offset, length) in &chunk_boundaries {
-        let mut buf = vec![0u8; *length];
-        file.seek(SeekFrom::Start(*offset as u64)).await.ok()?;
-        file.read_exact(&mut buf).await.ok()?;
-        chunk_data.push(buf);
-    }
+    // Extract chunk data directly from the stream
+    let chunk_data: Vec<Vec<u8>> = chunks.into_iter().map(|(_, _, d)| d).collect();
 
     // CPU-bound: hash chunks and build Merkle tree with cache
     tokio::task::spawn_blocking(move || {
