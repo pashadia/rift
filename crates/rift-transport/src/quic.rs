@@ -162,7 +162,7 @@ impl RiftStream for QuicStream {
     #[instrument(skip(self))]
     async fn recv_frame(&mut self) -> Result<Option<(u8, Bytes)>, TransportError> {
         loop {
-            // Try to decode a complete frame from the already-buffered bytes.
+            // Fast path: try to decode a complete frame from already-buffered bytes.
             if let Some((type_id, payload)) = codec::decode_message(&mut self.read_buf)? {
                 tracing::debug!(
                     type_id = type_id,
@@ -172,8 +172,23 @@ impl RiftStream for QuicStream {
                 return Ok(Some((type_id, payload)));
             }
 
-            // Need more bytes from the QUIC stream.
-            match self.recv.read_chunk(8192, true).await {
+            // Determine exactly how many more bytes we need.
+            let needed = match codec::try_decode_header(&self.read_buf)? {
+                Some((_type_id, payload_len, header_len)) => {
+                    // Header is decoded — we know the exact total frame size.
+                    (header_len + payload_len).saturating_sub(self.read_buf.len())
+                }
+                None => {
+                    // Can't decode the header yet — ask for at least enough bytes
+                    // for a worst-case header (2 varints × 10 bytes max each).
+                    20usize.saturating_sub(self.read_buf.len())
+                }
+            };
+
+            // Always ask for at least 1 byte so we make forward progress.
+            let max_bytes = std::cmp::max(needed, 1);
+
+            match self.recv.read_chunk(max_bytes, true).await {
                 Ok(Some(chunk)) => {
                     self.read_buf.extend_from_slice(&chunk.bytes);
                 }

@@ -56,6 +56,32 @@ pub fn encode_header(
     Ok(())
 }
 
+/// Peek at a frame header (`type_id` and `payload_len`) without consuming the buffer.
+///
+/// Returns `Ok(Some((type_id, payload_len, header_len)))` when a complete header
+/// is available, `Ok(None)` when more data is needed, or an error on malformed input.
+/// `header_len` is the number of bytes consumed by the two varints.
+pub fn try_decode_header(buf: &[u8]) -> Result<Option<(u8, usize, usize)>, CodecError> {
+    let mut peek = buf;
+
+    let Some(type_id) = decode_varint_peek(&mut peek)? else {
+        return Ok(None);
+    };
+
+    let Some(payload_len) = decode_varint_peek(&mut peek)? else {
+        return Ok(None);
+    };
+
+    let payload_len = usize::try_from(payload_len).expect("payload_len fits in usize");
+    let header_len = buf.len() - peek.len();
+
+    Ok(Some((
+        u8::try_from(type_id).expect("type_id is 0x00-0xFF"),
+        payload_len,
+        header_len,
+    )))
+}
+
 /// Decode a message from a buffer.
 ///
 /// Returns `Ok(Some((type_id, payload)))` when a complete frame is available,
@@ -386,6 +412,160 @@ mod tests {
         // Verify the payload is Bytes (zero-copy from buffer)
         let (_type_id, payload): (u8, Bytes) = result;
         assert_eq!(&payload[..], b"hello");
+    }
+
+    // ── try_decode_header tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_try_decode_header_valid() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"hello world", &mut buf).unwrap();
+
+        let (type_id, payload_len, header_len) = try_decode_header(&buf).unwrap().unwrap();
+
+        assert_eq!(type_id, 0x01);
+        assert_eq!(payload_len, 11);
+        assert_eq!(header_len, 2); // 1-byte type + 1-byte len
+        assert_eq!(buf.len(), header_len + payload_len);
+    }
+
+    #[test]
+    fn test_try_decode_header_partial() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"data", &mut buf).unwrap();
+
+        // Only first byte — not a complete header
+        let partial = &buf[..1];
+        assert!(try_decode_header(partial).unwrap().is_none());
+
+        // Just enough for complete header
+        let header_slice = &buf[..2];
+        let (type_id, payload_len, header_len) = try_decode_header(header_slice).unwrap().unwrap();
+        assert_eq!(type_id, 0x01);
+        assert_eq!(payload_len, 4);
+        assert_eq!(header_len, 2);
+    }
+
+    #[test]
+    fn test_try_decode_header_empty_input() {
+        assert!(try_decode_header(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_try_decode_header_invalid_varint() {
+        // 10 bytes all with continuation bit set → invalid varint
+        let buf: Vec<u8> = vec![0x80; 12];
+        let result = try_decode_header(&buf);
+        assert!(matches!(result, Err(CodecError::InvalidVarint)));
+    }
+
+    #[test]
+    fn test_try_decode_header_empty_payload() {
+        let mut buf = BytesMut::new();
+        encode_message(0x02, b"", &mut buf).unwrap();
+
+        let (type_id, payload_len, header_len) = try_decode_header(&buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x02);
+        assert_eq!(payload_len, 0);
+        assert_eq!(header_len, 2);
+    }
+
+    #[test]
+    fn test_try_decode_header_large_type_id() {
+        let mut buf = BytesMut::new();
+        // type_id 0x80 needs 2-byte varint
+        encode_message(0x80, b"test", &mut buf).unwrap();
+
+        let (type_id, payload_len, header_len) = try_decode_header(&buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x80);
+        assert_eq!(payload_len, 4);
+        assert_eq!(header_len, 3); // 2-byte type + 1-byte len
+    }
+
+    #[test]
+    fn test_try_decode_header_large_payload_len() {
+        let mut buf = BytesMut::new();
+        // payload length 300 needs 2-byte varint
+        let data = vec![0u8; 300];
+        encode_message(0x01, &data, &mut buf).unwrap();
+
+        let (type_id, payload_len, header_len) = try_decode_header(&buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x01);
+        assert_eq!(payload_len, 300);
+        assert_eq!(header_len, 3); // 1-byte type + 2-byte len
+    }
+
+    #[test]
+    fn test_try_decode_header_multiple_headers() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"first", &mut buf).unwrap();
+        encode_message(0x30, b"second", &mut buf).unwrap();
+
+        // First header
+        let (t1, l1, h1) = try_decode_header(&buf).unwrap().unwrap();
+        assert_eq!(t1, 0x01);
+        assert_eq!(l1, 5);
+        assert_eq!(h1, 2);
+
+        // Slice past first frame
+        let rest = &buf[h1 + l1..];
+        let (t2, l2, h2) = try_decode_header(rest).unwrap().unwrap();
+        assert_eq!(t2, 0x30);
+        assert_eq!(l2, 6);
+        assert_eq!(h2, 2);
+    }
+
+    #[test]
+    fn test_try_decode_header_partial_second_varint() {
+        let mut buf = BytesMut::new();
+        // type_id 0x80 needs 2 bytes, so after reading the first varint
+        // we might have only part of the second
+        encode_message(0x80, &vec![0u8; 300], &mut buf).unwrap();
+        // Header: 2-byte type + 2-byte len = 4 bytes
+        assert_eq!(buf[0], 0x80); // first byte: type_id continuation
+        assert_eq!(buf[1], 0x01); // second byte: type_id final
+
+        // Give only 3 bytes: enough for type varint but not length varint
+        let partial = &buf[..3];
+        assert!(try_decode_header(partial).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_try_decode_header_does_not_consume_buffer() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, b"immutable", &mut buf).unwrap();
+
+        let original_len = buf.len();
+        let _ = try_decode_header(&buf).unwrap().unwrap();
+
+        // Buffer length unchanged after peek
+        assert_eq!(buf.len(), original_len);
+    }
+
+    #[test]
+    fn test_try_decode_header_all_type_ids() {
+        let type_ids: &[u8] = &[0x00, 0x01, 0x7F, 0x80, 0xF0, 0xFF];
+        for &id in type_ids {
+            let mut buf = BytesMut::new();
+            encode_message(id, b"test", &mut buf).unwrap();
+
+            let (decoded_id, payload_len, header_len) = try_decode_header(&buf).unwrap().unwrap();
+            assert_eq!(decoded_id, id, "type_id 0x{id:02X} not preserved");
+            assert_eq!(payload_len, 4);
+            // header_len: 1 for types < 0x80, 2 for >= 0x80 (plus 1 for length)
+            let expected = if id < 0x80 { 2 } else { 3 };
+            assert_eq!(header_len, expected, "header_len for 0x{id:02X}");
+        }
+    }
+
+    #[test]
+    fn test_try_decode_header_max_message_size() {
+        let mut buf = BytesMut::new();
+        encode_message(0x01, &vec![0u8; MAX_MESSAGE_SIZE], &mut buf).unwrap();
+
+        let (type_id, payload_len, _header_len) = try_decode_header(&buf).unwrap().unwrap();
+        assert_eq!(type_id, 0x01);
+        assert_eq!(payload_len, MAX_MESSAGE_SIZE);
     }
 }
 

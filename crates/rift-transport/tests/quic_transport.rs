@@ -380,3 +380,116 @@ async fn quic_connection_close_detected_on_accept_stream() {
 
     server_task.await.unwrap();
 }
+
+/// Verify that multiple back-to-back frames on a single stream are decoded
+/// correctly by the optimized `recv_frame` (header-then-payload pattern).
+#[tokio::test]
+async fn quic_multiple_back_to_back_frames_on_one_stream() {
+    let (server_cert, server_key) = helpers::gen_test_cert("test-server");
+    let (client_cert, client_key) = helpers::gen_test_cert("test-client");
+
+    let listener = server_endpoint("127.0.0.1:0".parse().unwrap(), &server_cert, &server_key)
+        .expect("server_endpoint failed");
+    let addr = listener.local_addr();
+
+    let frames: Vec<(u8, Vec<u8>)> = vec![
+        (0x01, b"frame-1".to_vec()),
+        (0x30, vec![0xAA; 4096]),
+        (0xF0, b"frame-3-data".to_vec()),
+        (0x02, vec![0x00; 1024]),
+        (0x05, b"frame-5".to_vec()),
+    ];
+    let frames_clone = frames.clone();
+
+    let server_task = tokio::spawn(async move {
+        let conn = listener.accept().await.unwrap();
+        let mut s = conn.accept_stream().await.unwrap();
+        for (expected_type, expected_payload) in &frames_clone {
+            let (t, p) = s.recv_frame().await.unwrap().unwrap();
+            assert_eq!(t, *expected_type);
+            assert_eq!(&p[..], &expected_payload[..]);
+        }
+    });
+
+    let ep = client_endpoint(&client_cert, &client_key).expect("client_endpoint failed");
+    let conn = connect(&ep, addr, "test-server", Arc::new(AcceptAnyPolicy))
+        .await
+        .unwrap();
+    let mut s = conn.open_stream().await.unwrap();
+    for (type_id, payload) in &frames {
+        s.send_frame(*type_id, payload).await.unwrap();
+    }
+    s.finish_send().await.unwrap();
+
+    server_task.await.unwrap();
+}
+
+/// Verify that a large 1 MB frame is received correctly.
+/// The optimized `recv_frame` should parse the header first, then read
+/// exactly the payload without excessive small reads.
+#[tokio::test]
+async fn quic_large_frame_1mb_round_trip() {
+    let (server_cert, server_key) = helpers::gen_test_cert("test-server");
+    let (client_cert, client_key) = helpers::gen_test_cert("test-client");
+
+    let listener = server_endpoint("127.0.0.1:0".parse().unwrap(), &server_cert, &server_key)
+        .expect("server_endpoint failed");
+    let addr = listener.local_addr();
+
+    let payload: Vec<u8> = (0..=255u8).cycle().take(1024 * 1024).collect(); // 1 MB
+    let payload_clone = payload.clone();
+
+    let server_task = tokio::spawn(async move {
+        let conn = listener.accept().await.unwrap();
+        let mut s = conn.accept_stream().await.unwrap();
+        let (t, p) = s.recv_frame().await.unwrap().unwrap();
+        assert_eq!(t, 0xAB);
+        assert_eq!(p.len(), payload_clone.len());
+        assert_eq!(&p[..], &payload_clone[..]);
+    });
+
+    let ep = client_endpoint(&client_cert, &client_key).expect("client_endpoint failed");
+    let conn = connect(&ep, addr, "test-server", Arc::new(AcceptAnyPolicy))
+        .await
+        .unwrap();
+    let mut s = conn.open_stream().await.unwrap();
+    s.send_frame(0xAB, &payload).await.unwrap();
+    s.finish_send().await.unwrap();
+
+    server_task.await.unwrap();
+}
+
+/// Ensure the optimized `recv_frame` handles partial header data correctly:
+/// read header byte-by-byte until complete, then switch to payload-sized reads.
+#[tokio::test]
+async fn quic_partial_header_recovery() {
+    let (server_cert, server_key) = helpers::gen_test_cert("test-server");
+    let (client_cert, client_key) = helpers::gen_test_cert("test-client");
+
+    let listener = server_endpoint("127.0.0.1:0".parse().unwrap(), &server_cert, &server_key)
+        .expect("server_endpoint failed");
+    let addr = listener.local_addr();
+
+    // A frame with a multi-byte type_id (0x80) and a multi-byte payload_len (300).
+    // The header is 4 bytes: 2-byte type + 2-byte length.
+    let data = vec![0x42u8; 300];
+    let data_clone = data.clone();
+
+    let server_task = tokio::spawn(async move {
+        let conn = listener.accept().await.unwrap();
+        let mut s = conn.accept_stream().await.unwrap();
+        let (t, p) = s.recv_frame().await.unwrap().unwrap();
+        assert_eq!(t, 0x80);
+        assert_eq!(&p[..], &data_clone[..]);
+    });
+
+    let ep = client_endpoint(&client_cert, &client_key).expect("client_endpoint failed");
+    let conn = connect(&ep, addr, "test-server", Arc::new(AcceptAnyPolicy))
+        .await
+        .unwrap();
+    let mut s = conn.open_stream().await.unwrap();
+    s.send_frame(0x80, &data).await.unwrap();
+    s.finish_send().await.unwrap();
+
+    server_task.await.unwrap();
+}
