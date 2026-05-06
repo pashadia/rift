@@ -105,6 +105,37 @@ pub async fn canonicalize_within_share_async(
 /// - fd-resolved path escapes share
 ///
 /// On non-Linux, returns the canonical path as-is (no fd-based verification).
+/// Verify that an fd-resolved path is within the share and determine
+/// the final path to use. Returns `None` if the fd-resolved path escapes
+/// the share, otherwise returns the appropriate canonical path.
+#[cfg(target_os = "linux")]
+fn verify_fd_resolved_path(
+    fd_canonical: &Path,
+    canonical: &Path,
+    share_canonical: &Path,
+) -> Option<PathBuf> {
+    if !is_within_share(fd_canonical, share_canonical) {
+        tracing::warn!(
+            canonical = %canonical.display(),
+            fd_resolved = %fd_canonical.display(),
+            share = %share_canonical.display(),
+            "TOCTOU: path escaped share root between resolution and open"
+        );
+        return None;
+    }
+
+    if fd_canonical != canonical {
+        tracing::debug!(
+            original = %canonical.display(),
+            resolved = %fd_canonical.display(),
+            "TOCTOU: file path changed between resolution and open, using fd-resolved path"
+        );
+        return Some(fd_canonical.to_path_buf());
+    }
+
+    Some(canonical.to_path_buf())
+}
+
 #[cfg(target_os = "linux")]
 fn fd_recanonicalize_linux(canonical: &Path, share_canonical: &Path) -> Option<PathBuf> {
     use std::fs::File;
@@ -112,7 +143,14 @@ fn fd_recanonicalize_linux(canonical: &Path, share_canonical: &Path) -> Option<P
 
     // Only verify for regular files (not directories, not symlinks)
     let meta = std::fs::symlink_metadata(canonical).ok()?;
-    if meta.is_symlink() || meta.is_dir() {
+    if meta.is_symlink() {
+        tracing::warn!(
+            path = %canonical.display(),
+            "TOCTOU race: file became symlink during canonicalization, skipping"
+        );
+        return None;
+    }
+    if meta.is_dir() {
         return Some(canonical.to_path_buf());
     }
 
@@ -121,26 +159,7 @@ fn fd_recanonicalize_linux(canonical: &Path, share_canonical: &Path) -> Option<P
     let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
 
     if let Ok(fd_canonical) = std::fs::canonicalize(&fd_path) {
-        // Verify containment of fd-resolved path
-        if !is_within_share(&fd_canonical, share_canonical) {
-            tracing::warn!(
-                canonical = %canonical.display(),
-                fd_resolved = %fd_canonical.display(),
-                share = %share_canonical.display(),
-                "TOCTOU: path escaped share root between resolution and open"
-            );
-            return None;
-        }
-
-        // If fd resolves to different path, file was swapped - use fd-resolved path
-        if fd_canonical != canonical {
-            tracing::debug!(
-                original = %canonical.display(),
-                resolved = %fd_canonical.display(),
-                "TOCTOU: file path changed between resolution and open, using fd-resolved path"
-            );
-            return Some(fd_canonical);
-        }
+        return verify_fd_resolved_path(&fd_canonical, canonical, share_canonical);
     }
 
     Some(canonical.to_path_buf())
@@ -161,7 +180,14 @@ async fn fd_recanonicalize_linux_async(
 
     // Only verify for regular files (not directories, not symlinks)
     let meta = tokio::fs::symlink_metadata(canonical).await.ok()?;
-    if meta.is_symlink() || meta.is_dir() {
+    if meta.is_symlink() {
+        tracing::warn!(
+            path = %canonical.display(),
+            "TOCTOU race: file became symlink during canonicalization, skipping"
+        );
+        return None;
+    }
+    if meta.is_dir() {
         return Some(canonical.to_path_buf());
     }
 
@@ -170,26 +196,7 @@ async fn fd_recanonicalize_linux_async(
     let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
 
     if let Ok(fd_canonical) = tokio::fs::canonicalize(&fd_path).await {
-        // Verify containment of fd-resolved path
-        if !is_within_share(&fd_canonical, share_canonical) {
-            tracing::warn!(
-                canonical = %canonical.display(),
-                fd_resolved = %fd_canonical.display(),
-                share = %share_canonical.display(),
-                "TOCTOU: path escaped share root between resolution and open"
-            );
-            return None;
-        }
-
-        // If fd resolves to different path, file was swapped - use fd-resolved path
-        if fd_canonical != canonical {
-            tracing::debug!(
-                original = %canonical.display(),
-                resolved = %fd_canonical.display(),
-                "TOCTOU: file path changed between resolution and open, using fd-resolved path"
-            );
-            return Some(fd_canonical);
-        }
+        return verify_fd_resolved_path(&fd_canonical, canonical, share_canonical);
     }
 
     Some(canonical.to_path_buf())
@@ -400,6 +407,58 @@ mod tests {
         assert!(
             result.is_none(),
             "symlink escaping share should return None"
+        );
+    }
+
+    /// Test that `fd_recanonicalize_linux` rejects a symlink path.
+    ///
+    /// This simulates a TOCTOU race where a file is swapped for a symlink
+    /// between initial canonicalization and fd-based verification.
+    /// The old code returned `Some(canonical)`, bypassing fd verification
+    /// and potentially allowing symlink escapes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_recanonicalize_linux_rejects_symlink_toctou() {
+        let temp = TempDir::new().unwrap();
+        let share = temp.path().canonicalize().unwrap();
+
+        // Create a regular file
+        let file = share.join("file.txt");
+        std::fs::write(&file, b"content").unwrap();
+
+        // Now create a symlink (simulating TOCTOU swap)
+        let target = share.join("target.txt");
+        std::fs::write(&target, b"target").unwrap();
+        let link = share.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Directly test: if fd_recanonicalize_linux sees a symlink,
+        // it must return None, not Some(canonical)
+        let result = fd_recanonicalize_linux(&link, &share);
+        assert!(
+            result.is_none(),
+            "fd_recanonicalize_linux should reject a symlink (TOCTOU), got {:?}",
+            result
+        );
+    }
+
+    /// Async version of the TOCTOU symlink rejection test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fd_recanonicalize_linux_async_rejects_symlink_toctou() {
+        let temp = TempDir::new().unwrap();
+        let share = temp.path().canonicalize().unwrap();
+
+        let target = share.join("target.txt");
+        tokio::fs::write(&target, b"target").await.unwrap();
+        let link = share.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = fd_recanonicalize_linux_async(&link, &share).await;
+        assert!(
+            result.is_none(),
+            "fd_recanonicalize_linux_async should reject a symlink (TOCTOU), got {:?}",
+            result
         );
     }
 }
