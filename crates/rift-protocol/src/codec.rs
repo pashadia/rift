@@ -30,9 +30,28 @@ pub fn encode_message(type_id: u8, payload: &[u8], buf: &mut BytesMut) -> Result
         return Err(CodecError::MessageTooLarge(payload.len()));
     }
 
-    encode_varint(type_id.into(), buf);
-    encode_varint(payload.len() as u64, buf);
+    encode_header(type_id, payload.len(), buf)?;
     buf.put_slice(payload);
+
+    Ok(())
+}
+
+/// Encode only the frame header (varint `type_id` + varint `payload_len`) into `buf`.
+///
+/// This is useful when the caller wants to write the header and payload
+/// separately, avoiding a per-frame copy of the payload into an intermediate
+/// buffer.
+pub fn encode_header(
+    type_id: u8,
+    payload_len: usize,
+    buf: &mut impl BufMut,
+) -> Result<(), CodecError> {
+    if payload_len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::MessageTooLarge(payload_len));
+    }
+
+    encode_varint(type_id.into(), buf);
+    encode_varint(payload_len as u64, buf);
 
     Ok(())
 }
@@ -74,7 +93,7 @@ pub fn decode_message(buf: &mut BytesMut) -> Result<Option<(u8, Bytes)>, CodecEr
 }
 
 /// Encode a u64 as varint.
-fn encode_varint(mut value: u64, buf: &mut BytesMut) {
+fn encode_varint(mut value: u64, buf: &mut impl BufMut) {
     while value >= 0x80 {
         buf.put_u8(u8::try_from(value & 0x7F).expect("value & 0x7F fits in u8") | 0x80);
         value >>= 7;
@@ -271,6 +290,69 @@ mod tests {
             let decoded = decode_varint(&mut buf).unwrap().unwrap();
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn test_encode_header_matches_encode_message_prefix() {
+        // encode_header should produce the same bytes as the header portion
+        // (varint type + varint length) of encode_message.
+        let payload = b"hello world";
+
+        // Full encoding for reference.
+        let mut full = BytesMut::new();
+        encode_message(0x01, payload, &mut full).unwrap();
+        let expected_header_len = full.len() - payload.len();
+        let expected_header = &full[..expected_header_len];
+
+        // Header-only encoding.
+        let mut header_only = BytesMut::new();
+        encode_header(0x01, payload.len(), &mut header_only).unwrap();
+        assert_eq!(&header_only[..], expected_header);
+    }
+
+    #[test]
+    fn test_encode_header_empty_payload() {
+        let mut full = BytesMut::new();
+        encode_message(0xFF, b"", &mut full).unwrap();
+        let expected_header = &full[..];
+
+        let mut header_only = BytesMut::new();
+        encode_header(0xFF, 0, &mut header_only).unwrap();
+        assert_eq!(&header_only[..], expected_header);
+    }
+
+    #[test]
+    fn test_encode_header_large_type_id() {
+        // type_id above 127 requires 2-byte varint
+        let payload = b"test";
+        let mut full = BytesMut::new();
+        encode_message(0x80, payload, &mut full).unwrap();
+        let expected_header_len = full.len() - payload.len();
+        let expected_header = &full[..expected_header_len];
+
+        let mut header_only = BytesMut::new();
+        encode_header(0x80, payload.len(), &mut header_only).unwrap();
+        assert_eq!(&header_only[..], expected_header);
+    }
+
+    #[test]
+    fn test_encode_header_large_payload() {
+        // payload length 300 requires 2-byte varint
+        let payload = vec![0u8; 300];
+        let mut full = BytesMut::new();
+        encode_message(0x01, &payload, &mut full).unwrap();
+        let expected_header_len = full.len() - payload.len();
+        let expected_header = &full[..expected_header_len];
+
+        let mut header_only = BytesMut::new();
+        encode_header(0x01, payload.len(), &mut header_only).unwrap();
+        assert_eq!(&header_only[..], expected_header);
+    }
+
+    #[test]
+    fn test_encode_header_too_large() {
+        let result = encode_header(0x01, MAX_MESSAGE_SIZE + 1, &mut BytesMut::new());
+        assert!(matches!(result, Err(CodecError::MessageTooLarge(_))));
     }
 
     #[test]
