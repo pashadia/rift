@@ -84,14 +84,17 @@ async fn build_and_cache_tree<M: MerkleCache>(
 ) -> Option<(Blake3Hash, HashMap<Blake3Hash, Vec<MerkleChild>>)> {
     let (root, cache, leaf_infos) =
         crate::handler::merkle_cache::compute_file_merkle_tree(canonical, &chunker).await?;
-    crate::handler::merkle_cache::cache_computed_tree(
+    if let Err(e) = crate::handler::merkle_cache::cache_computed_tree(
         canonical,
         db,
         &root,
         cache.clone(),
         leaf_infos,
     )
-    .await;
+    .await
+    {
+        tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
+    }
     Some((root, cache))
 }
 

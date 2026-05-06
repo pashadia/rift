@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
 
@@ -9,7 +8,7 @@ use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
 
-use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleChild, MerkleTree};
+use rift_common::crypto::{Blake3Hash, Chunker, LeafInfo, MerkleTree};
 use rift_protocol::messages::{
     msg, read_response, BlockHeader, ChunkInfo, ErrorCode, ReadRequest, ReadResponse, ReadSuccess,
     TransferComplete,
@@ -74,26 +73,6 @@ async fn validate_handle<S: RiftStream>(stream: &mut S, req: &ReadRequest) -> an
         anyhow::bail!("invalid handle UUID");
     };
     Ok(handle)
-}
-
-/// Update the Merkle cache with the computed root, tree nodes, and leaf info.
-async fn cache_merkle_tree<M: MerkleCache>(
-    db: &M,
-    canonical: &Path,
-    root: &Blake3Hash,
-    cache: &HashMap<Blake3Hash, Vec<MerkleChild>>,
-    leaf_infos: &[LeafInfo],
-) -> anyhow::Result<()> {
-    let file_meta = tokio::fs::metadata(canonical).await?;
-    let mtime_ns = file_meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| u64::try_from(d.as_nanos()).ok());
-    let file_size = file_meta.len();
-    db.put_tree(canonical, mtime_ns, file_size, root, cache, leaf_infos)
-        .await?;
-    Ok(())
 }
 
 /// Verify all cached chunks in [start, end) by reading from disk and
@@ -435,7 +414,10 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
 
     tracing::info!(path = %canonical.display(), merkle_root = %format!("{:?}", root), "merkle tree built (cold path)");
 
-    if let Err(e) = cache_merkle_tree(db, &canonical, &root, &cache, &leaf_infos).await {
+    if let Err(e) =
+        crate::handler::merkle_cache::cache_computed_tree(&canonical, db, &root, cache, leaf_infos)
+            .await
+    {
         tracing::warn!(path = %canonical.display(), error = %e, "failed to cache merkle tree");
     }
     let transfer_complete = TransferComplete {

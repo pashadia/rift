@@ -46,7 +46,9 @@ pub(crate) async fn get_or_compute_merkle_root<M: MerkleCache>(
     match compute_file_merkle_tree(path, &chunker).await {
         Some((root, tree_cache, leaf_infos)) => {
             // Cache the result (errors are logged but don't fail the operation)
-            cache_computed_tree(path, cache, &root, tree_cache, leaf_infos).await;
+            if let Err(e) = cache_computed_tree(path, cache, &root, tree_cache, leaf_infos).await {
+                tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle tree");
+            }
             root
         }
         None => {
@@ -126,10 +128,8 @@ pub(crate) async fn cache_computed_tree<M: MerkleCache>(
     root: &Blake3Hash,
     tree_cache: HashMap<Blake3Hash, Vec<MerkleChild>>,
     leaf_infos: Vec<LeafInfo>,
-) {
-    let Ok(file_meta) = tokio::fs::metadata(path).await else {
-        return;
-    };
+) -> anyhow::Result<()> {
+    let file_meta = tokio::fs::metadata(path).await?;
 
     let mtime_ns = file_meta
         .modified()
@@ -139,12 +139,10 @@ pub(crate) async fn cache_computed_tree<M: MerkleCache>(
 
     let file_size = file_meta.len();
 
-    if let Err(e) = cache
+    cache
         .put_tree(path, mtime_ns, file_size, root, &tree_cache, &leaf_infos)
-        .await
-    {
-        tracing::warn!(path = %path.display(), error = %e, "failed to cache merkle tree");
-    }
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
