@@ -3,7 +3,6 @@ use std::path::Path;
 
 use bytes::BytesMut;
 use futures::StreamExt;
-use futures::TryStreamExt;
 use prost::Message as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::instrument;
@@ -325,9 +324,9 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     }
 
-    // Cold path: two-pass streaming.
-    // Pass 1: chunk boundaries (data dropped, O(N) boundaries).
-    // Pass 2: stream chunks, send each immediately, accumulate hashes.
+    // Cold path: single-pass streaming.
+    // Open file once, buffer all chunks, send response with chunk count,
+    // then send requested chunks, build and cache merkle tree.
     let file = match tokio::fs::File::open(&canonical).await {
         Ok(f) => f,
         Err(e) => {
@@ -335,23 +334,28 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         }
     };
     let reader = tokio::io::BufReader::with_capacity(512 * 1024, file);
-    let chunk_boundaries: Vec<(usize, usize)> = chunker
-        .chunk_stream(reader)
-        .map(|r| r.map(|(o, l, _)| (o, l)))
-        .try_collect()
-        .await?;
-    tracing::info!(path = %canonical.display(), chunk_count = chunk_boundaries.len(), file_size = meta.len(), "chunking file (cold path)");
+    let chunk_stream = chunker.chunk_stream(reader);
 
-    if req.start_chunk as usize >= chunk_boundaries.len() {
+    // Single-pass: collect all chunks (boundaries, hashes, and data)
+    let mut chunks: Vec<(usize, usize, Blake3Hash, Vec<u8>)> = Vec::new();
+    futures::pin_mut!(chunk_stream);
+    while let Some(chunk_result) = chunk_stream.next().await {
+        let (offset, length, data) = chunk_result?;
+        let hash = Blake3Hash::new(&data);
+        chunks.push((offset, length, hash, data));
+    }
+    tracing::info!(path = %canonical.display(), chunk_count = chunks.len(), "chunking complete (single-pass cold path)");
+
+    if req.start_chunk as usize >= chunks.len() {
         return send_read_error(stream, ErrorCode::ErrorNotFound).await;
     }
     let start = req.start_chunk as usize;
     let count = if req.chunk_count == 0 {
-        chunk_boundaries.len().saturating_sub(start)
+        chunks.len().saturating_sub(start)
     } else {
         req.chunk_count as usize
     };
-    let end = (start + count).min(chunk_boundaries.len());
+    let end = (start + count).min(chunks.len());
 
     let chunk_count = u32::try_from(end - start)
         .expect("chunk count exceeds u32 (bounded by MAX_CHUNK_COUNT=256)");
@@ -362,49 +366,32 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
         .send_frame(msg::READ_RESPONSE, &response.encode_to_vec())
         .await?;
 
-    // Pass 2: stream chunks, hash and send each in-range chunk immediately.
-    tracing::info!(path = %canonical.display(), chunk_count = end - start, "sending chunks (cold path streaming)");
-    let file2 = match tokio::fs::File::open(&canonical).await {
-        Ok(f) => f,
-        Err(e) => {
-            return send_read_error(stream, io_err_kind_to_code(e.kind())).await;
-        }
-    };
-    let reader2 = tokio::io::BufReader::with_capacity(512 * 1024, file2);
-    let stream2 = chunker.chunk_stream(reader2);
-
-    let mut leaf_hashes = Vec::with_capacity(chunk_boundaries.len());
-    let mut chunk_idx: usize = 0;
-
-    futures::pin_mut!(stream2);
-    while let Some(chunk_result) = stream2.next().await {
-        let (_offset, length, data) = chunk_result?;
-        let hash = Blake3Hash::new(&data);
-        leaf_hashes.push(hash.clone());
-
-        // Send immediately if in requested range
-        if chunk_idx >= start && chunk_idx < end {
-            let block_header = BlockHeader {
-                chunk: Some(ChunkInfo {
-                    index: u32::try_from(chunk_idx)
-                        .expect("chunk index exceeds u32 (max 256 chunks/request)"),
-                    length: length as u64,
-                    hash: hash.as_bytes().to_vec(),
-                }),
-            };
-            stream
-                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
-                .await?;
-            stream.send_frame(msg::BLOCK_DATA, &data).await?;
-        }
-        // data is dropped here — O(max_chunk_size) peak memory
-
-        chunk_idx += 1;
+    // Send chunks in requested range
+    tracing::info!(path = %canonical.display(), chunk_count = end - start, "sending chunks (single-pass cold path)");
+    for (i, (_offset, length, hash, data)) in chunks[start..end].iter().enumerate() {
+        let chunk_idx = start + i;
+        let block_header = BlockHeader {
+            chunk: Some(ChunkInfo {
+                index: u32::try_from(chunk_idx)
+                    .expect("chunk index exceeds u32 (max 256 chunks/request)"),
+                length: *length as u64,
+                hash: hash.as_bytes().to_vec(),
+            }),
+        };
+        stream
+            .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+            .await?;
+        stream.send_frame(msg::BLOCK_DATA, data).await?;
     }
 
-    tracing::info!(path = %canonical.display(), leaf_count = leaf_hashes.len(), "streaming send complete, building merkle tree");
+    // Build Merkle tree from accumulated hashes and boundaries
+    let chunk_boundaries: Vec<(usize, usize)> =
+        chunks.iter().map(|(o, l, _, _)| (*o, *l)).collect();
+    let leaf_hashes: Vec<Blake3Hash> = chunks.iter().map(|(_, _, h, _)| h.clone()).collect();
 
-    // Build Merkle tree (CPU-bound) from collected hashes
+    tracing::info!(path = %canonical.display(), leaf_count = leaf_hashes.len(), "send complete, building merkle tree");
+
+    // Build Merkle tree (CPU-bound)
     let (root, cache, leaf_infos) = tokio::task::spawn_blocking(move || {
         let merkle = MerkleTree::default();
         merkle.build_with_cache_and_offsets(&leaf_hashes, &chunk_boundaries)
@@ -412,7 +399,7 @@ pub async fn read_response<S: RiftStream, M: MerkleCache>(
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking task failed: {}", e))?;
 
-    tracing::info!(path = %canonical.display(), merkle_root = %format!("{:?}", root), "merkle tree built (cold path)");
+    tracing::info!(path = %canonical.display(), merkle_root = %format!("{:?}", root), "merkle tree built (single-pass cold path)");
 
     if let Err(e) =
         crate::handler::merkle_cache::cache_computed_tree(&canonical, db, &root, cache, leaf_infos)
@@ -806,6 +793,92 @@ mod tests {
             &reconstructed[..],
             new_content.as_slice(),
             "fallback must return new content"
+        );
+    }
+
+    /// Cold path must open the file only once (single-pass streaming).
+    /// This is a regression test for rift-1cjc.
+    #[tokio::test]
+    async fn cold_path_opens_file_once_single_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+        let file = share.join("single_pass.txt");
+        // ~100 KB file ensures multiple chunks
+        let content: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let uuid = handle_db.get_or_create_handle(&file).await.unwrap();
+
+        // Cold path: NoopCache forces cold path
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let mut client_stream = client_conn.open_stream().await.unwrap();
+        let mut server_stream = server_conn.accept_stream().await.unwrap();
+
+        let req = ReadRequest {
+            handle: uuid.as_bytes().to_vec(),
+            start_chunk: 0,
+            chunk_count: 0,
+        };
+
+        // Read the file content and chunk it to get expected chunk count
+        let chunker = Chunker::default();
+        let file_content = std::fs::read(&file).unwrap();
+        let expected_boundaries = chunker.chunk(&file_content);
+        let expected_chunk_count = expected_boundaries.len();
+
+        read_response(
+            &mut server_stream,
+            &req.encode_to_vec(),
+            &share,
+            &NoopCache, // Forces cold path
+            &handle_db,
+            Chunker::default(),
+        )
+        .await
+        .unwrap();
+
+        let frames = collect_frames(&mut client_stream).await;
+        assert!(!frames.is_empty(), "must receive frames");
+        assert_eq!(
+            frames[0].0,
+            msg::READ_RESPONSE,
+            "first frame must be READ_RESPONSE"
+        );
+
+        let resp = ReadResponse::decode(&frames[0].1[..]).unwrap();
+        let actual_chunk_count = match resp.result {
+            Some(read_response::Result::Ok(success)) => success.chunk_count as usize,
+            other => panic!("expected Ok, got: {:?}", other),
+        };
+
+        // Verify we got the correct chunk count (this requires buffering all chunks)
+        assert_eq!(
+            actual_chunk_count, expected_chunk_count,
+            "cold path should report correct total chunk count"
+        );
+
+        // Verify all chunks are sent correctly
+        let mut reconstructed = Vec::new();
+        for i in 0..actual_chunk_count {
+            let header_idx = 1 + i * 2;
+            let data_idx = 1 + i * 2 + 1;
+            assert_eq!(frames[header_idx].0, msg::BLOCK_HEADER);
+            assert_eq!(frames[data_idx].0, msg::BLOCK_DATA);
+            reconstructed.extend_from_slice(&frames[data_idx].1);
+        }
+        assert_eq!(
+            &reconstructed[..],
+            &file_content[..],
+            "reconstructed content must match original"
+        );
+
+        // Verify merkle root is present
+        let last = frames.last().unwrap();
+        assert_eq!(
+            last.0,
+            msg::TRANSFER_COMPLETE,
+            "last frame must be TRANSFER_COMPLETE"
         );
     }
 
@@ -1204,9 +1277,9 @@ mod tests {
         logs_assert(|lines: &[&str]| {
             let has = lines
                 .iter()
-                .any(|l| l.contains(" INFO ") && l.contains("chunking file"));
+                .any(|l| l.contains(" INFO ") && l.contains("chunking complete"));
             if !has {
-                return Err("missing INFO 'chunking file' log".to_string());
+                return Err("missing INFO 'chunking complete' log".to_string());
             }
             Ok(())
         });
