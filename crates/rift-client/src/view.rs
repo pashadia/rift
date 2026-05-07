@@ -129,21 +129,48 @@ impl<R: RemoteShare> RiftShareView<R> {
             .ok_or(FsError::NotFound)
     }
 
+    fn verify_node_children(
+        parent_hash: &Blake3Hash,
+        children: &[crate::client::MerkleChildInfo],
+    ) -> Result<Vec<Blake3Hash>, FsError> {
+        use rift_common::crypto::MerkleTree;
+
+        let child_hashes: Vec<Blake3Hash> = children
+            .iter()
+            .filter_map(|c| Blake3Hash::from_slice(&c.hash).ok())
+            .collect();
+
+        if !MerkleTree::verify_node(parent_hash, &child_hashes) {
+            tracing::info!(
+                parent_hash = ?parent_hash,
+                child_count = child_hashes.len(),
+                "merkle verification failed — cache conflict"
+            );
+            tracing::error!("merkle verification failed at node");
+            return Err(FsError::Io);
+        }
+        Ok(child_hashes)
+    }
+
+    async fn fetch_drill(
+        &self,
+        handle: Uuid,
+        hash: &[u8],
+    ) -> Result<crate::client::MerkleDrillResult, FsError> {
+        self.remote
+            .merkle_drill(handle, hash)
+            .await
+            .map_err(|_| FsError::Io)
+    }
+
     /// Recursively drills into the Merkle tree, verifying hashes at each level,
     /// and returns all resolved leaf nodes sorted by `chunk_index`.
-    #[allow(clippy::cognitive_complexity)]
     async fn resolve_merkle_tree(
         &self,
         handle: Uuid,
         root_hash: &Blake3Hash,
     ) -> Result<ResolvedMerkle, FsError> {
-        use rift_common::crypto::MerkleTree;
-
-        let drill = self
-            .remote
-            .merkle_drill(handle, &[])
-            .await
-            .map_err(|_| FsError::Io)?;
+        let drill = self.fetch_drill(handle, &[]).await?;
 
         let root_hash_from_drill =
             Blake3Hash::from_slice(&drill.parent_hash).map_err(|_| FsError::Io)?;
@@ -163,30 +190,13 @@ impl<R: RemoteShare> RiftShareView<R> {
             vec![(root_hash_from_drill.clone(), drill.children)];
 
         while let Some((parent_hash, children)) = stack.pop() {
-            let child_hashes: Vec<Blake3Hash> = children
-                .iter()
-                .filter_map(|c| Blake3Hash::from_slice(&c.hash).ok())
-                .collect();
-
-            if !MerkleTree::verify_node(&parent_hash, &child_hashes) {
-                tracing::info!(
-                    parent_hash = ?parent_hash,
-                    child_count = child_hashes.len(),
-                    "merkle verification failed — cache conflict"
-                );
-                tracing::error!("merkle verification failed at node");
-                return Err(FsError::Io);
-            }
+            let _child_hashes = Self::verify_node_children(&parent_hash, &children)?;
 
             for child in children {
                 let child_hash = Blake3Hash::from_slice(&child.hash).map_err(|_| FsError::Io)?;
 
                 if child.is_subtree {
-                    let drill = self
-                        .remote
-                        .merkle_drill(handle, &child.hash)
-                        .await
-                        .map_err(|_| FsError::Io)?;
+                    let drill = self.fetch_drill(handle, &child.hash).await?;
                     stack.push((child_hash, drill.children));
                 } else {
                     leaves.push(ResolvedLeaf {
@@ -826,7 +836,6 @@ impl<R: RemoteShare> RiftShareView<R> {
         Self::cache_manifest(cache.as_ref(), handle, merkle_root, leaves, chunk_starts).await;
     }
 
-    #[allow(clippy::cognitive_complexity)] // TODO: refactor into smaller functions
     async fn try_cached_read(
         &self,
         handle: &Uuid,
@@ -842,46 +851,16 @@ impl<R: RemoteShare> RiftShareView<R> {
         let cache = self.cache.as_ref()?;
         match cache.get_manifest(handle).await {
             Ok(Some(manifest)) => {
-                if manifest.root.as_bytes() != merkle_root {
-                    tracing::debug!("root hash changed, cache invalid");
-                    return None;
-                }
-                if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
-                    tracing::debug!(
-                        "manifest does not cover requested range, falling through to server"
-                    );
-                    return None;
-                }
-                match cache
-                    .reconstruct_range(&manifest.chunks, offset, length, file_size)
-                    .await
-                {
-                    Ok(data) => {
-                        tracing::debug!("read {} bytes from cache", data.len());
-                        Some(data)
-                    }
-                    Err(crate::cache::db::ReconstructError::MissingChunks(_)) => {
-                        tracing::debug!(
-                            "cache missing some chunks for requested range, falling through"
-                        );
-                        None
-                    }
-                    Err(crate::cache::db::ReconstructError::CorruptedChunks(ref bad_hashes)) => {
-                        tracing::warn!(
-                            "cache data corrupted: {} chunks failed hash verification: {:?}",
-                            bad_hashes.len(),
-                            bad_hashes
-                                .iter()
-                                .take(4)
-                                .map(|h| &h[..4])
-                                .collect::<Vec<_>>()
-                        );
-                        if let Err(e) = cache.remove_manifest(handle).await {
-                            tracing::warn!("failed to remove manifest: {}", e);
-                        }
-                        None
-                    }
-                }
+                Self::try_read_from_manifest(
+                    cache,
+                    handle,
+                    manifest,
+                    merkle_root,
+                    offset,
+                    length,
+                    file_size,
+                )
+                .await
             }
             Ok(None) => {
                 tracing::debug!("no cached manifest for handle");
@@ -892,6 +871,72 @@ impl<R: RemoteShare> RiftShareView<R> {
                 None
             }
         }
+    }
+
+    async fn try_read_from_manifest(
+        cache: &crate::cache::db::FileCache,
+        handle: &Uuid,
+        manifest: crate::cache::db::Manifest,
+        merkle_root: &[u8],
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) -> Option<Vec<u8>> {
+        if manifest.root.as_bytes() != merkle_root {
+            tracing::debug!("root hash changed, cache invalid");
+            return None;
+        }
+        Self::reconstruct_if_covered(cache, handle, &manifest, offset, length, file_size).await
+    }
+
+    async fn reconstruct_if_covered(
+        cache: &crate::cache::db::FileCache,
+        handle: &Uuid,
+        manifest: &crate::cache::db::Manifest,
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) -> Option<Vec<u8>> {
+        if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
+            tracing::debug!("manifest does not cover requested range, falling through to server");
+            return None;
+        }
+        match cache
+            .reconstruct_range(&manifest.chunks, offset, length, file_size)
+            .await
+        {
+            Ok(data) => {
+                tracing::debug!("read {} bytes from cache", data.len());
+                Some(data)
+            }
+            Err(crate::cache::db::ReconstructError::MissingChunks(_)) => {
+                tracing::debug!("cache missing some chunks for requested range, falling through");
+                None
+            }
+            Err(crate::cache::db::ReconstructError::CorruptedChunks(ref bad_hashes)) => {
+                Self::handle_corrupted_chunks(cache, handle, bad_hashes).await
+            }
+        }
+    }
+
+    async fn handle_corrupted_chunks(
+        cache: &crate::cache::db::FileCache,
+        handle: &Uuid,
+        bad_hashes: &[[u8; 32]],
+    ) -> Option<Vec<u8>> {
+        tracing::warn!(
+            "cache data corrupted: {} chunks failed hash verification: {:?}",
+            bad_hashes.len(),
+            bad_hashes
+                .iter()
+                .take(4)
+                .map(|h| &h[..4])
+                .collect::<Vec<_>>()
+        );
+        if let Err(e) = cache.remove_manifest(handle).await {
+            tracing::warn!("failed to remove manifest: {}", e);
+        }
+        None
     }
 
     async fn try_read_from_cache(

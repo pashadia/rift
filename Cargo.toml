@@ -23,6 +23,7 @@ repository = "https://github.com/yourusername/rift"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+dead_code = "deny"
 
 [workspace.lints.clippy]
 # pedantic = { level = "warn", priority = -1 }
@@ -37,7 +38,7 @@ match_wildcard_for_single_variants = "warn"
 # Complexity & readability
 too_many_lines = "warn"
 excessive_nesting = "warn"
-cognitive_complexity = "warn"
+cognitive_complexity = "deny"
 similar_names = "warn"
 fn_params_excessive_bools = "warn"
 unreadable_literal = "warn"
