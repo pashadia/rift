@@ -449,4 +449,51 @@ mod tests {
             "regular files must still be listed"
         );
     }
+
+    /// Symlinks in a SUBDIRECTORY whose canonical target is outside the share
+    /// root must be filtered out. This is the subdirectory case missing from
+    /// `readdir_response_filters_symlink_pointing_outside_share`.
+    #[tokio::test]
+    async fn readdir_response_filters_symlink_outside_share_in_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let share = tmp.path().to_path_buf();
+
+        // Create a subdirectory inside the share
+        let subdir = share.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        // Create a symlink inside the subdirectory pointing to an absolute path outside the share.
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), subdir.join("escape_link")).unwrap();
+
+        // Also create a regular file in the subdirectory.
+        std::fs::write(subdir.join("regular_in_subdir.txt"), b"data").unwrap();
+
+        let handle_db = HandleDatabase::new();
+        let dir_uuid = handle_db.get_or_create_handle(&subdir).await.unwrap();
+
+        let req = ReaddirRequest {
+            directory_handle: dir_uuid.as_bytes().to_vec(),
+            offset: 0,
+            limit: 0,
+        };
+        let payload = req.encode_to_vec();
+
+        let resp = readdir_response(&payload, &share, &handle_db).await;
+
+        let success = match resp.result {
+            Some(readdir_response::Result::Entries(s)) => s,
+            other => panic!("expected Entries, got: {:?}", other),
+        };
+
+        let names: Vec<&str> = success.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names.contains(&"escape_link"),
+            "symlink in subdirectory pointing outside the share must be filtered out"
+        );
+        assert!(
+            names.contains(&"regular_in_subdir.txt"),
+            "regular files in subdirectory must still be listed"
+        );
+    }
 }
