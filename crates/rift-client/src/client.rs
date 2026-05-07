@@ -769,6 +769,18 @@ impl<C: RiftConnection> RiftClient<C> {
                 .ok_or_else(|| anyhow::anyhow!("read_chunks_streaming: missing BLOCK_DATA"))?;
             let (_data_type, data_payload) = data_frame;
 
+            // Verify declared length matches actual data length before hashing.
+            // A mismatched length is a protocol violation — the hash can't be
+            // trusted to match either declared or actual length.
+            if data_payload.len() as u64 != length {
+                return Err(anyhow::anyhow!(
+                    "read_chunks_streaming: chunk {} declared length {} but received {} bytes",
+                    index,
+                    length,
+                    data_payload.len()
+                ));
+            }
+
             // Verify hash immediately before callback
             let computed_hash = rift_common::crypto::Blake3Hash::new(&data_payload);
             let expected_hash = rift_common::crypto::Blake3Hash::from_slice(&hash)
@@ -1964,5 +1976,65 @@ mod tests {
         assert_eq!(chunk_result.chunks.len(), 1);
         assert_eq!(&chunk_result.chunks[0].data[..], chunk_data);
         assert_eq!(chunk_result.merkle_root, expected_root);
+    }
+
+    #[tokio::test]
+    async fn read_chunks_streaming_rejects_mismatched_length() {
+        let (client_conn, server_conn) = InMemoryConnection::pair();
+        let root = dummy_root();
+        let client = RiftClient::from_connection(client_conn, root);
+
+        let chunk_data = b"only ten bytes"; // 14 bytes actual
+        let chunk_hash: [u8; 32] = rift_common::crypto::Blake3Hash::new(chunk_data)
+            .as_bytes()
+            .to_owned();
+        let merkle_root = chunk_hash.to_vec();
+
+        tokio::spawn(async move {
+            let mut stream = server_conn.accept_stream().await.unwrap();
+            let _ = stream.recv_frame().await.unwrap().unwrap();
+
+            let read_response = ReadResponse {
+                result: Some(read_response::Result::Ok(
+                    rift_protocol::messages::ReadSuccess { chunk_count: 1 },
+                )),
+            };
+            stream
+                .send_frame(msg::READ_RESPONSE, &read_response.encode_to_vec())
+                .await
+                .unwrap();
+
+            // Server LIES about length: declares 100 but sends 14 bytes
+            let block_header = BlockHeader {
+                chunk: Some(rift_protocol::messages::ChunkInfo {
+                    index: 0,
+                    length: 100, // <-- WRONG: actual data is 14 bytes
+                    hash: chunk_hash.to_vec(),
+                }),
+            };
+            stream
+                .send_frame(msg::BLOCK_HEADER, &block_header.encode_to_vec())
+                .await
+                .unwrap();
+            stream
+                .send_frame(msg::BLOCK_DATA, chunk_data)
+                .await
+                .unwrap();
+
+            let transfer_complete = TransferComplete {
+                merkle_root: merkle_root.clone(),
+            };
+            stream
+                .send_frame(msg::TRANSFER_COMPLETE, &transfer_complete.encode_to_vec())
+                .await
+                .unwrap();
+        });
+
+        let uuid = Uuid::from_bytes([0x42u8; 16]);
+        let result = client
+            .read_chunks_streaming(uuid, 0, 1, |_chunk| Ok(()))
+            .await;
+
+        assert!(result.is_err(), "mismatched chunk length must be rejected");
     }
 }

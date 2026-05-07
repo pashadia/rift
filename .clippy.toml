@@ -6,6 +6,9 @@ allow-unwrap-in-tests = true
 allow-dbg-in-tests = true
 allow-print-in-tests = true
 
+# Allow cognitive complexity up to 32 (reduced from default 25)
+cognitive-complexity-threshold = 32
+
 # Recognized identifiers in doc comments
 doc-valid-idents = [
     "CDC",

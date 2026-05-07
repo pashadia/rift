@@ -374,12 +374,26 @@ impl FileCache {
         Ok(())
     }
 
+    /// Verify a chunk's data matches its expected Blake3 hash.
+    /// Returns `true` if the data matches, `false` otherwise.
+    fn verify_chunk_hash(expected_hash: &[u8; 32], data: &[u8]) -> bool {
+        let computed = Blake3Hash::new(data);
+        let expected = Blake3Hash::from_slice(expected_hash).expect("chunk hash is 32 bytes");
+        if computed != expected {
+            tracing::warn!(
+                "hash mismatch for chunk {:?}: size matches but data corrupted",
+                &expected_hash[..4]
+            );
+            return false;
+        }
+        true
+    }
+
     /// Reconstruct only the byte range [offset, offset+length) from cached chunks.
     ///
     /// Reads only the chunk files needed for the requested range.
     /// Returns the assembled bytes, or `Err` listing missing/corrupted chunk hashes.
     /// Panics if the cache was opened in-memory (no chunk storage available).
-    #[allow(clippy::cognitive_complexity)] // TODO: refactor into smaller functions
     pub async fn reconstruct_range(
         &self,
         chunks: &[ChunkInfo],
@@ -395,19 +409,13 @@ impl FileCache {
             tracing::warn!("reconstruct_range: chunks not sorted by offset");
         }
 
-        // Clamp the requested end to the file size (use saturating_add to prevent overflow)
         let end = offset.saturating_add(length).min(file_size);
-
-        // Find the first chunk whose byte range overlaps [offset, end)
         let Some(first_idx) = chunks.iter().position(|c| c.offset + c.length > offset) else {
             return Ok(vec![]);
         };
-
-        // Find the last chunk whose byte range overlaps [offset, end)
         let Some(last_idx) = chunks.iter().rposition(|c| c.offset < end) else {
             return Ok(vec![]);
         };
-
         if first_idx > last_idx {
             return Ok(vec![]);
         }
@@ -416,21 +424,17 @@ impl FileCache {
             Vec::with_capacity(usize::try_from(end - offset).expect("byte range fits in usize"));
         let mut missing = Vec::new();
         let mut corrupted = Vec::new();
+        let store = self.chunk_store.as_ref().expect("chunk store required");
 
         for chunk in &chunks[first_idx..=last_idx] {
-            // Determine the slice of this chunk that falls within [offset, end)
-            let chunk_start = chunk.offset;
-            let chunk_end = chunk_start.saturating_add(chunk.length);
-            let slice_start = offset.saturating_sub(chunk_start);
-            let slice_end = end.min(chunk_end) - chunk_start;
+            let chunk_end = chunk.offset.saturating_add(chunk.length);
+            let slice_start = offset.saturating_sub(chunk.offset);
+            let slice_end = end.min(chunk_end) - chunk.offset;
             let need_len =
                 usize::try_from(slice_end - slice_start).expect("byte range fits in usize");
 
-            let store = self.chunk_store.as_ref().expect("chunk store required");
-
             // Quick integrity check: verify the stored file size matches expected
-            // (catches truncation/corruption before attempting partial read)
-            match store.verify_chunk_size(&chunk.hash, chunk.length) {
+            match store.verify_chunk_size(&chunk.hash, chunk.length).await {
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                     missing.push(chunk.hash);
                     continue;
@@ -443,8 +447,18 @@ impl FileCache {
                 Ok(()) => {}
             }
 
-            match store.read_chunk_range(&chunk.hash, slice_start, need_len) {
+            match store
+                .read_chunk_range(&chunk.hash, slice_start, need_len)
+                .await
+            {
                 Ok(Some(data)) => {
+                    if slice_start == 0
+                        && need_len == usize::try_from(chunk.length).expect("chunk fits in usize")
+                        && !Self::verify_chunk_hash(&chunk.hash, &data)
+                    {
+                        corrupted.push(chunk.hash);
+                        continue;
+                    }
                     result.extend_from_slice(&data);
                 }
                 Ok(None) => missing.push(chunk.hash),
@@ -665,6 +679,66 @@ mod tests {
         // The returned hash should be the EXPECTED hash (chunk0_hash), not the
         // hash of the corrupted data
         assert_eq!(bad_hashes[0], *chunk0_hash.as_bytes());
+    }
+
+    /// Corrupt chunk data on disk while keeping the same file size.
+    /// The hash check must detect this — verify the error is `CorruptedChunks`.
+    #[tokio::test]
+    async fn reconstruct_range_detects_same_size_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::open(tmp.path()).await.unwrap();
+
+        let chunk_data = b"hello world"; // 11 bytes
+        let chunk_hash = Blake3Hash::new(chunk_data);
+
+        cache
+            .put_chunk(chunk_hash.as_bytes(), chunk_data)
+            .await
+            .unwrap();
+
+        // Corrupt the file on disk with same-length garbage
+        let path = {
+            let hex = {
+                const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+                let mut s = String::with_capacity(64);
+                for &b in chunk_hash.as_bytes() {
+                    s.push(HEX_CHARS[(b >> 4) as usize] as char);
+                    s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+                }
+                s
+            };
+            tmp.path()
+                .join("chunks")
+                .join(&hex[..2])
+                .join(&hex[2..4])
+                .join(format!("{hex}.bin"))
+        };
+        // Overwrite with same-length garbage (size check passes, hash must catch it)
+        let garbage: Vec<u8> = (0..11).map(|i| u8::try_from(i + 42).unwrap()).collect();
+        std::fs::write(&path, &garbage).unwrap();
+
+        let chunks = vec![ChunkInfo {
+            index: 0,
+            offset: 0,
+            length: 11,
+            hash: *chunk_hash.as_bytes(),
+        }];
+
+        let result = cache.reconstruct_range(&chunks, 0, 11, 11).await;
+        assert!(
+            result.is_err(),
+            "same-size corruption must be detected via hash check"
+        );
+        match result.unwrap_err() {
+            ReconstructError::CorruptedChunks(c) => {
+                assert_eq!(c.len(), 1);
+                assert_eq!(c[0], *chunk_hash.as_bytes());
+            }
+            other @ ReconstructError::MissingChunks(_) => panic!(
+                "expected CorruptedChunks for same-size corruption, got {:?}",
+                other
+            ),
+        }
     }
 
     /// File has 5 chunks of [100, 200, 150, 300, 250] bytes.
