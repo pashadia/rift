@@ -57,10 +57,8 @@ struct ResolvedLeaf {
 }
 
 /// Result of recursively drilling into the Merkle tree.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct ResolvedMerkle {
-    root_hash: Blake3Hash,
     leaves: Vec<ResolvedLeaf>,
 }
 
@@ -209,10 +207,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         }
 
         leaves.sort_by_key(|l| l.chunk_index);
-        Ok(ResolvedMerkle {
-            root_hash: root_hash_from_drill,
-            leaves,
-        })
+        Ok(ResolvedMerkle { leaves })
     }
 }
 
@@ -263,11 +258,11 @@ fn calculate_chunk_range(chunk_starts: &[u64], offset: u64, end: u64) -> (u32, u
     (start_chunk, end_chunk)
 }
 
+#[cfg(test)]
 /// Verify each chunk's Blake3 hash and length, then verify the Merkle root.
 ///
 /// The `root_hash` parameter is the expected root hash (from the stat response).
 /// The `merkle_root` in `result` must match it.
-#[allow(dead_code)]
 fn verify_chunks_integrity(
     chunks: &[crate::client::ChunkData],
     root_hash: &Blake3Hash,
@@ -740,6 +735,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         })
     }
 
+    #[cfg(test)]
     /// Persist individual chunk data into the local file cache.
     ///
     /// Each chunk is stored keyed by its BLAKE3 hash. Cache write failures are logged
@@ -807,6 +803,7 @@ impl<R: RemoteShare> RiftShareView<R> {
     /// 2. A manifest mapping chunk indices → hashes + file offsets (via [`cache_manifest`]).
     ///
     /// The cache is entirely optional — failures are logged but never propagated.
+    #[cfg(test)]
     /// If `no_cache` is set or `self.cache` is `None`, the function returns immediately.
     ///
     /// # Parameters
@@ -816,7 +813,6 @@ impl<R: RemoteShare> RiftShareView<R> {
     /// * `chunks` — Fetched chunk data from the server.
     /// * `leaves` — Resolved Merkle leaf nodes.
     /// * `chunk_starts` — File offsets for each chunk.
-    #[allow(dead_code)]
     async fn cache_fetched_chunks(
         &self,
         handle: &Uuid,
@@ -1022,7 +1018,6 @@ mod tests {
         last_stat_batch_args: Mutex<Option<Vec<Uuid>>>,
     }
 
-    #[allow(dead_code)]
     impl MockRemote {
         fn new() -> Self {
             Self {
@@ -2192,12 +2187,10 @@ mod tests {
         };
 
         let resolved = ResolvedMerkle {
-            root_hash: Blake3Hash::from_array([0xAB; 32]),
             leaves: vec![leaf0, leaf1],
         };
 
         assert_eq!(resolved.leaves.len(), 2);
-        assert_eq!(resolved.root_hash, Blake3Hash::from_array([0xAB; 32]));
         assert_eq!(resolved.leaves[0].chunk_index, 0);
         assert_eq!(resolved.leaves[1].length, 200);
     }
