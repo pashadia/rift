@@ -436,11 +436,7 @@ impl FileCache {
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "chunk size mismatch for hash {:?}: {}",
-                        &chunk.hash[..4],
-                        e
-                    );
+                    tracing::warn!("chunk size mismatch for hash {:?}: {}", &chunk.hash[..4], e);
                     corrupted.push(chunk.hash);
                     continue;
                 }
@@ -1178,10 +1174,7 @@ mod tests {
         let data = Bytes::from_static(b"chunk data via bytes");
         let hash = *Blake3Hash::new(&data).as_bytes();
 
-        cache
-            .put_chunk_bytes(&hash, data.clone())
-            .await
-            .unwrap();
+        cache.put_chunk_bytes(&hash, data.clone()).await.unwrap();
         let result = cache.get_chunk(&hash).await.unwrap();
         assert_eq!(result, Some(data.to_vec()));
     }
@@ -1198,7 +1191,7 @@ mod tests {
         assert_eq!(result, Some(b"equiv test".to_vec()));
     }
 
-    /// Verify reconstruct_range uses partial reads and matches full-read results.
+    /// Verify `reconstruct_range` uses partial reads and matches full-read results.
     #[tokio::test]
     async fn reconstruct_range_partial_reads_match_full_reads() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1230,13 +1223,20 @@ mod tests {
 
         let full: Vec<u8> = all.iter().flat_map(|d| d.iter().copied()).collect();
 
-        for (off, len) in [(0, 50), (80, 40), (250, 50), (550, 100), (900, 50), (0, 1000)] {
+        for (off, len) in [
+            (0, 50),
+            (80, 40),
+            (250, 50),
+            (550, 100),
+            (900, 50),
+            (0, 1000),
+        ] {
             let result = cache
                 .reconstruct_range(&chunks, off, len, file_size)
                 .await
                 .unwrap();
-            let end = (off + len).min(file_size) as usize;
-            assert_eq!(result, &full[off as usize..end]);
+            let end = usize::try_from((off + len).min(file_size)).unwrap();
+            assert_eq!(result, &full[usize::try_from(off).unwrap()..end]);
         }
     }
 

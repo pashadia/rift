@@ -553,10 +553,7 @@ mod tests {
         let hash = make_hash(0xFC);
 
         // Write via bytes path
-        store1
-            .write_chunk_from_bytes(&hash, bytes)
-            .await
-            .unwrap();
+        store1.write_chunk_from_bytes(&hash, bytes).await.unwrap();
         let result1 = store1.read_chunk(&hash).await.unwrap();
 
         // Delete and re-write via slice path
@@ -616,7 +613,11 @@ mod tests {
         rt.block_on(store.write_chunk(&hash, data)).unwrap();
 
         let result = store.read_chunk_range(&hash, 3, 100);
-        assert!(result.is_err(), "read past end should error, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "read past end should error, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -630,7 +631,11 @@ mod tests {
         rt.block_on(store.write_chunk(&hash, data)).unwrap();
 
         let result = store.read_chunk_range(&hash, 100, 10);
-        assert!(result.is_err(), "offset past end should error, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "offset past end should error, got: {:?}",
+            result
+        );
     }
 
     #[test]
