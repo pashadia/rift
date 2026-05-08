@@ -44,6 +44,7 @@ libc = { workspace = true, optional = true }
 [features]
 default = ["fuse"]
 fuse = ["dep:fuse3", "dep:futures", "dep:libc"]
+testing = []
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -54,6 +55,7 @@ prost-types.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-test = "0.2"
+rift-client = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true
