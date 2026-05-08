@@ -69,7 +69,7 @@ pub struct RiftShareView<R: RemoteShare> {
     remote: Arc<R>,
     cache: Option<Arc<FileCache>>,
     handles: Arc<HandleCache>,
-    /// When true, skip all cache reads and writes — every chunk is fetched
+    /// When true, skip all cache reads and writes - every chunk is fetched
     /// fresh from the server. Useful for debugging data-integrity issues
     /// (e.g. sporadic corruption in large files with deep Merkle trees).
     no_cache: bool,
@@ -110,6 +110,23 @@ impl<R: RemoteShare> RiftShareView<R> {
         self
     }
 
+    /// Access the handle cache (for testing).
+    #[cfg(any(feature = "testing", test))]
+    #[must_use]
+    pub fn handles(&self) -> &Arc<HandleCache> {
+        &self.handles
+    }
+
+    /// Returns a reference to the file cache if caching is enabled.
+    /// Returns `None` if `no_cache` is set or no cache directory was provided.
+    fn cache(&self) -> Option<&FileCache> {
+        if self.no_cache {
+            None
+        } else {
+            self.cache.as_ref().map(|arc| arc.as_ref())
+        }
+    }
+
     /// Cache symlink target if this entry is a symlink with a non-empty target.
     async fn cache_symlink_target_if_present(&self, path: &Path, attrs: &FileAttrs) {
         if attrs.file_type == FileType::Symlink as i32 && !attrs.symlink_target.is_empty() {
@@ -142,7 +159,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             tracing::info!(
                 parent_hash = ?parent_hash,
                 child_count = child_hashes.len(),
-                "merkle verification failed — cache conflict"
+                "merkle verification failed - cache conflict"
             );
             tracing::error!("merkle verification failed at node");
             return Err(FsError::Io);
@@ -209,6 +226,135 @@ impl<R: RemoteShare> RiftShareView<R> {
         leaves.sort_by_key(|l| l.chunk_index);
         Ok(ResolvedMerkle { leaves })
     }
+
+    // ===================================================================
+    // Hybrid fetch: per-chunk resolve (cache → network)
+    // ===================================================================
+
+    /// Resolve a single chunk: cache hit → return immediately;
+    /// cache miss → fetch from network, cache it, return.
+    ///
+    /// Verifies both the Merkle root (against `root_hash`) and the per-chunk
+    /// hash (against `leaf.hash`) before returning data.
+    #[instrument(skip(self, leaf, root_hash), fields(chunk_index = leaf.chunk_index))]
+    async fn fetch_chunk(
+        &self,
+        handle: Uuid,
+        leaf: &ResolvedLeaf,
+        root_hash: &Blake3Hash,
+    ) -> Result<Vec<u8>, FsError> {
+        // Fast path: cache hit
+        if let Some(cache) = self.cache() {
+            match cache.get_chunk(leaf.hash.as_bytes()).await {
+                Ok(Some(data)) => {
+                    if Blake3Hash::new(&data) == leaf.hash && data.len() as u64 == leaf.length {
+                        return Ok(data);
+                    }
+                    tracing::warn!(
+                        chunk_index = leaf.chunk_index,
+                        "cached chunk data corrupted, re-fetching"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(chunk_index = leaf.chunk_index, error = %e, "cache read error");
+                }
+            }
+        }
+
+        // Slow path: fetch from network
+        let result = self
+            .remote
+            .read_chunks(handle, leaf.chunk_index, 1)
+            .await
+            .map_err(|_| FsError::Io)?;
+
+        // Verify merkle root
+        let computed_root = Blake3Hash::from_slice(&result.merkle_root).map_err(|_| FsError::Io)?;
+        if computed_root != *root_hash {
+            tracing::error!(chunk_index = leaf.chunk_index, "merkle root mismatch");
+            return Err(FsError::Io);
+        }
+
+        // Extract and verify the single chunk
+        let chunk = result.chunks.into_iter().next().ok_or(FsError::Io)?;
+
+        if Blake3Hash::new(&chunk.data) != leaf.hash {
+            tracing::error!(chunk_index = leaf.chunk_index, "chunk hash mismatch");
+            return Err(FsError::Io);
+        }
+        if chunk.data.len() as u64 != leaf.length {
+            tracing::error!(chunk_index = leaf.chunk_index, "chunk length mismatch");
+            return Err(FsError::Io);
+        }
+
+        // Cache the chunk data
+        if let Some(cache) = self.cache() {
+            if let Err(e) = cache.put_chunk(leaf.hash.as_bytes(), &chunk.data).await {
+                tracing::warn!(chunk_index = leaf.chunk_index, error = %e, "failed to cache chunk");
+            }
+        }
+
+        Ok(chunk.data.into())
+    }
+
+    /// Obtain the chunk leaf data and byte-offset table for a file.
+    ///
+    /// Tries the cached manifest first (avoids merkle drill if the root
+    /// hash still matches). Falls back to `resolve_merkle_tree` on miss or
+    /// mismatch. Returns `(leaves, chunk_starts, manifest_was_cached)`.
+    async fn resolve_chunk_info(
+        &self,
+        handle: Uuid,
+        root_hash: &Blake3Hash,
+        merkle_root: &[u8],
+        file_size: u64,
+    ) -> Result<(Vec<ResolvedLeaf>, Vec<u64>, bool), FsError> {
+        // Try cached manifest first (avoids network round-trips for the drill)
+        if let Some(cache) = self.cache() {
+            if let Ok(Some(manifest)) = cache.get_manifest(&handle).await {
+                if manifest.root.as_bytes() == merkle_root {
+                    let leaves: Vec<ResolvedLeaf> = manifest
+                        .chunks
+                        .iter()
+                        .map(|c| ResolvedLeaf {
+                            chunk_index: c.index,
+                            length: c.length,
+                            hash: Blake3Hash::from_array(c.hash),
+                        })
+                        .collect();
+                    if let Ok(starts) = build_chunk_starts(&leaves, file_size) {
+                        return Ok((leaves, starts, true));
+                    }
+                }
+            }
+        }
+
+        // Fall back: resolve merkle tree via network drill
+        let resolved = self.resolve_merkle_tree(handle, root_hash).await?;
+        let chunk_starts = build_chunk_starts(&resolved.leaves, file_size)?;
+        Ok((resolved.leaves, chunk_starts, false))
+    }
+
+    /// Slice the portion of a chunk's data that falls within `[offset, end)`.
+    ///
+    /// This is a pure byte-slicing operation - no I/O.
+    #[allow(clippy::cast_possible_truncation)]
+    fn slice_chunk(
+        data: &[u8],
+        chunk_start: u64,
+        chunk_len: u64,
+        offset: u64,
+        end: u64,
+    ) -> Vec<u8> {
+        let slice_start = offset.saturating_sub(chunk_start) as usize;
+        let slice_end = (end.min(chunk_start + chunk_len) - chunk_start) as usize;
+        if slice_start < slice_end && slice_end <= data.len() {
+            data[slice_start..slice_end].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Convert a FUSE absolute path to a share-relative path.
@@ -258,84 +404,6 @@ fn calculate_chunk_range(chunk_starts: &[u64], offset: u64, end: u64) -> (u32, u
     (start_chunk, end_chunk)
 }
 
-#[cfg(test)]
-/// Verify each chunk's Blake3 hash and length, then verify the Merkle root.
-///
-/// The `root_hash` parameter is the expected root hash (from the stat response).
-/// The `merkle_root` in `result` must match it.
-fn verify_chunks_integrity(
-    chunks: &[crate::client::ChunkData],
-    root_hash: &Blake3Hash,
-    merkle_root: &[u8],
-) -> Result<(), FsError> {
-    for chunk in chunks {
-        let computed = Blake3Hash::new(&chunk.data);
-        let expected = Blake3Hash::from_slice(&chunk.hash).map_err(|_| FsError::Io)?;
-        if computed != expected {
-            tracing::error!("chunk {} hash mismatch", chunk.index);
-            return Err(FsError::Io);
-        }
-        if chunk.data.len() as u64 != chunk.length {
-            tracing::error!("chunk {} length mismatch", chunk.index);
-            return Err(FsError::Io);
-        }
-    }
-    let computed_root = Blake3Hash::from_slice(merkle_root).map_err(|_| FsError::Io)?;
-    if computed_root != *root_hash {
-        tracing::error!("transfer root hash mismatch");
-        return Err(FsError::Io);
-    }
-    Ok(())
-}
-
-/// Sort chunks by index, verify contiguous indices, and copy only the
-/// requested byte range `[offset..end)` directly into the output buffer.
-fn assemble_byte_range(
-    chunks: Vec<crate::client::ChunkData>,
-    start_chunk: u32,
-    chunk_starts: &[u64],
-    offset: u64,
-    end: u64,
-) -> Result<Vec<u8>, FsError> {
-    let mut sorted: Vec<_> = chunks.into_iter().collect();
-    sorted.sort_by_key(|c| c.index);
-    for (i, chunk) in sorted.iter().enumerate() {
-        if chunk.index != start_chunk + u32::try_from(i).expect("chunk index fits in u32") {
-            tracing::error!(
-                "chunk index mismatch: expected {}, got {}",
-                start_chunk + u32::try_from(i).expect("chunk index fits in u32"),
-                chunk.index
-            );
-            return Err(FsError::Io);
-        }
-    }
-
-    let needed = usize::try_from(end - offset).expect("byte range fits in usize");
-    let mut result = Vec::with_capacity(needed);
-
-    for chunk in &sorted {
-        let chunk_start_byte =
-            chunk_starts[usize::try_from(chunk.index).expect("chunk index fits in usize")];
-        let chunk_end_byte = chunk_start_byte + chunk.data.len() as u64;
-
-        // Skip chunks that don't overlap with the requested range
-        if chunk_end_byte <= offset || chunk_start_byte >= end {
-            continue;
-        }
-
-        let slice_start = usize::try_from(offset.saturating_sub(chunk_start_byte))
-            .expect("byte offset fits in usize");
-        let slice_end = usize::try_from(end.min(chunk_end_byte) - chunk_start_byte)
-            .expect("byte offset fits in usize");
-
-        if slice_start < slice_end && slice_end <= chunk.data.len() {
-            result.extend_from_slice(&chunk.data[slice_start..slice_end]);
-        }
-    }
-
-    Ok(result)
-}
-
 fn build_dir_entry(
     entry: &rift_protocol::messages::ReaddirEntry,
     attrs: FileAttrs,
@@ -377,7 +445,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         // Cache symlink target if this entry is a symlink with a non-empty target.
         // This is required because FUSE calls lstat() then readlink(), and
-        // readlink() only looks in the cache — it does not make a network call.
+        // readlink() only looks in the cache - it does not make a network call.
         self.cache_symlink_target_if_present(&path_to_relative(path), &attrs)
             .await;
 
@@ -401,7 +469,6 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         };
         self.handles.insert(child_path.clone(), child_uuid).await;
 
-        // Cache symlink target if this entry is a symlink with a non-empty target
         // Cache symlink target if this entry is a symlink with a non-empty target
         self.cache_symlink_target_if_present(&child_path, &attrs)
             .await;
@@ -431,7 +498,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             })
             .collect();
 
-        // Collect all handles for stat_batch — always call stat_batch for every
+        // Collect all handles for stat_batch - always call stat_batch for every
         // entry to get accurate metadata (uid, gid, mode, mtime) including for symlinks.
         let handles: Vec<Uuid> = pairs.iter().map(|(_, uuid)| *uuid).collect();
 
@@ -489,7 +556,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
 
         let (file_size, merkle_root) = match self.stat_file(handle).await {
             Ok(result) => result,
-            Err(_) if !self.no_cache && self.cache.is_some() => {
+            Err(_) if self.cache().is_some() => {
+                // Offline fallback - try cache without network
                 if let Some(data) = self.try_read_from_cache(&handle, offset, length).await {
                     return Ok(data);
                 }
@@ -502,89 +570,45 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        if let Some(data) = self
-            .try_cached_read(&handle, offset, length, &merkle_root, file_size)
-            .await
-        {
-            return Ok(data);
-        }
-
         let end = offset.saturating_add(length).min(file_size);
         let root_hash = Blake3Hash::from_slice(&merkle_root).map_err(|_| FsError::Io)?;
 
-        let resolved = self.resolve_merkle_tree(handle, &root_hash).await?;
-        if resolved.leaves.is_empty() && file_size > 0 {
-            return Err(FsError::Io);
-        }
+        // Resolve chunk info (try cached manifest first, fall back to merkle drill)
+        let (leaves, chunk_starts, manifest_was_cached) = self
+            .resolve_chunk_info(handle, &root_hash, &merkle_root, file_size)
+            .await?;
 
-        let chunk_starts = build_chunk_starts(&resolved.leaves, file_size)?;
         let (start_chunk, end_chunk) = calculate_chunk_range(&chunk_starts, offset, end);
         let chunk_count = end_chunk - start_chunk;
         if chunk_count == 0 {
             return Ok(vec![]);
         }
 
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(
-            chunk_count as usize,
-        )));
-        let collected_for_cb = std::sync::Arc::clone(&collected);
-        let cache_for_cb = self.cache.clone();
-        let no_cache = self.no_cache;
+        // Per-chunk fetch: each chunk is resolved individually.
+        // Cached chunks return immediately; missing chunks are fetched from the network.
+        let needed = usize::try_from(end - offset).unwrap_or(0);
+        let mut result = Vec::with_capacity(needed.max(1));
 
-        let returned_merkle = self
-            .remote
-            .read_chunks_streaming(
-                handle,
-                start_chunk,
-                chunk_count,
-                Box::new(move |chunk| {
-                    // Cache individual chunk data as it arrives
-                    if !no_cache {
-                        if let Some(ref cache) = cache_for_cb {
-                            let cache = std::sync::Arc::clone(cache);
-                            let hash = chunk.hash;
-                            let data = chunk.data.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = cache.put_chunk(&hash, &data).await {
-                                    tracing::warn!("failed to cache chunk: {}", e);
-                                }
-                            });
-                        }
-                    }
-                    collected_for_cb.lock().expect("lock poisoned").push(chunk);
-                    Ok(())
-                }),
-            )
-            .await
-            .map_err(|e| e.downcast::<FsError>().unwrap_or(FsError::Io))?;
-
-        let chunks: Vec<crate::client::ChunkData> = std::sync::Arc::try_unwrap(collected)
-            .expect("Arc should have exactly one reference")
-            .into_inner()
-            .expect("mutex lock poisoned");
-
-        // Verify the returned Merkle root matches the stat root hash
-        let computed_root = Blake3Hash::from_slice(&returned_merkle).map_err(|_| FsError::Io)?;
-        if computed_root != root_hash {
-            tracing::error!("transfer root hash mismatch");
-            return Err(FsError::Io);
+        for idx in start_chunk..end_chunk {
+            let leaf = &leaves[idx as usize];
+            let data = self.fetch_chunk(handle, leaf, &root_hash).await?;
+            result.extend(Self::slice_chunk(
+                &data,
+                chunk_starts[idx as usize],
+                leaf.length,
+                offset,
+                end,
+            ));
         }
 
-        // Cache the manifest (chunk data already cached incrementally above)
-        if !self.no_cache {
-            if let Some(ref cache) = self.cache {
-                RiftShareView::<R>::cache_manifest(
-                    cache.as_ref(),
-                    &handle,
-                    &merkle_root,
-                    &resolved.leaves,
-                    &chunk_starts,
-                )
-                .await;
+        // Cache the manifest for future reads (if we didn't already have it)
+        if !manifest_was_cached {
+            if let Some(cache) = self.cache() {
+                Self::cache_manifest(cache, &handle, &merkle_root, &leaves, &chunk_starts).await;
             }
         }
 
-        assemble_byte_range(chunks, start_chunk, &chunk_starts, offset, end)
+        Ok(result)
     }
 
     #[instrument(skip(self), fields(path = %path.display()))]
@@ -639,7 +663,7 @@ fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_si
         return true;
     }
 
-    // 2. No chunks at all — can't cover anything
+    // 2. No chunks at all - can't cover anything
     if chunks.is_empty() {
         return false;
     }
@@ -705,15 +729,15 @@ impl<R: RemoteShare> RiftShareView<R> {
     ///
     /// # Parameters
     ///
-    /// * `merkle_root` — Raw bytes of the file's Merkle root hash. Used as the manifest
+    /// * `merkle_root` - Raw bytes of the file's Merkle root hash. Used as the manifest
     ///   identity; the caller should verify this matches the cached root before use.
-    /// * `leaves` — Resolved leaf nodes from the Merkle tree traversal.
-    /// * `chunk_starts` — File offsets where each chunk begins (parallel to `leaves`).
+    /// * `leaves` - Resolved leaf nodes from the Merkle tree traversal.
+    /// * `chunk_starts` - File offsets where each chunk begins (parallel to `leaves`).
     ///
     /// # Returns
     ///
-    /// * `Some(Manifest)` — Successfully built from the inputs.
-    /// * `None` — `merkle_root` is not a valid 32-byte BLAKE3 hash.
+    /// * `Some(Manifest)` - Successfully built from the inputs.
+    /// * `None` - `merkle_root` is not a valid 32-byte BLAKE3 hash.
     fn build_manifest(
         merkle_root: &[u8],
         leaves: &[ResolvedLeaf],
@@ -735,31 +759,6 @@ impl<R: RemoteShare> RiftShareView<R> {
         })
     }
 
-    #[cfg(test)]
-    /// Persist individual chunk data into the local file cache.
-    ///
-    /// Each chunk is stored keyed by its BLAKE3 hash. Cache write failures are logged
-    /// as warnings but do not abort — the operation continues with remaining chunks
-    /// so that partial results are available for future cache hits.
-    ///
-    /// # Parameters
-    ///
-    /// * `cache` — The file cache instance.
-    /// * `chunks` — List of `(hash, data)` pairs fetched from the server.
-    ///
-    /// # Error handling
-    ///
-    /// Individual `put_chunk` failures are logged at `WARN` level. The function always
-    /// completes — it never returns an error because a cache miss is handled gracefully
-    /// by falling through to a server fetch.
-    async fn cache_chunks_data(cache: &FileCache, chunks: &[crate::client::ChunkData]) {
-        for chunk in chunks {
-            if let Err(e) = cache.put_chunk(&chunk.hash, &chunk.data).await {
-                tracing::warn!("failed to cache chunk: {}", e);
-            }
-        }
-    }
-
     /// Build and persist a [`Manifest`] for the given handle into the local cache.
     ///
     /// The manifest records which chunks belong to a file and where they start in the
@@ -768,11 +767,11 @@ impl<R: RemoteShare> RiftShareView<R> {
     ///
     /// # Parameters
     ///
-    /// * `cache` — The file cache instance.
-    /// * `handle` — Server-side file handle (used as the cache key).
-    /// * `merkle_root` — File's Merkle root hash bytes.
-    /// * `leaves` — Resolved Merkle leaf nodes.
-    /// * `chunk_starts` — File offsets for each leaf.
+    /// * `cache` - The file cache instance.
+    /// * `handle` - Server-side file handle (used as the cache key).
+    /// * `merkle_root` - File's Merkle root hash bytes.
+    /// * `leaves` - Resolved Merkle leaf nodes.
+    /// * `chunk_starts` - File offsets for each leaf.
     ///
     /// # Error handling
     ///
@@ -792,147 +791,6 @@ impl<R: RemoteShare> RiftShareView<R> {
         if let Err(e) = cache.put_manifest(handle, &manifest).await {
             tracing::warn!("failed to cache manifest: {}", e);
         }
-    }
-
-    /// Cache fetched chunk data and a manifest for later read acceleration.
-    ///
-    /// This is the top-level cache-write entry point, called after a successful
-    /// `read_chunks` RPC. It stores:
-    ///
-    /// 1. Each chunk's raw bytes, keyed by hash (via [`cache_chunks_data`]).
-    /// 2. A manifest mapping chunk indices → hashes + file offsets (via [`cache_manifest`]).
-    ///
-    /// The cache is entirely optional — failures are logged but never propagated.
-    #[cfg(test)]
-    /// If `no_cache` is set or `self.cache` is `None`, the function returns immediately.
-    ///
-    /// # Parameters
-    ///
-    /// * `handle` — Server-side file handle used as the manifest cache key.
-    /// * `merkle_root` — File's Merkle root hash bytes (validates manifest identity).
-    /// * `chunks` — Fetched chunk data from the server.
-    /// * `leaves` — Resolved Merkle leaf nodes.
-    /// * `chunk_starts` — File offsets for each chunk.
-    async fn cache_fetched_chunks(
-        &self,
-        handle: &Uuid,
-        merkle_root: &[u8],
-        chunks: &[crate::client::ChunkData],
-        leaves: &[ResolvedLeaf],
-        chunk_starts: &[u64],
-    ) {
-        if self.no_cache {
-            tracing::debug!("no-cache mode: skipping cache write");
-            return;
-        }
-        let Some(ref cache) = self.cache else {
-            return;
-        };
-        Self::cache_chunks_data(cache.as_ref(), chunks).await;
-        Self::cache_manifest(cache.as_ref(), handle, merkle_root, leaves, chunk_starts).await;
-    }
-
-    async fn try_cached_read(
-        &self,
-        handle: &Uuid,
-        offset: u64,
-        length: u64,
-        merkle_root: &[u8],
-        file_size: u64,
-    ) -> Option<Vec<u8>> {
-        if self.no_cache {
-            tracing::debug!("no-cache mode: bypassing manifest cache");
-            return None;
-        }
-        let cache = self.cache.as_ref()?;
-        match cache.get_manifest(handle).await {
-            Ok(Some(manifest)) => {
-                Self::try_read_from_manifest(
-                    cache,
-                    handle,
-                    manifest,
-                    merkle_root,
-                    offset,
-                    length,
-                    file_size,
-                )
-                .await
-            }
-            Ok(None) => {
-                tracing::debug!("no cached manifest for handle");
-                None
-            }
-            Err(e) => {
-                tracing::warn!("cache error: {}", e);
-                None
-            }
-        }
-    }
-
-    async fn try_read_from_manifest(
-        cache: &crate::cache::db::FileCache,
-        handle: &Uuid,
-        manifest: crate::cache::db::Manifest,
-        merkle_root: &[u8],
-        offset: u64,
-        length: u64,
-        file_size: u64,
-    ) -> Option<Vec<u8>> {
-        if manifest.root.as_bytes() != merkle_root {
-            tracing::debug!("root hash changed, cache invalid");
-            return None;
-        }
-        Self::reconstruct_if_covered(cache, handle, &manifest, offset, length, file_size).await
-    }
-
-    async fn reconstruct_if_covered(
-        cache: &crate::cache::db::FileCache,
-        handle: &Uuid,
-        manifest: &crate::cache::db::Manifest,
-        offset: u64,
-        length: u64,
-        file_size: u64,
-    ) -> Option<Vec<u8>> {
-        if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
-            tracing::debug!("manifest does not cover requested range, falling through to server");
-            return None;
-        }
-        match cache
-            .reconstruct_range(&manifest.chunks, offset, length, file_size)
-            .await
-        {
-            Ok(data) => {
-                tracing::debug!("read {} bytes from cache", data.len());
-                Some(data)
-            }
-            Err(crate::cache::db::ReconstructError::MissingChunks(_)) => {
-                tracing::debug!("cache missing some chunks for requested range, falling through");
-                None
-            }
-            Err(crate::cache::db::ReconstructError::CorruptedChunks(ref bad_hashes)) => {
-                Self::handle_corrupted_chunks(cache, handle, bad_hashes).await
-            }
-        }
-    }
-
-    async fn handle_corrupted_chunks(
-        cache: &crate::cache::db::FileCache,
-        handle: &Uuid,
-        bad_hashes: &[[u8; 32]],
-    ) -> Option<Vec<u8>> {
-        tracing::warn!(
-            "cache data corrupted: {} chunks failed hash verification: {:?}",
-            bad_hashes.len(),
-            bad_hashes
-                .iter()
-                .take(4)
-                .map(|h| &h[..4])
-                .collect::<Vec<_>>()
-        );
-        if let Err(e) = cache.remove_manifest(handle).await {
-            tracing::warn!("failed to remove manifest: {}", e);
-        }
-        None
     }
 
     async fn try_read_from_cache(
@@ -993,170 +851,11 @@ mod tests {
     #![allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     use super::*;
     use crate::client::{ChunkData, ChunkReadResult, MerkleChildInfo, MerkleDrillResult};
-    use async_trait::async_trait;
+    use crate::mock_remote::MockRemote;
     use bytes::Bytes;
     use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
     use rift_protocol::messages::{FileType, ReaddirEntry};
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    #[allow(clippy::type_complexity)]
-    struct MockRemote {
-        lookup_result: Mutex<Option<anyhow::Result<(Uuid, FileAttrs)>>>,
-        readdir_result: Mutex<Option<anyhow::Result<Vec<ReaddirEntry>>>>,
-        stat_batch_result: Mutex<Option<anyhow::Result<Vec<Result<FileAttrs, FsError>>>>>,
-        read_chunks_result: Mutex<Option<anyhow::Result<ChunkReadResult>>>,
-        /// Map from hash (as Vec<u8>) to drill result. Empty Vec key = root drill.
-        merkle_drill_results: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
-        read_chunks_called: Mutex<u32>,
-        /// (`start_chunk`, `chunk_count`) from the most recent `read_chunks` call
-        last_read_chunks_args: Mutex<Option<(u32, u32)>>,
-        /// Number of times `stat_batch` was called
-        stat_batch_called: Mutex<u32>,
-        /// Handles passed to the most recent `stat_batch` call
-        last_stat_batch_args: Mutex<Option<Vec<Uuid>>>,
-    }
-
-    impl MockRemote {
-        fn new() -> Self {
-            Self {
-                lookup_result: Mutex::new(None),
-                readdir_result: Mutex::new(None),
-                stat_batch_result: Mutex::new(None),
-                read_chunks_result: Mutex::new(None),
-                merkle_drill_results: Mutex::new(HashMap::new()),
-                read_chunks_called: Mutex::new(0),
-                last_read_chunks_args: Mutex::new(None),
-                stat_batch_called: Mutex::new(0),
-                last_stat_batch_args: Mutex::new(None),
-            }
-        }
-
-        async fn set_lookup(&self, result: anyhow::Result<(Uuid, FileAttrs)>) {
-            *self.lookup_result.lock().await = Some(result);
-        }
-
-        async fn set_readdir(&self, result: anyhow::Result<Vec<ReaddirEntry>>) {
-            *self.readdir_result.lock().await = Some(result);
-        }
-
-        async fn set_stat_batch(&self, result: anyhow::Result<Vec<Result<FileAttrs, FsError>>>) {
-            *self.stat_batch_result.lock().await = Some(result);
-        }
-
-        async fn set_read_chunks(&self, result: anyhow::Result<ChunkReadResult>) {
-            *self.read_chunks_result.lock().await = Some(result);
-        }
-
-        async fn set_merkle_drill(&self, result: anyhow::Result<MerkleDrillResult>) {
-            // Backwards-compatible: stores as the root (empty hash) drill result
-            let drill = result.expect("set_merkle_drill requires Ok result; use set_merkle_drill_for_hash for error cases");
-            self.merkle_drill_results.lock().await.insert(vec![], drill);
-        }
-
-        /// Store a `merkle_drill` result keyed by hash. Empty Vec = root drill.
-        async fn set_merkle_drill_for_hash(&self, hash: Vec<u8>, result: MerkleDrillResult) {
-            self.merkle_drill_results.lock().await.insert(hash, result);
-        }
-
-        async fn get_read_chunks_call_count(&self) -> u32 {
-            *self.read_chunks_called.lock().await
-        }
-
-        async fn get_last_read_chunks_args(&self) -> Option<(u32, u32)> {
-            *self.last_read_chunks_args.lock().await
-        }
-
-        async fn get_stat_batch_call_count(&self) -> u32 {
-            *self.stat_batch_called.lock().await
-        }
-
-        async fn get_last_stat_batch_args(&self) -> Option<Vec<Uuid>> {
-            self.last_stat_batch_args.lock().await.clone()
-        }
-    }
-
-    #[async_trait]
-    impl RemoteShare for MockRemote {
-        async fn lookup(
-            &self,
-            _parent_handle: Uuid,
-            _name: &str,
-        ) -> anyhow::Result<(Uuid, FileAttrs)> {
-            self.lookup_result
-                .lock()
-                .await
-                .take()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("no lookup result set")))
-        }
-
-        async fn readdir(&self, _handle: Uuid) -> anyhow::Result<Vec<ReaddirEntry>> {
-            self.readdir_result
-                .lock()
-                .await
-                .take()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("no readdir result set")))
-        }
-
-        async fn stat_batch(
-            &self,
-            handles: Vec<Uuid>,
-        ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
-            *self.stat_batch_called.lock().await += 1;
-            *self.last_stat_batch_args.lock().await = Some(handles.clone());
-            self.stat_batch_result
-                .lock()
-                .await
-                .take()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("no stat_batch result set")))
-        }
-
-        async fn read_chunks(
-            &self,
-            _handle: Uuid,
-            _start_chunk: u32,
-            _chunk_count: u32,
-        ) -> anyhow::Result<ChunkReadResult> {
-            *self.read_chunks_called.lock().await += 1;
-            *self.last_read_chunks_args.lock().await = Some((_start_chunk, _chunk_count));
-            self.read_chunks_result
-                .lock()
-                .await
-                .take()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("no read_chunks result set")))
-        }
-
-        async fn read_chunks_streaming(
-            &self,
-            handle: Uuid,
-            start_chunk: u32,
-            chunk_count: u32,
-            mut on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
-        ) -> anyhow::Result<Vec<u8>> {
-            let result = self.read_chunks(handle, start_chunk, chunk_count).await?;
-            for chunk in &result.chunks {
-                on_chunk(ChunkData {
-                    index: chunk.index,
-                    length: chunk.length,
-                    hash: chunk.hash,
-                    data: chunk.data.clone(),
-                })?;
-            }
-            Ok(result.merkle_root)
-        }
-
-        async fn merkle_drill(
-            &self,
-            _handle: Uuid,
-            hash: &[u8],
-        ) -> anyhow::Result<MerkleDrillResult> {
-            let mut map = self.merkle_drill_results.lock().await;
-            map.remove(hash)
-                .or_else(|| map.remove(&vec![]))
-                .ok_or_else(|| anyhow::anyhow!("no merkle_drill result for hash {:?}", hash))
-        }
-    }
 
     fn make_file_attrs(size: u64, root_hash: [u8; 32]) -> FileAttrs {
         FileAttrs {
@@ -1408,15 +1107,15 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), content);
 
-        let call_count = remote.get_read_chunks_call_count().await;
         assert_eq!(
-            call_count, 1,
-            "read_chunks should be called exactly once for non-cached read"
+            remote.fetched_chunk_indices().await,
+            vec![0u32],
+            "non-cached read should fetch chunk 0 from server"
         );
     }
 
     /// Three chunks with variable sizes [100, 200, 150].
-    /// Read offset=120, length=50 must request `start_chunk=1` from the server — not chunk 0.
+    /// Read offset=120, length=50 must request `start_chunk=1` from the server - not chunk 0.
     #[tokio::test]
     async fn read_requests_correct_start_chunk_index_from_server() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -1483,17 +1182,16 @@ mod tests {
             .await
             .expect("read should succeed");
 
-        // The server must have been asked for chunk 1 (start_chunk=1), count=1.
-        let args = remote
-            .get_last_read_chunks_args()
-            .await
-            .expect("read_chunks should have been called");
-        assert_eq!(args, (1, 1),
-            "start_chunk should be 1 and chunk_count should be 1 for offset=120 in a [100,200,150]-sized file");
+        // The server should have fetched chunk 1 (the chunk containing byte 120).
+        assert_eq!(
+            remote.fetched_chunk_indices().await,
+            vec![1u32],
+            "offset 120 in a [100, 200, 150]-sized file should fetch chunk 1"
+        );
     }
 
     /// offset >= `file_size` must return an empty vec, not an error (POSIX: read at/past EOF).
-    /// No network calls should be made — the result is trivially known from stat.
+    /// No network calls should be made - the result is trivially known from stat.
     #[tokio::test]
     async fn read_offset_beyond_eof_returns_empty() {
         let root_hash = [0xABu8; 32];
@@ -1509,7 +1207,7 @@ mod tests {
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
             .await;
-        // No merkle_drill or read_chunks setup — they must NOT be called.
+        // No merkle_drill or read_chunks setup - they must NOT be called.
 
         let result = view
             .read(Path::new("file"), 400, 100, None)
@@ -1520,9 +1218,8 @@ mod tests {
             result.is_empty(),
             "reading past EOF must return empty bytes"
         );
-        assert_eq!(
-            remote.get_read_chunks_call_count().await,
-            0,
+        assert!(
+            remote.fetched_chunk_indices().await.is_empty(),
             "no chunk fetch should occur when offset is beyond EOF"
         );
     }
@@ -1592,10 +1289,9 @@ mod tests {
             "must return only remaining bytes up to EOF"
         );
 
-        let args = remote.get_last_read_chunks_args().await.unwrap();
         assert_eq!(
-            args,
-            (1, 1),
+            remote.fetched_chunk_indices().await,
+            vec![1u32],
             "only chunk 1 needed for offset=250 in a [100,200] file"
         );
     }
@@ -1652,7 +1348,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .add_per_chunk_results(ChunkReadResult {
                 chunks: vec![
                     ChunkData {
                         index: 0,
@@ -1668,7 +1364,7 @@ mod tests {
                     },
                 ],
                 merkle_root: root_hash.to_vec(),
-            }))
+            })
             .await;
 
         view.read(Path::new("file"), 0, file_size, None)
@@ -1697,7 +1393,7 @@ mod tests {
     }
 
     /// After a read, the manifest stored in cache must hold the correct byte offset
-    /// for each chunk — not `chunk_index` × 128 KB.
+    /// for each chunk - not `chunk_index` × 128 KB.
     ///
     /// For sizes=[100, 200, 150] the stored offsets must be [0, 100, 300].
     #[tokio::test]
@@ -1752,10 +1448,10 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .add_per_chunk_results(ChunkReadResult {
                 chunks: all_chunks,
                 merkle_root: root_hash.to_vec(),
-            }))
+            })
             .await;
 
         view.read(Path::new("file"), 0, file_size, None)
@@ -1786,7 +1482,7 @@ mod tests {
 
     /// A partial read (offset=120, length=50 within a 3-chunk file) only fetches
     /// chunk 1 from the server, but the manifest must still contain ALL 3 leaves
-    /// from the resolved Merkle tree — not just the single fetched chunk.
+    /// from the resolved Merkle tree - not just the single fetched chunk.
     /// This prevents cache corruption where a partial manifest replaces a complete one.
     #[tokio::test]
     async fn read_partial_range_stores_complete_manifest() {
@@ -1838,7 +1534,7 @@ mod tests {
             }))
             .await;
 
-        // BUT read_chunks returns ONLY chunk 1 — simulating a partial read at offset 120.
+        // BUT read_chunks returns ONLY chunk 1 - simulating a partial read at offset 120.
         remote
             .set_read_chunks(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
@@ -1855,7 +1551,7 @@ mod tests {
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
             .await;
 
-        // Read 50 bytes at offset 120 — entirely within chunk 1.
+        // Read 50 bytes at offset 120 - entirely within chunk 1.
         view.read(Path::new("file"), 120, 50, None)
             .await
             .expect("read should succeed");
@@ -1950,10 +1646,9 @@ mod tests {
             vec![0xBBu8; 10],
             "offset==chunk boundary: should return first 10 bytes of chunk 1"
         );
-        let args = remote.get_last_read_chunks_args().await.unwrap();
         assert_eq!(
-            args,
-            (1, 1),
+            remote.fetched_chunk_indices().await,
+            vec![1u32],
             "offset==100 is the start of chunk 1; only that chunk should be fetched"
         );
     }
@@ -2001,10 +1696,10 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .add_per_chunk_results(ChunkReadResult {
                 chunks: all_chunks,
                 merkle_root: root_hash.to_vec(),
-            }))
+            })
             .await;
 
         let result = view
@@ -2020,11 +1715,10 @@ mod tests {
             "cross-chunk read should concatenate tail of chunk0 and head of chunk1"
         );
 
-        let args = remote.get_last_read_chunks_args().await.unwrap();
         assert_eq!(
-            args,
-            (0, 2),
-            "start_chunk=0 and chunk_count=2 expected for a cross-boundary read"
+            remote.fetched_chunk_indices().await,
+            vec![0u32, 1],
+            "cross-chunk read should fetch both chunks 0 and 1"
         );
     }
 
@@ -2319,7 +2013,7 @@ mod tests {
         }
     }
 
-    /// 67 leaves (with subtrees at root) — exercises recursive drilling.
+    /// 67 leaves (with subtrees at root) - exercises recursive drilling.
     /// With fanout=64, 67 leaves means the root has 2 children:
     ///   - subtree for leaves 0..63
     ///   - subtree for leaf 64..66
@@ -2702,10 +2396,10 @@ mod tests {
             .await;
 
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .add_per_chunk_results(ChunkReadResult {
                 chunks,
                 merkle_root: root_hash_val.as_bytes().to_vec(),
-            }))
+            })
             .await;
 
         let file_uuid = Uuid::now_v7();
@@ -2972,9 +2666,9 @@ mod tests {
 
         // Verify that read_chunks was called (server was contacted)
         assert_eq!(
-            remote.get_read_chunks_call_count().await,
-            1,
-            "first read should contact server"
+            remote.fetched_chunk_indices().await,
+            vec![0u32],
+            "first read should fetch chunk 0 from server"
         );
 
         // Verify that the cache does NOT contain the manifest
@@ -3081,11 +2775,11 @@ mod tests {
             .await;
         assert_eq!(result.unwrap(), content);
 
-        // Both reads should have called read_chunks (server was contacted)
-        let call_count = remote.get_read_chunks_call_count().await;
+        // Both reads should have fetched chunk 0 from the server
         assert_eq!(
-            call_count, 2,
-            "no_cache mode: both reads should contact the server, got {call_count} calls"
+            remote.fetched_chunk_indices().await,
+            vec![0u32, 0],
+            "no_cache mode: both reads should fetch chunk 0 from server"
         );
     }
 
@@ -3113,7 +2807,7 @@ mod tests {
         assert!(!manifest_covers_range(&chunks, 0, 100, 450));
     }
 
-    /// Gap in the middle: chunks [0, 2] — missing index 1.
+    /// Gap in the middle: chunks [0, 2] - missing index 1.
     #[test]
     fn coverage_gap_in_middle_returns_false() {
         let chunks = vec![
@@ -3133,7 +2827,7 @@ mod tests {
         assert!(!manifest_covers_range(&chunks, 0, 100, 450));
     }
 
-    /// Complete contiguous chunks [0, 1, 2] — all checks pass.
+    /// Complete contiguous chunks [0, 1, 2] - all checks pass.
     #[test]
     fn coverage_complete_returns_true() {
         let chunks = vec![
@@ -3187,7 +2881,7 @@ mod tests {
     }
 
     /// Integration test: A partial manifest in cache (missing chunk 0) must
-    /// cause a cache miss — the read falls through to the server and does NOT
+    /// cause a cache miss - the read falls through to the server and does NOT
     /// return stale/wrong data.
     #[tokio::test]
     async fn partial_manifest_causes_cache_miss() {
@@ -3266,7 +2960,7 @@ mod tests {
             }))
             .await;
 
-        // Read at offset 0 — partial manifest should cause cache miss,
+        // Read at offset 0 - partial manifest should cause cache miss,
         // falling through to server fetch
         let result = view
             .read(Path::new("file"), 0, 100, None)
@@ -3280,11 +2974,11 @@ mod tests {
             "must return correct data from server, not stale cache data"
         );
 
-        // Server must have been contacted (cache missed)
-        let call_count = remote.get_read_chunks_call_count().await;
+        // Server must have been contacted (partial manifest cache miss)
         assert_eq!(
-            call_count, 1,
-            "server must be contacted since partial manifest should cause cache miss"
+            remote.fetched_chunk_indices().await,
+            vec![0u32],
+            "partial manifest should cause cache miss, fetching chunk 0 from server"
         );
     }
 
@@ -3381,7 +3075,7 @@ mod tests {
             .await;
         // Return chunks in REVERSE order: index 1 first, then index 0
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .add_per_chunk_results(ChunkReadResult {
                 chunks: vec![
                     ChunkData {
                         index: 1,
@@ -3397,7 +3091,7 @@ mod tests {
                     },
                 ],
                 merkle_root: root_hash.to_vec(),
-            }))
+            })
             .await;
 
         let result = view
@@ -3527,9 +3221,9 @@ mod tests {
             "partial read data should be correct"
         );
         assert_eq!(
-            remote.get_read_chunks_call_count().await,
-            1,
-            "first read should contact the server once"
+            remote.fetched_chunk_indices().await,
+            vec![1u32],
+            "partial read should fetch only chunk 1 from server"
         );
 
         // --- Step 2: Full read (bytes 0-300, needs all 3 chunks) ---
@@ -3564,10 +3258,10 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .add_per_chunk_results(ChunkReadResult {
                 chunks: all_chunks,
                 merkle_root: root_hash.to_vec(),
-            }))
+            })
             .await;
 
         let result = view
@@ -3582,9 +3276,9 @@ mod tests {
             "full read data should be correct after partial read cache miss"
         );
         assert_eq!(
-            remote.get_read_chunks_call_count().await,
-            2,
-            "full read should contact the server (cache miss for missing chunks)"
+            remote.fetched_chunk_indices().await,
+            vec![1u32, 0, 2],
+            "total fetched: chunk 1 (partial read) + chunks 0 and 2 (full read, chunk 1 was cached)"
         );
     }
 
@@ -3700,7 +3394,7 @@ mod tests {
 
         let _ = view.lookup(Path::new("."), "regular.txt").await;
 
-        // stat_batch returns regular file attrs — not a symlink
+        // stat_batch returns regular file attrs - not a symlink
         remote
             .set_stat_batch(Ok(vec![Ok(make_file_attrs(100, [0x01; 32]))]))
             .await;
@@ -3751,7 +3445,7 @@ mod tests {
             })]))
             .await;
 
-        // Step 1: call getattr — should cache the symlink_target
+        // Step 1: call getattr - should cache the symlink_target
         let attrs = view
             .getattr(Path::new("my_link"))
             .await
@@ -3759,7 +3453,7 @@ mod tests {
         assert_eq!(attrs.file_type, FileType::Symlink as i32);
         assert_eq!(attrs.symlink_target, b"../../foo");
 
-        // Step 2: call readlink — should return the cached target
+        // Step 2: call readlink - should return the cached target
         let target = view
             .readlink(Path::new("my_link"))
             .await
@@ -3845,7 +3539,7 @@ mod tests {
     // =======================================================================
 
     /// When all entries in a directory are symlinks with `symlink_target` set,
-    /// `stat_batch` should still be called — symlink attrs must come from
+    /// `stat_batch` should still be called - symlink attrs must come from
     /// `stat_batch` to get accurate uid/gid/mtime.
     #[tokio::test]
     async fn readdir_all_symlinks_calls_stat_batch() {
@@ -4101,229 +3795,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_chunks_integrity_accepts_valid() {
-        let data = b"hello world".to_vec();
-        let hash = *Blake3Hash::new(&data).as_bytes();
-        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
-        let chunks = vec![crate::client::ChunkData {
-            index: 0,
-            length: data.len() as u64,
-            hash,
-            data: Bytes::from(data),
-        }];
-        // Use the actual merkle root derived from the root hash
-        let merkle_root = root_hash.as_bytes().to_vec();
-        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_ok());
-    }
-
-    #[test]
-    fn verify_chunks_integrity_rejects_bad_chunk_hash() {
-        let data = b"hello world".to_vec();
-        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
-        let bad_hash = [0xFFu8; 32];
-        let chunks = vec![crate::client::ChunkData {
-            index: 0,
-            length: data.len() as u64,
-            hash: bad_hash,
-            data: Bytes::from(data),
-        }];
-        let merkle_root = root_hash.as_bytes().to_vec();
-        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
-    }
-
-    #[test]
-    fn verify_chunks_integrity_rejects_bad_chunk_length() {
-        let data = b"hello world".to_vec();
-        let hash = *Blake3Hash::new(&data).as_bytes();
-        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
-        let chunks = vec![crate::client::ChunkData {
-            index: 0,
-            length: 9999, // wrong length
-            hash,
-            data: Bytes::from(data),
-        }];
-        let merkle_root = root_hash.as_bytes().to_vec();
-        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
-    }
-
-    #[test]
-    fn verify_chunks_integrity_rejects_root_mismatch() {
-        let data = b"hello world".to_vec();
-        let hash = *Blake3Hash::new(&data).as_bytes();
-        let root_hash = Blake3Hash::from_slice(&[0u8; 32]).unwrap();
-        let wrong_root = Blake3Hash::from_slice(&[1u8; 32]).unwrap();
-        let chunks = vec![crate::client::ChunkData {
-            index: 0,
-            length: data.len() as u64,
-            hash,
-            data: Bytes::from(data),
-        }];
-        // merkle_root doesn't match root_hash
-        let merkle_root = wrong_root.as_bytes().to_vec();
-        assert!(verify_chunks_integrity(&chunks, &root_hash, &merkle_root).is_err());
-    }
-
-    #[test]
-    fn assemble_byte_range_single_chunk_from_start() {
-        let data = vec![0xAAu8; 100];
-        let hash = *Blake3Hash::new(&data).as_bytes();
-        let chunks = vec![crate::client::ChunkData {
-            index: 0,
-            length: 100,
-            hash,
-            data: Bytes::from(data.clone()),
-        }];
-        let starts = vec![0u64, 100];
-        let result = assemble_byte_range(chunks, 0, &starts, 0, 50).unwrap();
-        assert_eq!(result, &data[0..50]);
-    }
-
-    #[test]
-    fn assemble_byte_range_offset_within_chunk() {
-        let data = vec![0xAAu8; 100];
-        let hash = *Blake3Hash::new(&data).as_bytes();
-        let chunks = vec![crate::client::ChunkData {
-            index: 0,
-            length: 100,
-            hash,
-            data: Bytes::from(data.clone()),
-        }];
-        let starts = vec![0u64, 100];
-        let result = assemble_byte_range(chunks, 0, &starts, 10, 30).unwrap();
-        assert_eq!(result, &data[10..30]);
-    }
-
-    #[test]
-    #[allow(clippy::similar_names)] // chunk0 and chunks are intentionally similar
-    fn assemble_byte_range_across_two_chunks() {
-        let chunk0 = vec![0u8; 64];
-        let chunk1 = vec![1u8; 64];
-        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
-        let h1 = *Blake3Hash::new(&chunk1).as_bytes();
-        let chunks = vec![
-            crate::client::ChunkData {
-                index: 0,
-                length: 64,
-                hash: h0,
-                data: Bytes::from(chunk0.clone()),
-            },
-            crate::client::ChunkData {
-                index: 1,
-                length: 64,
-                hash: h1,
-                data: Bytes::from(chunk1.clone()),
-            },
-        ];
-        let starts = vec![0u64, 64, 128];
-        let result = assemble_byte_range(chunks, 0, &starts, 32, 96).unwrap();
-        assert_eq!(result.len(), 64);
-        assert_eq!(&result[0..32], &chunk0[32..64]);
-        assert_eq!(&result[32..64], &chunk1[0..32]);
-    }
-
-    #[test]
-    fn assemble_byte_range_rejects_non_contiguous_indices() {
-        let data = vec![0xAAu8; 100];
-        let hash = *Blake3Hash::new(&data).as_bytes();
-        // chunk with index 5 but start_chunk=0
-        let chunks = vec![crate::client::ChunkData {
-            index: 5,
-            length: 100,
-            hash,
-            data: Bytes::from(data),
-        }];
-        let starts = vec![0u64, 100];
-        assert!(assemble_byte_range(chunks, 0, &starts, 0, 100).is_err());
-    }
-
-    #[test]
-    fn assemble_byte_range_partial_read_only_needed_bytes() {
-        // Create 3 chunks of 100 bytes each
-        let chunk0 = vec![0u8; 100];
-        let chunk1 = vec![1u8; 100];
-        let chunk2 = vec![2u8; 100];
-        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
-        let h1 = *Blake3Hash::new(&chunk1).as_bytes();
-        let h2 = *Blake3Hash::new(&chunk2).as_bytes();
-        let input = vec![
-            crate::client::ChunkData {
-                index: 0,
-                length: 100,
-                hash: h0,
-                data: Bytes::from(chunk0.clone()),
-            },
-            crate::client::ChunkData {
-                index: 1,
-                length: 100,
-                hash: h1,
-                data: Bytes::from(chunk1.clone()),
-            },
-            crate::client::ChunkData {
-                index: 2,
-                length: 100,
-                hash: h2,
-                data: Bytes::from(chunk2),
-            },
-        ];
-        let starts = vec![0u64, 100, 200, 300];
-        // Request bytes 50-150 (crossing chunk boundary)
-        let result = assemble_byte_range(input, 0, &starts, 50, 150).unwrap();
-        assert_eq!(result.len(), 100);
-        let mut expected = chunk0[50..100].to_vec();
-        expected.extend_from_slice(&chunk1[0..50]);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn assemble_byte_range_single_byte_from_middle() {
-        let chunk0: Vec<u8> = (0u8..100u8).collect();
-        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
-        let input = vec![crate::client::ChunkData {
-            index: 0,
-            length: 100,
-            hash: h0,
-            data: Bytes::from(chunk0),
-        }];
-        let starts = vec![0u64, 100];
-        // Request 1 byte from the middle of a chunk
-        let result = assemble_byte_range(input, 0, &starts, 50, 51).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], 50);
-    }
-
-    #[test]
-    fn assemble_byte_range_output_size_matches_request() {
-        let chunk0 = vec![0u8; 64];
-        let chunk1 = vec![1u8; 64];
-        let h0 = *Blake3Hash::new(&chunk0).as_bytes();
-        let h1 = *Blake3Hash::new(&chunk1).as_bytes();
-        let input = vec![
-            crate::client::ChunkData {
-                index: 0,
-                length: 64,
-                hash: h0,
-                data: Bytes::from(chunk0),
-            },
-            crate::client::ChunkData {
-                index: 1,
-                length: 64,
-                hash: h1,
-                data: Bytes::from(chunk1),
-            },
-        ];
-        let starts = vec![0u64, 64, 128];
-        let result = assemble_byte_range(input, 0, &starts, 10, 90).unwrap();
-        // Exact length must match requested range (90 - 10 = 80)
-        assert_eq!(result.len(), 80, "output len must match requested range");
-        // Capacity must not exceed the requested range (u8 alignment = 1, so std gives exact)
-        assert_eq!(
-            result.capacity(),
-            80,
-            "capacity must not exceed requested range (no over-allocation)"
-        );
-    }
-
-    #[test]
     fn build_dir_entry_regular_file() {
         let entry = rift_protocol::messages::ReaddirEntry {
             name: "hello.txt".to_owned(),
@@ -4354,7 +3825,7 @@ mod tests {
     }
 
     /// When the manifest references chunks that were never fetched, a cached
-    /// read must report `MissingChunks` — never `CorruptedChunks`.
+    /// read must report `MissingChunks` - never `CorruptedChunks`.
     #[tokio::test]
     async fn missing_chunks_reported_as_missing_not_corrupted() {
         let chunk0_data = vec![0xAAu8; 100];
@@ -4366,18 +3837,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("cache");
 
-        let root_uuid = Uuid::now_v7();
-        let remote = Arc::new(MockRemote::new());
-        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
             .await
-            .expect("with_cache should succeed");
+            .expect("cache should open");
 
         let file_uuid = Uuid::now_v7();
-        view.handles
-            .insert(std::path::PathBuf::from("file"), file_uuid)
-            .await;
 
-        let leaves = vec![
+        let leaves = [
             ResolvedLeaf {
                 chunk_index: 0,
                 length: 100,
@@ -4394,28 +3860,32 @@ mod tests {
                 hash: Blake3Hash::from_array(chunk_hashes[2]),
             },
         ];
-        let chunk_starts = vec![0u64, 100, 250];
+        let chunk_starts: [u64; 3] = [0, 100, 250];
 
-        // Only cache chunk 1 on disk
-        let fetched_chunks = vec![ChunkData {
-            index: 1,
-            length: 150,
-            hash: chunk_hashes[1],
-            data: Bytes::from(chunk1_data),
-        }];
-
-        view.cache_fetched_chunks(
-            &file_uuid,
-            &root_hash,
-            &fetched_chunks,
-            &leaves,
-            &chunk_starts,
-        )
-        .await;
-
-        let cache = crate::cache::db::FileCache::open(&cache_dir)
+        // Store manifest and only chunk 1 on disk (chunks 0 and 2 are missing)
+        let manifest = crate::cache::db::Manifest {
+            root: Blake3Hash::from_array(root_hash),
+            chunks: leaves
+                .iter()
+                .zip(chunk_starts.iter())
+                .map(|(leaf, &offset)| crate::cache::db::ChunkInfo {
+                    index: leaf.chunk_index,
+                    offset,
+                    length: leaf.length,
+                    hash: *leaf.hash.as_bytes(),
+                })
+                .collect(),
+        };
+        cache.put_manifest(&file_uuid, &manifest).await.unwrap();
+        cache
+            .put_chunk(&chunk_hashes[1], &chunk1_data)
             .await
-            .expect("cache should open");
+            .unwrap();
+        cache.put_manifest(&file_uuid, &manifest).await.unwrap();
+        cache
+            .put_chunk(&chunk_hashes[1], &chunk1_data)
+            .await
+            .unwrap();
 
         // Full manifest is present, but chunk 0 is missing on disk
         let manifest = cache
@@ -4425,7 +3895,7 @@ mod tests {
             .expect("manifest should exist");
         assert_eq!(manifest.chunks.len(), 3, "manifest must contain all leaves");
 
-        // Request bytes in chunk 0 — should report MissingChunks, not corruption
+        // Request bytes in chunk 0 - should report MissingChunks, not corruption
         let result = cache.reconstruct_range(&manifest.chunks, 0, 100, 450).await;
         assert!(
             matches!(

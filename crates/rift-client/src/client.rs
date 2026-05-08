@@ -204,6 +204,7 @@ impl RiftClient<QuicConnection> {
 }
 
 /// Result of a `read_chunks` operation, containing the fetched chunk data and Merkle root.
+#[derive(Debug, Clone)]
 pub struct ChunkReadResult {
     pub chunks: Vec<ChunkData>,
     pub merkle_root: Vec<u8>,

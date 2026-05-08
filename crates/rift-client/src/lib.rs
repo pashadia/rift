@@ -13,3 +13,6 @@ pub mod view;
 
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 pub mod fuse;
+
+#[cfg(any(feature = "testing", test))]
+pub mod mock_remote;
