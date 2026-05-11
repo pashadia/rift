@@ -265,7 +265,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         // Slow path: fetch from network
         let result = self
             .remote
-            .read_chunks(handle, leaf.chunk_index, 1)
+            .read_chunk(handle, leaf.chunk_index)
             .await
             .map_err(|_| FsError::Io)?;
 
@@ -277,7 +277,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         }
 
         // Extract and verify the single chunk
-        let chunk = result.chunks.into_iter().next().ok_or(FsError::Io)?;
+        let chunk = result.single();
 
         if Blake3Hash::new(&chunk.data) != leaf.hash {
             tracing::error!(chunk_index = leaf.chunk_index, "chunk hash mismatch");
@@ -1089,7 +1089,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -1167,7 +1167,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1266,7 +1266,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1536,7 +1536,7 @@ mod tests {
 
         // BUT read_chunks returns ONLY chunk 1 - simulating a partial read at offset 120.
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1625,7 +1625,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1767,7 +1767,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -2465,7 +2465,7 @@ mod tests {
         // Wrong hash in ChunkData (matches nothing)
         let wrong_hash: [u8; 32] = [0xFF; 32];
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: 100,
@@ -2524,7 +2524,7 @@ mod tests {
         // Return correct chunk data but wrong merkle_root
         let wrong_root = [0xFF; 32];
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: 100,
@@ -2582,7 +2582,7 @@ mod tests {
 
         // Return wrong length (claims 200 bytes but actually has 100)
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: 200, // Wrong!
@@ -2646,7 +2646,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -2722,7 +2722,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -2758,7 +2758,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -2954,10 +2954,18 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
-                chunks: all_chunks,
-                merkle_root: root_hash.to_vec(),
-            }))
+            .add_read_chunk_result(
+                0,
+                Ok(ChunkReadResult {
+                    chunks: vec![ChunkData {
+                        index: 0,
+                        length: 100,
+                        hash: chunk_hashes[0],
+                        data: all_chunks[0].data.clone(),
+                    }],
+                    merkle_root: root_hash.to_vec(),
+                }),
+            )
             .await;
 
         // Read at offset 0 - partial manifest should cause cache miss,
@@ -3199,7 +3207,7 @@ mod tests {
             .await;
         // Only chunk 1 is fetched for the partial read
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -3826,6 +3834,92 @@ mod tests {
 
     /// When the manifest references chunks that were never fetched, a cached
     /// read must report `MissingChunks` - never `CorruptedChunks`.
+    // =======================================================================
+    // Bead 0: read_chunk (single-chunk API) tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn read_chunk_returns_single_chunk() {
+        let remote = Arc::new(MockRemote::new());
+        let handle = Uuid::now_v7();
+
+        let chunk_data = vec![0xAAu8; 100];
+        let chunk_hash = blake3_of(&chunk_data);
+        let result = ChunkReadResult {
+            chunks: vec![ChunkData {
+                index: 0,
+                length: 100,
+                hash: chunk_hash,
+                data: Bytes::from(chunk_data.clone()),
+            }],
+            merkle_root: chunk_hash.to_vec(),
+        };
+
+        remote.add_read_chunk_result(0, Ok(result)).await;
+
+        let got = remote
+            .read_chunk(handle, 0)
+            .await
+            .expect("read_chunk should succeed");
+        assert_eq!(
+            got.chunks.len(),
+            1,
+            "read_chunk must return exactly one ChunkData"
+        );
+        let single = got.single();
+        assert_eq!(single.index, 0);
+        assert_eq!(single.data.as_ref(), &chunk_data);
+    }
+
+    #[tokio::test]
+    async fn mock_remote_tracks_single_chunk_fetches() {
+        let remote = Arc::new(MockRemote::new());
+        let handle = Uuid::now_v7();
+
+        let data0 = vec![0xAAu8; 100];
+        let hash0 = blake3_of(&data0);
+        let data1 = vec![0xBBu8; 200];
+        let hash1 = blake3_of(&data1);
+
+        remote
+            .add_read_chunk_result(
+                0,
+                Ok(ChunkReadResult {
+                    chunks: vec![ChunkData {
+                        index: 0,
+                        length: 100,
+                        hash: hash0,
+                        data: Bytes::from(data0),
+                    }],
+                    merkle_root: hash0.to_vec(),
+                }),
+            )
+            .await;
+        remote
+            .add_read_chunk_result(
+                1,
+                Ok(ChunkReadResult {
+                    chunks: vec![ChunkData {
+                        index: 1,
+                        length: 200,
+                        hash: hash1,
+                        data: Bytes::from(data1),
+                    }],
+                    merkle_root: hash1.to_vec(),
+                }),
+            )
+            .await;
+
+        let _r0 = remote.read_chunk(handle, 0).await.unwrap();
+        let _r1 = remote.read_chunk(handle, 1).await.unwrap();
+
+        assert_eq!(
+            remote.fetched_chunk_indices().await,
+            vec![0u32, 1],
+            "fetched_chunk_indices should return [0, 1] after reading chunks 0 and 1"
+        );
+    }
+
     #[tokio::test]
     async fn missing_chunks_reported_as_missing_not_corrupted() {
         let chunk0_data = vec![0xAAu8; 100];

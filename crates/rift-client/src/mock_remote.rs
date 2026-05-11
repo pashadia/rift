@@ -11,7 +11,7 @@
 //!
 //! let remote = Arc::new(MockRemote::new());
 //! remote.set_stat_batch(Ok(vec![Ok(attrs)])).await;
-//! remote.set_read_chunks(Ok(result)).await;
+//! remote.set_read_chunk(Ok(result)).await;
 //!
 //! // ... exercise code using `remote` ...
 //!
@@ -35,7 +35,7 @@ use rift_protocol::messages::{FileAttrs, ReaddirEntry};
 ///
 /// Each method's behavior is controlled by pre-setting results via `set_*`
 /// methods. Results are consumed on first call (take semantics) unless
-/// a keyed override is registered (e.g., [`add_read_chunks_result`]).
+/// a keyed override is registered (e.g., [`add_read_chunk_result`]).
 ///
 /// All call counters and argument records are available for assertion after
 /// the test runs.
@@ -45,24 +45,22 @@ pub struct MockRemote {
     lookup_result: Mutex<Option<anyhow::Result<(Uuid, FileAttrs)>>>,
     readdir_result: Mutex<Option<anyhow::Result<Vec<ReaddirEntry>>>>,
     stat_batch_result: Mutex<Option<anyhow::Result<Vec<Result<FileAttrs, FsError>>>>>,
-    read_chunks_result: Mutex<Option<anyhow::Result<ChunkReadResult>>>,
+    read_chunk_result: Mutex<Option<anyhow::Result<ChunkReadResult>>>,
 
     /// Map from hash (as `Vec<u8>`) to drill result. Empty `Vec` key = root drill.
     merkle_drill_results: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
 
-    /// Keyed `read_chunks` results: maps `(start_chunk, chunk_count)` to the
-    /// result to return for that specific call. Takes priority over the
-    /// one-shot `read_chunks_result`. Each entry is consumed on first match.
-    read_chunks_keyed: Mutex<HashMap<(u32, u32), anyhow::Result<ChunkReadResult>>>,
+    /// Keyed `read_chunk` results: maps `chunk_index` to the
+    /// result to return for that specific call. Each entry is consumed on first match.
+    read_chunk_keyed: Mutex<HashMap<u32, anyhow::Result<ChunkReadResult>>>,
 
     // -- call tracking --
-    /// Total number of times `read_chunks` / `read_chunks_streaming` was called.
-    read_chunks_called: Mutex<u32>,
-    /// All `(start_chunk, chunk_count)` arguments from every `read_chunks` call,
-    /// in order.
-    all_read_chunks_args: Mutex<Vec<(u32, u32)>>,
-    /// (`start_chunk`, `chunk_count`) from the most recent `read_chunks` call.
-    last_read_chunks_args: Mutex<Option<(u32, u32)>>,
+    /// Total number of times `read_chunk` was called.
+    read_chunk_called: Mutex<u32>,
+    /// All chunk indices from every `read_chunk` call, in order.
+    all_read_chunk_args: Mutex<Vec<u32>>,
+    /// The chunk index from the most recent `read_chunk` call.
+    last_read_chunk_arg: Mutex<Option<u32>>,
     /// Number of times `stat_batch` was called.
     stat_batch_called: Mutex<u32>,
     /// Handles passed to the most recent `stat_batch` call.
@@ -86,12 +84,12 @@ impl Default for MockRemote {
             lookup_result: Mutex::new(None),
             readdir_result: Mutex::new(None),
             stat_batch_result: Mutex::new(None),
-            read_chunks_result: Mutex::new(None),
+            read_chunk_result: Mutex::new(None),
             merkle_drill_results: Mutex::new(HashMap::new()),
-            read_chunks_keyed: Mutex::new(HashMap::new()),
-            read_chunks_called: Mutex::new(0),
-            all_read_chunks_args: Mutex::new(Vec::new()),
-            last_read_chunks_args: Mutex::new(None),
+            read_chunk_keyed: Mutex::new(HashMap::new()),
+            read_chunk_called: Mutex::new(0),
+            all_read_chunk_args: Mutex::new(Vec::new()),
+            last_read_chunk_arg: Mutex::new(None),
             stat_batch_called: Mutex::new(0),
             last_stat_batch_args: Mutex::new(None),
         }
@@ -114,40 +112,37 @@ impl MockRemote {
         *self.stat_batch_result.lock().await = Some(result);
     }
 
-    /// Pre-set the result for the next `read_chunks` call (one-shot).
+    /// Pre-set the result for the next `read_chunk` call (one-shot).
     ///
     /// This result is returned when no keyed result matches the requested
-    /// `(start_chunk, chunk_count)`. It is consumed on first use.
-    pub async fn set_read_chunks(&self, result: anyhow::Result<ChunkReadResult>) {
-        *self.read_chunks_result.lock().await = Some(result);
+    /// `chunk_index`. It is consumed on first use.
+    pub async fn set_read_chunk(&self, result: anyhow::Result<ChunkReadResult>) {
+        *self.read_chunk_result.lock().await = Some(result);
     }
 
-    /// Pre-set a keyed result for `read_chunks` calls with a specific
-    /// `(start_chunk, chunk_count)`.
+    /// Pre-set a keyed result for `read_chunk` calls with a specific chunk index.
     ///
     /// Keyed results take priority over the one-shot result set via
-    /// [`set_read_chunks`]. Each keyed entry is consumed on first match.
-    /// This allows sequencing multiple `read_chunks` calls with different
+    /// [`set_read_chunk`]. Each keyed entry is consumed on first match.
+    /// This allows sequencing multiple `read_chunk` calls with different
     /// results in the same test.
-    pub async fn add_read_chunks_result(
+    pub async fn add_read_chunk_result(
         &self,
-        start_chunk: u32,
-        chunk_count: u32,
+        chunk_index: u32,
         result: anyhow::Result<ChunkReadResult>,
     ) {
-        self.read_chunks_keyed
+        self.read_chunk_keyed
             .lock()
             .await
-            .insert((start_chunk, chunk_count), result);
+            .insert(chunk_index, result);
     }
 
     /// Split a `ChunkReadResult` into per-chunk keyed results.
     ///
-    /// Registers each chunk in `result` as a `read_chunks(idx, 1)` keyed
-    /// entry, so that per-chunk fetch calls (e.g. `fetch_chunk`) receive
-    /// the correct single chunk. Also registers the full result as a
-    /// one-shot fallback via [`set_read_chunks`] for backward
-    /// compatibility with tests that call `read_chunks` with a range.
+    /// Registers each chunk in `result` as a `read_chunk(idx)` keyed
+    /// entry, so that per-chunk fetch calls receive the correct single chunk.
+    /// Also registers the full result as a one-shot fallback via [`set_read_chunk`]
+    /// for backward compatibility with tests that call `read_chunk` with a range.
     pub async fn add_per_chunk_results(&self, result: ChunkReadResult) {
         let merkle_root = result.merkle_root.clone();
         for chunk in &result.chunks {
@@ -155,11 +150,10 @@ impl MockRemote {
                 chunks: vec![chunk.clone()],
                 merkle_root: merkle_root.clone(),
             };
-            self.add_read_chunks_result(chunk.index, 1, Ok(single))
-                .await;
+            self.add_read_chunk_result(chunk.index, Ok(single)).await;
         }
-        // Also set the one-shot fallback for the full range
-        self.set_read_chunks(Ok(result)).await;
+        // Also set the one-shot fallback
+        self.set_read_chunk(Ok(result)).await;
     }
 
     /// Store the root drill result (empty hash key).
@@ -181,35 +175,27 @@ impl MockRemote {
         self.merkle_drill_results.lock().await.insert(hash, result);
     }
 
-    /// Return the total number of times `read_chunks` / `read_chunks_streaming`
-    /// was called.
-    pub async fn get_read_chunks_call_count(&self) -> u32 {
-        *self.read_chunks_called.lock().await
+    /// Return the total number of times `read_chunk` was called.
+    pub async fn get_read_chunk_call_count(&self) -> u32 {
+        *self.read_chunk_called.lock().await
     }
 
-    /// Return all `(start_chunk, chunk_count)` arguments from every
-    /// `read_chunks` call, in order.
-    pub async fn get_all_read_chunks_args(&self) -> Vec<(u32, u32)> {
-        self.all_read_chunks_args.lock().await.clone()
+    /// Return all chunk indices from every `read_chunk` call, in order.
+    pub async fn get_all_read_chunk_args(&self) -> Vec<u32> {
+        self.all_read_chunk_args.lock().await.clone()
     }
 
-    /// Return the chunk indices that were fetched, i.e. each `(start, count)`
-    /// call is expanded to `start..start+count`.
+    /// Return the chunk indices that were fetched.
     ///
-    /// This is the semantically meaningful view: **which** chunks were
-    /// requested from the server, regardless of how they were batched.
+    /// Since each `read_chunk` call fetches exactly one chunk index,
+    /// this returns the same as `get_all_read_chunk_args`.
     pub async fn fetched_chunk_indices(&self) -> Vec<u32> {
-        self.all_read_chunks_args
-            .lock()
-            .await
-            .iter()
-            .flat_map(|&(start, count)| start..start + count)
-            .collect()
+        self.all_read_chunk_args.lock().await.clone()
     }
 
-    /// Return `(start_chunk, chunk_count)` from the most recent `read_chunks` call.
-    pub async fn get_last_read_chunks_args(&self) -> Option<(u32, u32)> {
-        *self.last_read_chunks_args.lock().await
+    /// Return the chunk index from the most recent `read_chunk` call.
+    pub async fn get_last_read_chunk_arg(&self) -> Option<u32> {
+        *self.last_read_chunk_arg.lock().await
     }
 
     /// Return the number of times `stat_batch` was called.
@@ -254,35 +240,22 @@ impl RemoteShare for MockRemote {
             .unwrap_or_else(|| Err(anyhow::anyhow!("no stat_batch result set")))
     }
 
-    async fn read_chunks(
-        &self,
-        _handle: Uuid,
-        start_chunk: u32,
-        chunk_count: u32,
-    ) -> anyhow::Result<ChunkReadResult> {
-        *self.read_chunks_called.lock().await += 1;
-        *self.last_read_chunks_args.lock().await = Some((start_chunk, chunk_count));
-        self.all_read_chunks_args
-            .lock()
-            .await
-            .push((start_chunk, chunk_count));
+    async fn read_chunk(&self, _handle: Uuid, chunk_index: u32) -> anyhow::Result<ChunkReadResult> {
+        *self.read_chunk_called.lock().await += 1;
+        *self.last_read_chunk_arg.lock().await = Some(chunk_index);
+        self.all_read_chunk_args.lock().await.push(chunk_index);
 
         // Check keyed results first (takes priority)
-        if let Some(result) = self
-            .read_chunks_keyed
-            .lock()
-            .await
-            .remove(&(start_chunk, chunk_count))
-        {
+        if let Some(result) = self.read_chunk_keyed.lock().await.remove(&chunk_index) {
             return result;
         }
 
         // Fall back to one-shot result
-        self.read_chunks_result
+        self.read_chunk_result
             .lock()
             .await
             .take()
-            .unwrap_or_else(|| Err(anyhow::anyhow!("no read_chunks result set")))
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no read_chunk result set")))
     }
 
     async fn read_chunks_streaming(
@@ -292,16 +265,21 @@ impl RemoteShare for MockRemote {
         chunk_count: u32,
         mut on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
     ) -> anyhow::Result<Vec<u8>> {
-        let result = self.read_chunks(handle, start_chunk, chunk_count).await?;
-        for chunk in &result.chunks {
-            on_chunk(ChunkData {
-                index: chunk.index,
-                length: chunk.length,
-                hash: chunk.hash,
-                data: chunk.data.clone(),
-            })?;
+        // Fetch each chunk individually via read_chunk
+        let mut merkle_root = Vec::new();
+        for idx in start_chunk..start_chunk + chunk_count {
+            let result = self.read_chunk(handle, idx).await?;
+            merkle_root = result.merkle_root.clone();
+            for chunk in result.chunks {
+                on_chunk(ChunkData {
+                    index: chunk.index,
+                    length: chunk.length,
+                    hash: chunk.hash,
+                    data: chunk.data.clone(),
+                })?;
+            }
         }
-        Ok(result.merkle_root)
+        Ok(merkle_root)
     }
 
     async fn merkle_drill(&self, _handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
