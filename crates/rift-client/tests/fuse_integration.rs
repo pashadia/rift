@@ -107,11 +107,10 @@ impl RemoteShare for MockRemoteShare {
         }
         Ok(results)
     }
-    async fn read_chunks(
+    async fn read_chunk(
         &self,
         _handle: Uuid,
-        _start_chunk: u32,
-        _chunk_count: u32,
+        _chunk_index: u32,
     ) -> anyhow::Result<ChunkReadResult> {
         Ok(ChunkReadResult {
             chunks: vec![],

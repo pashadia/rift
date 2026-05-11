@@ -243,7 +243,7 @@ async fn run_cache_test(test: &CacheTest) {
     // Register per-chunk results for each chunk the server should serve.
     for &idx in test.expected_fetches {
         let result = build_single_chunk_result(&chunk_hashes, &chunks_data, root_hash, idx);
-        remote.add_read_chunks_result(idx, 1, Ok(result)).await;
+        remote.add_read_chunk_result(idx, Ok(result)).await;
     }
 
     // Create the view with cache

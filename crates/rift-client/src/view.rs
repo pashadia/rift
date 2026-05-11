@@ -265,7 +265,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         // Slow path: fetch from network
         let result = self
             .remote
-            .read_chunks(handle, leaf.chunk_index, 1)
+            .read_chunk(handle, leaf.chunk_index)
             .await
             .map_err(|_| FsError::Io)?;
 
@@ -1089,7 +1089,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -1167,7 +1167,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1266,7 +1266,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1536,7 +1536,7 @@ mod tests {
 
         // BUT read_chunks returns ONLY chunk 1 - simulating a partial read at offset 120.
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1625,7 +1625,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -1767,7 +1767,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,
@@ -2465,7 +2465,7 @@ mod tests {
         // Wrong hash in ChunkData (matches nothing)
         let wrong_hash: [u8; 32] = [0xFF; 32];
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: 100,
@@ -2524,7 +2524,7 @@ mod tests {
         // Return correct chunk data but wrong merkle_root
         let wrong_root = [0xFF; 32];
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: 100,
@@ -2582,7 +2582,7 @@ mod tests {
 
         // Return wrong length (claims 200 bytes but actually has 100)
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: 200, // Wrong!
@@ -2646,7 +2646,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -2722,7 +2722,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -2758,7 +2758,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 0,
                     length: content.len() as u64,
@@ -2954,7 +2954,7 @@ mod tests {
             }))
             .await;
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: all_chunks,
                 merkle_root: root_hash.to_vec(),
             }))
@@ -3199,7 +3199,7 @@ mod tests {
             .await;
         // Only chunk 1 is fetched for the partial read
         remote
-            .set_read_chunks(Ok(ChunkReadResult {
+            .set_read_chunk(Ok(ChunkReadResult {
                 chunks: vec![ChunkData {
                     index: 1,
                     length: 200,

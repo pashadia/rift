@@ -210,6 +210,25 @@ pub struct ChunkReadResult {
     pub merkle_root: Vec<u8>,
 }
 
+impl ChunkReadResult {
+    /// Assert exactly one chunk was returned and return it.
+    ///
+    /// This is a convenience helper for the single-chunk fetch path.
+    #[must_use]
+    pub fn single(self) -> ChunkData {
+        assert_eq!(
+            self.chunks.len(),
+            1,
+            "expected exactly one chunk, got {}",
+            self.chunks.len()
+        );
+        self.chunks
+            .into_iter()
+            .next()
+            .expect("len() == 1 guarantee")
+    }
+}
+
 /// A single chunk's data.
 #[derive(Debug, Clone)]
 pub struct ChunkData {
@@ -1037,13 +1056,8 @@ impl crate::remote::RemoteShare for RiftClient<QuicConnection> {
         self.stat_batch(handles).await
     }
 
-    async fn read_chunks(
-        &self,
-        handle: Uuid,
-        start_chunk: u32,
-        chunk_count: u32,
-    ) -> anyhow::Result<ChunkReadResult> {
-        self.read_chunks(handle, start_chunk, chunk_count).await
+    async fn read_chunk(&self, handle: Uuid, chunk_index: u32) -> anyhow::Result<ChunkReadResult> {
+        self.read_chunks(handle, chunk_index, 1).await
     }
 
     async fn read_chunks_streaming(
