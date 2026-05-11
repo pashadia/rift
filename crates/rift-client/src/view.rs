@@ -2,6 +2,7 @@ use crate::cache::db::{ChunkInfo, FileCache};
 use crate::handle::HandleCache;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
+use bytes::Bytes;
 use rift_common::crypto::Blake3Hash;
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType};
@@ -242,13 +243,13 @@ impl<R: RemoteShare> RiftShareView<R> {
         handle: Uuid,
         leaf: &ResolvedLeaf,
         root_hash: &Blake3Hash,
-    ) -> Result<Vec<u8>, FsError> {
+    ) -> Result<Bytes, FsError> {
         // Fast path: cache hit
         if let Some(cache) = self.cache() {
             match cache.get_chunk(leaf.hash.as_bytes()).await {
                 Ok(Some(data)) => {
                     if Blake3Hash::new(&data) == leaf.hash && data.len() as u64 == leaf.length {
-                        return Ok(data);
+                        return Ok(Bytes::from(data));
                     }
                     tracing::warn!(
                         chunk_index = leaf.chunk_index,
@@ -290,12 +291,15 @@ impl<R: RemoteShare> RiftShareView<R> {
 
         // Cache the chunk data
         if let Some(cache) = self.cache() {
-            if let Err(e) = cache.put_chunk(leaf.hash.as_bytes(), &chunk.data).await {
+            if let Err(e) = cache
+                .put_chunk_bytes(leaf.hash.as_bytes(), chunk.data.clone())
+                .await
+            {
                 tracing::warn!(chunk_index = leaf.chunk_index, error = %e, "failed to cache chunk");
             }
         }
 
-        Ok(chunk.data.into())
+        Ok(chunk.data)
     }
 
     /// Obtain the chunk leaf data and byte-offset table for a file.
@@ -3834,9 +3838,58 @@ mod tests {
 
     /// When the manifest references chunks that were never fetched, a cached
     /// read must report `MissingChunks` - never `CorruptedChunks`.
-    // =======================================================================
-    // Bead 0: read_chunk (single-chunk API) tests
-    // =======================================================================
+    #[tokio::test]
+    async fn fetch_chunk_returns_bytes() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let content = b"hello bytes world";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        // We need to test fetch_chunk indirectly via read()
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        let result = view
+            .read(Path::new("test_file"), 0, content.len() as u64, None)
+            .await
+            .expect("read should succeed");
+
+        assert_eq!(result, content, "read must return original content");
+    }
 
     #[tokio::test]
     async fn read_chunk_returns_single_chunk() {
