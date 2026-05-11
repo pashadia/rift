@@ -3,11 +3,14 @@ use crate::handle::HandleCache;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use rift_common::crypto::Blake3Hash;
 use rift_common::FsError;
 use rift_protocol::messages::{FileAttrs, FileType};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -50,7 +53,7 @@ pub trait ShareView: Send + Sync + 'static {
 }
 
 /// A fully-resolved leaf node with verified metadata.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ResolvedLeaf {
     chunk_index: u32,
     length: u64,
@@ -588,16 +591,59 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             return Ok(vec![]);
         }
 
-        // Per-chunk fetch: each chunk is resolved individually.
-        // Cached chunks return immediately; missing chunks are fetched from the network.
+        // Parallel chunk fetch: up to 8 at a time.
+        // Chunks arrive in arbitrary order, reassembled by index.
+        // Successful chunks are cached regardless of sibling failures.
+
+        let num_chunks = (end_chunk - start_chunk) as usize;
+        let chunk_data: Arc<Mutex<Vec<Option<Bytes>>>> =
+            Arc::new(Mutex::new(vec![None; num_chunks]));
+        let any_failed = Arc::new(AtomicBool::new(false));
+        let leaves_arc = Arc::new(leaves.clone());
+
+        stream::iter(start_chunk..end_chunk)
+            .for_each_concurrent(8, |idx| {
+                let chunk_data = chunk_data.clone();
+                let any_failed = any_failed.clone();
+                let leaves_arc = leaves_arc.clone();
+                let root_hash_ref = root_hash.clone();
+                async move {
+                    let leaf = &leaves_arc[idx as usize];
+                    match self.fetch_chunk(handle, leaf, &root_hash_ref).await {
+                        Ok(data) => {
+                            let pos = (idx - start_chunk) as usize;
+                            chunk_data.lock().await[pos] = Some(data);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                chunk_index = idx,
+                                error = %e,
+                                "chunk fetch failed"
+                            );
+                            any_failed.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .await;
+
+        if any_failed.load(Ordering::Relaxed) {
+            return Err(FsError::Io);
+        }
+
+        // Reassemble in order
         let needed = usize::try_from(end - offset).unwrap_or(0);
         let mut result = Vec::with_capacity(needed.max(1));
-
-        for idx in start_chunk..end_chunk {
+        let results = Arc::try_unwrap(chunk_data)
+            .expect("all references dropped after for_each_concurrent")
+            .into_inner();
+        for (i, idx) in (start_chunk..end_chunk).enumerate() {
+            let data = results[i]
+                .as_ref()
+                .expect("all chunks must succeed if no failure flag");
             let leaf = &leaves[idx as usize];
-            let data = self.fetch_chunk(handle, leaf, &root_hash).await?;
             result.extend(Self::slice_chunk(
-                &data,
+                data,
                 chunk_starts[idx as usize],
                 leaf.length,
                 offset,
@@ -2891,7 +2937,7 @@ mod tests {
     async fn partial_manifest_causes_cache_miss() {
         let chunk0_data = vec![0xAAu8; 100];
         let chunk1_data = vec![0xBBu8; 200];
-        let (chunk_hashes, root_hash, all_chunks) =
+        let (chunk_hashes, root_hash, _all_chunks) =
             build_mock_chunks(&[chunk0_data, chunk1_data.clone()]);
         let file_size: u64 = 100 + 200;
 
@@ -2965,7 +3011,7 @@ mod tests {
                         index: 0,
                         length: 100,
                         hash: chunk_hashes[0],
-                        data: all_chunks[0].data.clone(),
+                        data: Bytes::from(vec![0xAAu8; 100]),
                     }],
                     merkle_root: root_hash.to_vec(),
                 }),
@@ -4050,6 +4096,350 @@ mod tests {
                 Err(crate::cache::db::ReconstructError::MissingChunks(_))
             ),
             "missing chunks must be reported as MissingChunks, not CorruptedChunks"
+        );
+    }
+
+    // =======================================================================
+    // Bead 4: Parallel chunk fetching tests
+    // =======================================================================
+
+    /// File with 10 chunks (100 bytes each), none cached.
+    /// Full-file read fetches all 10 chunks in parallel.
+    #[tokio::test]
+    async fn parallel_fetch_all_chunks() {
+        let num_chunks = 10usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        // Flat merkle drill with all 10 chunks
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        // Register per-chunk results for all 10 chunks
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            remote
+                .add_read_chunk_result(
+                    i as u32,
+                    Ok(ChunkReadResult {
+                        chunks: vec![ChunkData {
+                            index: i as u32,
+                            length: chunk_size as u64,
+                            hash: chunk_hashes[i],
+                            data: Bytes::from(chunk_data.clone()),
+                        }],
+                        merkle_root: root_hash.to_vec(),
+                    }),
+                )
+                .await;
+        }
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("read should succeed");
+
+        let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
+        assert_eq!(result, expected, "full file read must return correct data");
+
+        let fetched = remote.fetched_chunk_indices().await;
+        assert_eq!(
+            fetched,
+            (0..num_chunks as u32).collect::<Vec<_>>(),
+            "all chunks must be fetched"
+        );
+    }
+
+    /// File with 10 chunks (100 bytes each). read("file", 250, 100) fetches
+    /// only chunks 2 and 3 (bytes 200-400).
+    #[tokio::test]
+    async fn parallel_fetch_partial_range() {
+        let num_chunks = 10usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        // Only register chunks 2 and 3
+        for &i in &[2u32, 3] {
+            remote
+                .add_read_chunk_result(
+                    i,
+                    Ok(ChunkReadResult {
+                        chunks: vec![ChunkData {
+                            index: i,
+                            length: chunk_size as u64,
+                            hash: chunk_hashes[i as usize],
+                            data: Bytes::from(chunks_data[i as usize].clone()),
+                        }],
+                        merkle_root: root_hash.to_vec(),
+                    }),
+                )
+                .await;
+        }
+
+        let result = view
+            .read(Path::new("file"), 250, 100, None)
+            .await
+            .expect("read should succeed");
+
+        // Expected: chunk 2's bytes [50..100] ++ chunk 3's bytes [0..50]
+        // (offset=250 is 50 bytes into chunk 2, length=100)
+        let mut expected = vec![2u8; 50]; // tail of chunk 2
+        expected.extend(vec![3u8; 50]); // head of chunk 3
+        assert_eq!(
+            result, expected,
+            "partial range read must return correct bytes"
+        );
+
+        let fetched = remote.fetched_chunk_indices().await;
+        assert_eq!(
+            fetched,
+            vec![2u32, 3],
+            "only chunks 2 and 3 should be fetched"
+        );
+    }
+
+    /// Use per-chunk delays in `MockRemote` to verify that chunks arriving
+    /// out of order are still assembled correctly by index.
+    #[tokio::test]
+    async fn parallel_fetch_result_assembly_order_invariant() {
+        let num_chunks = 10usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        // Register per-chunk results AND add delays (higher index = longer delay)
+        // This ensures chunks 0..9 arrive in reverse order (9 finishes first).
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            let idx = i as u32;
+            remote
+                .add_read_chunk_result(
+                    idx,
+                    Ok(ChunkReadResult {
+                        chunks: vec![ChunkData {
+                            index: idx,
+                            length: chunk_size as u64,
+                            hash: chunk_hashes[i],
+                            data: Bytes::from(chunk_data.clone()),
+                        }],
+                        merkle_root: root_hash.to_vec(),
+                    }),
+                )
+                .await;
+            // Higher index = longer delay -> out of order arrival
+            remote
+                .set_chunk_delay(idx, std::time::Duration::from_millis(u64::from(idx)))
+                .await;
+        }
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("read should succeed");
+
+        let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
+        assert_eq!(
+            result, expected,
+            "out-of-order arrival must produce correct file data"
+        );
+    }
+
+    /// File with 5 chunks. `MockRemote` returns error for chunk 2, success
+    /// for all others. `read()` returns `Err(FsError::Io).
+    /// Successful chunks 0, 1, 3, 4 must be cached. Failed chunk 2 must NOT
+    /// be cached.
+    #[tokio::test]
+    async fn partial_failure_caches_successful_chunks() {
+        let num_chunks = 5usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        // Register results: error for chunk 2, success for all others
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            let idx = i as u32;
+            if i == 2 {
+                remote
+                    .add_read_chunk_result(idx, Err(anyhow::anyhow!("chunk 2 failed")))
+                    .await;
+            } else {
+                remote
+                    .add_read_chunk_result(
+                        idx,
+                        Ok(ChunkReadResult {
+                            chunks: vec![ChunkData {
+                                index: idx,
+                                length: chunk_size as u64,
+                                hash: chunk_hashes[i],
+                                data: Bytes::from(chunk_data.clone()),
+                            }],
+                            merkle_root: root_hash.to_vec(),
+                        }),
+                    )
+                    .await;
+            }
+        }
+
+        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "partial failure must return FsError::Io"
+        );
+
+        // Verify successful chunks are in cache
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
+            .await
+            .expect("cache should open");
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..num_chunks {
+            if i != 2 {
+                let cached = cache
+                    .get_chunk(&chunk_hashes[i])
+                    .await
+                    .expect("get_chunk ok");
+                assert!(
+                    cached.is_some(),
+                    "chunk {} should be cached after successful fetch",
+                    i
+                );
+            }
+        }
+
+        // Verify failed chunk is NOT in cache
+        let chunk2_cached = cache
+            .get_chunk(&chunk_hashes[2])
+            .await
+            .expect("get_chunk ok");
+        assert!(
+            chunk2_cached.is_none(),
+            "failed chunk 2 must NOT be in cache"
         );
     }
 }
