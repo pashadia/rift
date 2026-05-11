@@ -50,9 +50,12 @@ pub struct MockRemote {
     /// Map from hash (as `Vec<u8>`) to drill result. Empty `Vec` key = root drill.
     merkle_drill_results: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
 
-    /// Keyed `read_chunks` results: maps `(start_chunk, chunk_count)` to the
-    /// result to return for that specific call. Takes priority over the
-    /// one-shot `read_chunks_result`. Each entry is consumed on first match.
+    /// Per-chunk delays: maps `chunk_index` to delay before returning the result.
+    /// Used to test out-of-order arrival in parallel fetch.
+    chunk_delays: Mutex<HashMap<u32, std::time::Duration>>,
+
+    /// Keyed `read_chunk` results: maps `chunk_index` to the result to return.
+    /// Each entry is consumed on first match.
     read_chunks_keyed: Mutex<HashMap<(u32, u32), anyhow::Result<ChunkReadResult>>>,
 
     // -- call tracking --
@@ -88,6 +91,7 @@ impl Default for MockRemote {
             stat_batch_result: Mutex::new(None),
             read_chunks_result: Mutex::new(None),
             merkle_drill_results: Mutex::new(HashMap::new()),
+            chunk_delays: Mutex::new(HashMap::new()),
             read_chunks_keyed: Mutex::new(HashMap::new()),
             read_chunks_called: Mutex::new(0),
             all_read_chunks_args: Mutex::new(Vec::new()),
@@ -158,6 +162,13 @@ impl MockRemote {
         }
         // Also set the one-shot fallback
         self.set_read_chunk(Ok(result)).await;
+    }
+
+    /// Set a per-chunk delay: for chunk at `index`, wait `duration` before
+    /// returning the result. Used to test out-of-order arrival in parallel
+    /// fetch scenarios.
+    pub async fn set_chunk_delay(&self, index: u32, duration: std::time::Duration) {
+        self.chunk_delays.lock().await.insert(index, duration);
     }
 
     /// Store the root drill result (empty hash key).
@@ -259,6 +270,11 @@ impl RemoteShare for MockRemote {
             .lock()
             .await
             .push((chunk_index, 1));
+
+        // Apply per-chunk delay (for parallel fetch ordering tests)
+        if let Some(delay) = self.chunk_delays.lock().await.remove(&chunk_index) {
+            tokio::time::sleep(delay).await;
+        }
 
         // Check keyed results first (takes priority)
         if let Some(result) = self
