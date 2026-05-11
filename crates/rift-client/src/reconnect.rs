@@ -198,14 +198,9 @@ impl RemoteShare for ReconnectingClient {
         .await
     }
 
-    async fn read_chunks(
-        &self,
-        handle: Uuid,
-        start_chunk: u32,
-        chunk_count: u32,
-    ) -> anyhow::Result<ChunkReadResult> {
+    async fn read_chunk(&self, handle: Uuid, chunk_index: u32) -> anyhow::Result<ChunkReadResult> {
         self.with_reconnect(move |client| async move {
-            client.read_chunks(handle, start_chunk, chunk_count).await
+            client.read_chunks(handle, chunk_index, 1).await
         })
         .await
     }
@@ -217,12 +212,16 @@ impl RemoteShare for ReconnectingClient {
         chunk_count: u32,
         mut on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
     ) -> anyhow::Result<Vec<u8>> {
-        // Fall back to read_chunks since reconnection breaks streaming.
-        let result = self.read_chunks(handle, start_chunk, chunk_count).await?;
-        for chunk in &result.chunks {
-            on_chunk(chunk.clone())?;
+        // Fall back to per-chunk fetch since reconnection breaks streaming.
+        let mut merkle_root = Vec::new();
+        for idx in start_chunk..start_chunk + chunk_count {
+            let result = self.read_chunk(handle, idx).await?;
+            merkle_root = result.merkle_root.clone();
+            for chunk in result.chunks {
+                on_chunk(chunk.clone())?;
+            }
         }
-        Ok(result.merkle_root)
+        Ok(merkle_root)
     }
 
     async fn merkle_drill(&self, handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {

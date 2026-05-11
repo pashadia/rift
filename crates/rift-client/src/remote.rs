@@ -21,13 +21,8 @@ pub trait RemoteShare: Send + Sync + 'static {
         handles: Vec<Uuid>,
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>>;
 
-    /// Reads chunks from a file.
-    async fn read_chunks(
-        &self,
-        handle: Uuid,
-        start_chunk: u32,
-        chunk_count: u32,
-    ) -> anyhow::Result<ChunkReadResult>;
+    /// Reads a single chunk from a file.
+    async fn read_chunk(&self, handle: Uuid, chunk_index: u32) -> anyhow::Result<ChunkReadResult>;
 
     /// Reads chunks from a file with streaming callback.
     ///
