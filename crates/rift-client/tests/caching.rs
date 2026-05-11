@@ -267,7 +267,9 @@ async fn run_cache_test(test: &CacheTest) {
     assert_eq!(result, expected_data, "read must return correct file data");
 
     // Verify the chunk indices that were fetched from the server
-    let fetched = remote.fetched_chunk_indices().await;
+    // Sort because parallel fetch may return in any order
+    let mut fetched = remote.fetched_chunk_indices().await;
+    fetched.sort_unstable();
     assert_eq!(
         fetched, test.expected_fetches,
         "test '{}': fetched chunks do not match expected",
