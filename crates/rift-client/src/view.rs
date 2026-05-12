@@ -585,6 +585,14 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             .resolve_chunk_info(handle, &root_hash, &merkle_root, file_size)
             .await?;
 
+        // Eagerly cache manifest before fetching chunks.
+        // On partial failure, the manifest is still available for retry.
+        if !manifest_was_cached {
+            if let Some(cache) = self.cache() {
+                Self::cache_manifest(cache, &handle, &merkle_root, &leaves, &chunk_starts).await;
+            }
+        }
+
         let (start_chunk, end_chunk) = calculate_chunk_range(&chunk_starts, offset, end);
         let chunk_count = end_chunk - start_chunk;
         if chunk_count == 0 {
@@ -649,13 +657,6 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 offset,
                 end,
             ));
-        }
-
-        // Cache the manifest for future reads (if we didn't already have it)
-        if !manifest_was_cached {
-            if let Some(cache) = self.cache() {
-                Self::cache_manifest(cache, &handle, &merkle_root, &leaves, &chunk_starts).await;
-            }
         }
 
         Ok(result)
@@ -4440,6 +4441,352 @@ mod tests {
         assert!(
             chunk2_cached.is_none(),
             "failed chunk 2 must NOT be in cache"
+        );
+    }
+
+    // =======================================================================
+    // Bead 5: Eager manifest caching tests
+    // =======================================================================
+
+    /// File with 5 chunks. `MockRemote`: merkle drill succeeds, but chunk 2
+    /// always fails. After `read()` returns EIO, verify manifest IS in `SQLite`
+    /// cache — the manifest should be cached BEFORE chunks are fetched,
+    /// so a partial failure doesn't prevent manifest caching.
+    #[tokio::test]
+    async fn manifest_cached_before_chunk_fetch() {
+        let num_chunks = 5usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        // All chunks except chunk 2 succeed
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            let idx = i as u32;
+            if i == 2 {
+                remote
+                    .add_read_chunk_result(idx, Err(anyhow::anyhow!("chunk 2 failed")))
+                    .await;
+            } else {
+                remote
+                    .add_read_chunk_result(
+                        idx,
+                        Ok(ChunkReadResult {
+                            chunks: vec![ChunkData {
+                                index: idx,
+                                length: chunk_size as u64,
+                                hash: chunk_hashes[i],
+                                data: Bytes::from(chunk_data.clone()),
+                            }],
+                            merkle_root: root_hash.to_vec(),
+                        }),
+                    )
+                    .await;
+            }
+        }
+
+        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "read with chunk 2 failure must return FsError::Io"
+        );
+
+        // Verify manifest IS in cache despite the partial failure
+        let cache = crate::cache::db::FileCache::open(&cache_dir)
+            .await
+            .expect("cache should open");
+        let manifest = cache
+            .get_manifest(&file_uuid)
+            .await
+            .expect("get_manifest ok");
+        assert!(
+            manifest.is_some(),
+            "manifest must be cached even after partial chunk failure"
+        );
+
+        // Verify manifest contains all 5 chunks
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.chunks.len(), num_chunks);
+        assert_eq!(
+            manifest.chunks.iter().map(|c| c.index).collect::<Vec<_>>(),
+            (0..num_chunks as u32).collect::<Vec<_>>()
+        );
+    }
+
+    /// Read file successfully (manifest cached). Read same file again.
+    /// Verify the second read uses the cached manifest by checking that
+    /// `MockRemote`'s `merkle_drill` was called only once (not twice).
+    #[tokio::test]
+    async fn manifest_cached_on_first_read_not_second() {
+        let num_chunks = 5usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        // --- First read: everything fetched from server ---
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            let idx = i as u32;
+            remote
+                .add_read_chunk_result(
+                    idx,
+                    Ok(ChunkReadResult {
+                        chunks: vec![ChunkData {
+                            index: idx,
+                            length: chunk_size as u64,
+                            hash: chunk_hashes[i],
+                            data: Bytes::from(chunk_data.clone()),
+                        }],
+                        merkle_root: root_hash.to_vec(),
+                    }),
+                )
+                .await;
+        }
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("first read should succeed");
+
+        let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
+        assert_eq!(result, expected, "first read data must be correct");
+
+        // merkle_drill was called once during first read
+        assert_eq!(
+            remote.get_merkle_drill_call_count().await,
+            1,
+            "first read should call merkle_drill once"
+        );
+
+        // --- Second read: manifest should be cached, no merkle_drill ---
+        // Only set stat_batch — merkle_drill and read_chunk are NOT set.
+        // Cached manifest + cached chunks should serve the second read.
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("second read should succeed from cache");
+
+        assert_eq!(result, expected, "second read data must be correct");
+
+        // merkle_drill must still have been called only once — the second
+        // read hit the cached manifest and skipped the drill.
+        assert_eq!(
+            remote.get_merkle_drill_call_count().await,
+            1,
+            "second read must NOT call merkle_drill (cached manifest)"
+        );
+    }
+
+    /// File with 5 chunks (100 bytes each). First read: chunk 2 always fails
+    /// (returns Err). `read()` returns EIO. Manifest and chunks 0,1,3,4 are
+    /// cached. Second read: chunk 2 now succeeds. Verify the second read only
+    /// fetches chunk 2 from network — all other chunks come from disk cache.
+    #[tokio::test]
+    async fn retry_after_partial_failure_uses_cached_manifest() {
+        let num_chunks = 5usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir.clone())
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        // --- First read: chunk 2 fails ---
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            let idx = i as u32;
+            if i == 2 {
+                remote
+                    .add_read_chunk_result(idx, Err(anyhow::anyhow!("chunk 2 failed")))
+                    .await;
+            } else {
+                remote
+                    .add_read_chunk_result(
+                        idx,
+                        Ok(ChunkReadResult {
+                            chunks: vec![ChunkData {
+                                index: idx,
+                                length: chunk_size as u64,
+                                hash: chunk_hashes[i],
+                                data: Bytes::from(chunk_data.clone()),
+                            }],
+                            merkle_root: root_hash.to_vec(),
+                        }),
+                    )
+                    .await;
+            }
+        }
+
+        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "first read must fail due to chunk 2 error"
+        );
+
+        // --- Second read: chunk 2 now succeeds ---
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+
+        // Do NOT set merkle_drill — should use cached manifest
+        // Only register chunk 2's result; chunks 0,1,3,4 are in disk cache
+        remote
+            .add_read_chunk_result(
+                2,
+                Ok(ChunkReadResult {
+                    chunks: vec![ChunkData {
+                        index: 2,
+                        length: chunk_size as u64,
+                        hash: chunk_hashes[2],
+                        data: Bytes::from(chunks_data[2].clone()),
+                    }],
+                    merkle_root: root_hash.to_vec(),
+                }),
+            )
+            .await;
+
+        let result = view
+            .read(Path::new("file"), 0, file_size, None)
+            .await
+            .expect("second read should succeed");
+
+        let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
+        assert_eq!(result, expected, "second read data must be correct");
+
+        // Verify only chunk 2 was fetched on the second read
+        // (all 5 chunks are attempted in the first parallel fetch;
+        //  only chunk 2 is fetched again on the second read because
+        //  chunks 0,1,3,4 are already in cache)
+        let fetched = remote.fetched_chunk_indices().await;
+        // 5 attempts in first parallel fetch (indices 0..4), plus chunk 2 retry = 6 total
+        assert_eq!(
+            fetched.len(),
+            6,
+            "5 chunks in first read (incl. failed chunk 2) + 1 retry on second read"
+        );
+        // Chunk 2 was attempted twice (first read + second read retry)
+        let chunk2_count = fetched.iter().filter(|&&i| i == 2).count();
+        assert_eq!(
+            chunk2_count, 2,
+            "chunk 2 should be attempted twice (once in each read)"
+        );
+        // All other chunks should appear exactly once (first read)
+        for c in &[0u32, 1, 3, 4] {
+            let count = fetched.iter().filter(|&&i| i == *c).count();
+            assert_eq!(count, 1, "chunk {} should appear only once (first read)", c);
+        }
+
+        // Verify merkle_drill was called only once (first read)
+        assert_eq!(
+            remote.get_merkle_drill_call_count().await,
+            1,
+            "merkle_drill should not be called during second read (cached manifest)"
         );
     }
 }
