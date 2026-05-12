@@ -69,6 +69,10 @@ pub struct MockRemote {
     stat_batch_called: Mutex<u32>,
     /// Handles passed to the most recent `stat_batch` call.
     last_stat_batch_args: Mutex<Option<Vec<Uuid>>>,
+    /// Number of times `merkle_drill` was called.
+    merkle_drill_called: Mutex<u32>,
+    /// Hashes passed to every `merkle_drill` call, in order.
+    all_merkle_drill_hashes: Mutex<Vec<Vec<u8>>>,
 }
 
 impl MockRemote {
@@ -97,6 +101,8 @@ impl Default for MockRemote {
             last_read_chunk_arg: Mutex::new(None),
             stat_batch_called: Mutex::new(0),
             last_stat_batch_args: Mutex::new(None),
+            merkle_drill_called: Mutex::new(0),
+            all_merkle_drill_hashes: Mutex::new(Vec::new()),
         }
     }
 }
@@ -219,6 +225,16 @@ impl MockRemote {
     pub async fn get_last_stat_batch_args(&self) -> Option<Vec<Uuid>> {
         self.last_stat_batch_args.lock().await.clone()
     }
+
+    /// Return the number of times `merkle_drill` was called.
+    pub async fn get_merkle_drill_call_count(&self) -> u32 {
+        *self.merkle_drill_called.lock().await
+    }
+
+    /// Return all hashes from every `merkle_drill` call, in order.
+    pub async fn get_all_merkle_drill_hashes(&self) -> Vec<Vec<u8>> {
+        self.all_merkle_drill_hashes.lock().await.clone()
+    }
 }
 
 #[async_trait]
@@ -300,6 +316,11 @@ impl RemoteShare for MockRemote {
     }
 
     async fn merkle_drill(&self, _handle: Uuid, hash: &[u8]) -> anyhow::Result<MerkleDrillResult> {
+        *self.merkle_drill_called.lock().await += 1;
+        self.all_merkle_drill_hashes
+            .lock()
+            .await
+            .push(hash.to_vec());
         let mut map = self.merkle_drill_results.lock().await;
         map.remove(hash)
             .or_else(|| map.remove(&vec![]))
