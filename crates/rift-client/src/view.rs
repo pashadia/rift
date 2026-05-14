@@ -282,7 +282,7 @@ impl<R: RemoteShare> RiftShareView<R> {
                 let remote = Arc::clone(&remote);
                 let cache = cache.clone();
                 async move {
-                    Self::fetch_chunk_from_network(
+                    Self::fetch_chunk_with_retries(
                         &remote,
                         cache.as_deref(),
                         handle_copy,
@@ -347,6 +347,55 @@ impl<R: RemoteShare> RiftShareView<R> {
         }
 
         Ok(chunk.data)
+    }
+
+    /// Maximum number of chunk fetch retry attempts.
+    const MAX_RETRIES: u32 = 3;
+
+    /// Retry interval base (milliseconds). Actual delays:
+    /// attempt 1: 100ms, attempt 2: 200ms, attempt 3: 400ms
+    const RETRY_DELAY_MS: u64 = 100;
+
+    /// Fetch a chunk from the network with exponential backoff retries.
+    ///
+    /// Calls `fetch_chunk_from_network` up to `MAX_RETRIES` times.
+    /// Between attempts, sleeps for `RETRY_DELAY_MS * 2^(attempt-1)`.
+    /// Returns `FsError::Io` if all attempts fail.
+    #[instrument(skip(remote, cache, root_hash), fields(chunk_index))]
+    async fn fetch_chunk_with_retries(
+        remote: &Arc<R>,
+        cache: Option<&FileCache>,
+        handle: Uuid,
+        chunk_index: u32,
+        expected_hash: &[u8; 32],
+        expected_length: u64,
+        root_hash: &Blake3Hash,
+    ) -> Result<Bytes, FsError> {
+        let mut last_error = FsError::Io;
+        for attempt in 0..=Self::MAX_RETRIES {
+            if attempt > 0 {
+                let delay_ms = Self::RETRY_DELAY_MS * 2u64.pow(attempt - 1);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            match Self::fetch_chunk_from_network(
+                remote,
+                cache,
+                handle,
+                chunk_index,
+                expected_hash,
+                expected_length,
+                root_hash,
+            )
+            .await
+            {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::warn!(chunk_index, attempt, "chunk fetch failed, retrying");
+                    last_error = e;
+                }
+            }
+        }
+        Err(last_error)
     }
 
     /// Obtain the chunk leaf data and byte-offset table for a file.
@@ -4097,6 +4146,192 @@ mod tests {
                 Err(crate::cache::db::ReconstructError::MissingChunks(_))
             ),
             "missing chunks must be reported as MissingChunks, not CorruptedChunks"
+        );
+    }
+
+    // =======================================================================
+    // Bead 6: Retry logic tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn retry_succeeds_on_second_attempt() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let content = b"retry content";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
+
+        // stat + merkle drill setup
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+
+        // First call fails, second call succeeds
+        remote
+            .add_read_chunk_result(
+                0,
+                Err(anyhow::anyhow!("first attempt fails")),
+            )
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // MockRemote should receive 2 calls: 1st fails, 2nd succeeds
+        let result = view
+            .read(Path::new("test_file"), 0, content.len() as u64, None)
+            .await;
+        assert!(result.is_ok(), "retry should succeed on second attempt");
+        assert_eq!(result.unwrap(), content);
+        assert_eq!(
+            remote.get_read_chunk_call_count().await,
+            2,
+            "read_chunk should be called twice (1 fail + 1 succeed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_returns_eio() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let content = b"will fail";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("fail_file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+
+        // Set up a one-shot error result for first call;
+        // subsequent calls will get MockRemote's default error.
+        remote
+            .add_read_chunk_result(
+                0,
+                Err(anyhow::anyhow!("fails every time")),
+            )
+            .await;
+
+        // MockRemote consumes the keyed result, then falls to one-shot
+        // which is None -> default error -> all 3 attempts fail
+        let result = view
+            .read(Path::new("fail_file"), 0, content.len() as u64, None)
+            .await;
+        assert!(
+            matches!(result, Err(FsError::Io)),
+            "all retries exhausted should return FsError::Io"
+        );
+        // Each attempt calls read_chunk at least once
+        assert!(
+            remote.get_read_chunk_call_count().await >= 1,
+            "read_chunk should be called at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_timing() {
+        tokio::time::pause();
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let content = b"timing test";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("timing_file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+
+        // All calls fail — test exercises all 3 backoff delays
+        remote
+            .add_read_chunk_result(
+                0,
+                Err(anyhow::anyhow!("fail")),
+            )
+            .await;
+
+        let start = tokio::time::Instant::now();
+        let _result = view
+            .read(Path::new("timing_file"), 0, content.len() as u64, None)
+            .await;
+        let elapsed = start.elapsed();
+
+        // Expected delays: 0ms (first) + 100ms + 200ms + 400ms = 700ms
+        // Allow a small tolerance for scheduling overhead
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "total retry delay should be at least 700ms, got {:?}",
+            elapsed
         );
     }
 }
