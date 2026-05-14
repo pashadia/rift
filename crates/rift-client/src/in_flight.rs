@@ -23,13 +23,10 @@ use tokio::sync::oneshot;
 /// Type alias for the waiter list shared between the first caller and waiters.
 type WaiterList = Arc<Mutex<Vec<oneshot::Sender<Result<Bytes, FsError>>>>>;
 
-/// Entry state for an in-flight chunk fetch.
-/// Currently only `Pending` is used; entries are removed from the map
-/// after produce completes. Future iterations may add `Completed` to
-/// cache results briefly for late arrivals.
-enum EntryState {
-    /// A fetch is in progress. Waiters are collected in the oneshot list.
-    Pending { waiters: WaiterList },
+/// An in-flight chunk fetch with registered waiters.
+struct InFlightEntry {
+    /// Waiters registered while the fetch is in progress.
+    waiters: WaiterList,
 }
 
 /// A deduplication layer for concurrent chunk fetches keyed by BLAKE3 hash.
@@ -39,7 +36,7 @@ enum EntryState {
 /// the waiter list and await the result. After produce completes, the result
 /// is sent to all registered waiters, and the entry is removed from the map.
 pub struct InFlightChunks {
-    map: HashMap<[u8; 32], EntryState>,
+    map: HashMap<[u8; 32], InFlightEntry>,
 }
 
 impl InFlightChunks {
@@ -64,39 +61,36 @@ impl InFlightChunks {
         loop {
             match self.map.entry_async(*hash).await {
                 scc::hash_map::Entry::Occupied(entry) => {
-                    match entry.get() {
-                        EntryState::Pending { waiters } => {
-                            // Register our oneshot sender while holding the
-                            // bucket lock. This guarantees the first caller
-                            // will see our sender when it drains the list.
-                            let (tx, rx) = oneshot::channel();
-                            {
-                                let mut list = match waiters.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                list.push(tx);
-                            }
-                            // Release the bucket lock so the first caller can
-                            // finish (send results, remove entry).
-                            drop(entry);
+                    let waiters = &entry.get().waiters;
+                    // Register our oneshot sender while holding the
+                    // bucket lock. This guarantees the first caller
+                    // will see our sender when it drains the list.
+                    let (tx, rx) = oneshot::channel();
+                    {
+                        let mut list = match waiters.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        list.push(tx);
+                    }
+                    // Release the bucket lock so the first caller can
+                    // finish (send results, remove entry).
+                    drop(entry);
 
-                            // Await the result.
-                            match rx.await {
-                                Ok(Ok(data)) => return Ok(data),
-                                Ok(Err(_)) => return Err(FsError::Io),
-                                Err(_) => {
-                                    // First caller dropped the sender without
-                                    // sending — loop back and try again.
-                                }
-                            }
+                    // Await the result.
+                    match rx.await {
+                        Ok(Ok(data)) => return Ok(data),
+                        Ok(Err(_)) => return Err(FsError::Io),
+                        Err(_) => {
+                            // First caller dropped the sender without
+                            // sending — loop back and try again.
                         }
                     }
                 }
                 scc::hash_map::Entry::Vacant(entry) => {
                     // We are first — insert a pending entry.
                     let waiters = Arc::new(Mutex::new(Vec::new()));
-                    entry.insert_entry(EntryState::Pending {
+                    entry.insert_entry(InFlightEntry {
                         waiters: Arc::clone(&waiters),
                     });
                     // Bucket lock released when the temporary OccupiedEntry
@@ -149,17 +143,17 @@ impl Default for InFlightChunks {
     }
 }
 
-/// RAII guard that removes a `Pending` entry from the map on drop.
+/// RAII guard that removes an in-flight entry from the map on drop.
 /// Call `guard.remove()` once the entry has been successfully drained
 /// and removed to disable automatic cleanup.
 struct EntryGuard<'a> {
-    map: &'a HashMap<[u8; 32], EntryState>,
+    map: &'a HashMap<[u8; 32], InFlightEntry>,
     hash: [u8; 32],
     removed: bool,
 }
 
 impl<'a> EntryGuard<'a> {
-    fn new(map: &'a HashMap<[u8; 32], EntryState>, hash: [u8; 32]) -> Self {
+    fn new(map: &'a HashMap<[u8; 32], InFlightEntry>, hash: [u8; 32]) -> Self {
         Self {
             map,
             hash,
