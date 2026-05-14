@@ -46,7 +46,7 @@ pub trait ShareView: Send + Sync + 'static {
         offset: u64,
         length: u64,
         cached_root_hash: Option<&[u8]>,
-    ) -> Result<Vec<u8>, FsError>;
+    ) -> Result<Bytes, FsError>;
 
     /// Reads the target of a symbolic link by path.
     /// Returns the symlink target as a String.
@@ -261,7 +261,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             match cache.get_chunk(leaf.hash.as_bytes()).await {
                 Ok(Some(data)) => {
                     if Blake3Hash::new(&data) == leaf.hash && data.len() as u64 == leaf.length {
-                        return Ok(Bytes::from(data));
+                        return Ok(data);
                     }
                     tracing::warn!(
                         chunk_index = leaf.chunk_index,
@@ -454,19 +454,13 @@ impl<R: RemoteShare> RiftShareView<R> {
     ///
     /// This is a pure byte-slicing operation - no I/O.
     #[allow(clippy::cast_possible_truncation)]
-    fn slice_chunk(
-        data: &[u8],
-        chunk_start: u64,
-        chunk_len: u64,
-        offset: u64,
-        end: u64,
-    ) -> Vec<u8> {
+    fn slice_chunk(data: &Bytes, chunk_start: u64, chunk_len: u64, offset: u64, end: u64) -> Bytes {
         let slice_start = offset.saturating_sub(chunk_start) as usize;
         let slice_end = (end.min(chunk_start + chunk_len) - chunk_start) as usize;
         if slice_start < slice_end && slice_end <= data.len() {
-            data[slice_start..slice_end].to_vec()
+            data.slice(slice_start..slice_end)
         } else {
-            Vec::new()
+            Bytes::new()
         }
     }
 }
@@ -669,7 +663,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         offset: u64,
         length: u64,
         _cached_root_hash: Option<&[u8]>,
-    ) -> Result<Vec<u8>, FsError> {
+    ) -> Result<Bytes, FsError> {
         let handle = self.resolve_path(path)?;
 
         let (file_size, merkle_root) = match self.stat_file(handle).await {
@@ -685,7 +679,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         };
 
         if file_size == 0 || offset >= file_size || length == 0 {
-            return Ok(vec![]);
+            return Ok(Bytes::new());
         }
 
         let end = offset.saturating_add(length).min(file_size);
@@ -707,7 +701,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         let (start_chunk, end_chunk) = calculate_chunk_range(&chunk_starts, offset, end)?;
         let chunk_count = end_chunk - start_chunk;
         if chunk_count == 0 {
-            return Ok(vec![]);
+            return Ok(Bytes::new());
         }
 
         // Parallel chunk fetch: up to 8 at a time.
@@ -755,8 +749,6 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         }
 
         // Reassemble in order
-        let needed = usize::try_from(end - offset).unwrap_or(0);
-        let mut result = Vec::with_capacity(needed.max(1));
         let results = match Arc::try_unwrap(chunk_data) {
             Ok(mutex) => mutex.into_inner(),
             Err(arc) => {
@@ -769,12 +761,31 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 std::mem::take(&mut *locked)
             }
         };
+
+        // Fast path: single-chunk read returns zero-copy Bytes slice
+        if start_chunk + 1 == end_chunk {
+            let data = results[0]
+                .as_ref()
+                .expect("all chunks must succeed if no failure flag");
+            let leaf = &leaves[start_chunk as usize];
+            return Ok(Self::slice_chunk(
+                data,
+                chunk_starts[start_chunk as usize],
+                leaf.length,
+                offset,
+                end,
+            ));
+        }
+
+        // Multi-chunk: assemble into contiguous buffer
+        let needed = usize::try_from(end - offset).unwrap_or(0);
+        let mut buf = Vec::with_capacity(needed.max(1));
         for (i, idx) in (start_chunk..end_chunk).enumerate() {
             let data = results[i]
                 .as_ref()
                 .expect("all chunks must succeed if no failure flag");
             let leaf = &leaves[idx as usize];
-            result.extend(Self::slice_chunk(
+            buf.extend_from_slice(&Self::slice_chunk(
                 data,
                 chunk_starts[idx as usize],
                 leaf.length,
@@ -783,7 +794,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             ));
         }
 
-        Ok(result)
+        Ok(Bytes::from(buf))
     }
 
     #[instrument(skip(self), fields(path = %path.display()))]
@@ -968,12 +979,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         }
     }
 
-    async fn try_read_from_cache(
-        &self,
-        handle: &Uuid,
-        offset: u64,
-        length: u64,
-    ) -> Option<Vec<u8>> {
+    async fn try_read_from_cache(&self, handle: &Uuid, offset: u64, length: u64) -> Option<Bytes> {
         let cache = self.cache.as_ref()?;
         let manifest = cache.get_manifest(handle).await.ok()??;
 
@@ -988,7 +994,7 @@ impl<R: RemoteShare> RiftShareView<R> {
         manifest: &crate::cache::db::Manifest,
         offset: u64,
         length: u64,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Bytes> {
         let file_size: u64 = manifest.chunks.iter().map(|c| c.length).sum();
         if !manifest_covers_range(&manifest.chunks, offset, length, file_size) {
             tracing::debug!("offline read: manifest does not cover requested range");
@@ -1002,8 +1008,8 @@ impl<R: RemoteShare> RiftShareView<R> {
     }
 
     fn log_reconstruct_offline(
-        result: Result<Vec<u8>, crate::cache::db::ReconstructError>,
-    ) -> Option<Vec<u8>> {
+        result: Result<Bytes, crate::cache::db::ReconstructError>,
+    ) -> Option<Bytes> {
         match result {
             Ok(data) => {
                 tracing::debug!("offline read: served {} bytes from cache", data.len());
@@ -1282,7 +1288,7 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(&result.unwrap()[..], &content[..]);
 
         assert_eq!(
             remote.fetched_chunk_indices().await,
@@ -2841,7 +2847,7 @@ mod tests {
             .read(Path::new("file"), 0, content.len() as u64, None)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(&result.unwrap()[..], &content[..]);
 
         // Verify that read_chunks was called (server was contacted)
         assert_eq!(
@@ -2916,7 +2922,7 @@ mod tests {
         let result = view
             .read(Path::new("file"), 0, content.len() as u64, None)
             .await;
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(&result.unwrap()[..], &content[..]);
 
         // Re-set mock results for second read (MockRemote consumes them)
         remote
@@ -2952,7 +2958,7 @@ mod tests {
         let result = view
             .read(Path::new("file"), 0, content.len() as u64, None)
             .await;
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(&result.unwrap()[..], &content[..]);
 
         // Both reads should have fetched chunk 0 from the server
         assert_eq!(
@@ -4065,7 +4071,11 @@ mod tests {
             .await
             .expect("read should succeed");
 
-        assert_eq!(result, content, "read must return original content");
+        assert_eq!(
+            &result[..],
+            &content[..],
+            "read must return original content"
+        );
     }
 
     #[tokio::test]
@@ -4299,7 +4309,11 @@ mod tests {
             .expect("read should succeed");
 
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
-        assert_eq!(result, expected, "full file read must return correct data");
+        assert_eq!(
+            &result[..],
+            &expected[..],
+            "full file read must return correct data"
+        );
 
         let mut fetched = remote.fetched_chunk_indices().await;
         fetched.sort();
@@ -4751,7 +4765,11 @@ mod tests {
             .expect("first read should succeed");
 
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
-        assert_eq!(result, expected, "first read data must be correct");
+        assert_eq!(
+            &result[..],
+            &expected[..],
+            "first read data must be correct"
+        );
 
         // merkle_drill was called once during first read
         assert_eq!(
@@ -4772,7 +4790,11 @@ mod tests {
             .await
             .expect("second read should succeed from cache");
 
-        assert_eq!(result, expected, "second read data must be correct");
+        assert_eq!(
+            &result[..],
+            &expected[..],
+            "second read data must be correct"
+        );
 
         // merkle_drill must still have been called only once — the second
         // read hit the cached manifest and skipped the drill.
@@ -4889,7 +4911,11 @@ mod tests {
             .expect("second read should succeed");
 
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
-        assert_eq!(result, expected, "second read data must be correct");
+        assert_eq!(
+            &result[..],
+            &expected[..],
+            "second read data must be correct"
+        );
 
         // Verify only chunk 2 was fetched on the second read
         // (all 5 chunks are attempted in the first parallel fetch;

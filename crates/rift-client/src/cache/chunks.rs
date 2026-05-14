@@ -89,10 +89,10 @@ impl ChunkStore {
     }
 
     /// Read a chunk from disk. Returns `None` if the chunk doesn't exist.
-    pub async fn read_chunk(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
+    pub async fn read_chunk(&self, hash: &[u8; 32]) -> io::Result<Option<Bytes>> {
         let path = hash_to_path(&self.base_dir, hash);
         match tokio::fs::read(&path).await {
-            Ok(data) => Ok(Some(data)),
+            Ok(data) => Ok(Some(Bytes::from(data))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -120,7 +120,7 @@ impl ChunkStore {
         hash: &[u8; 32],
         range_offset: u64,
         len: usize,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> io::Result<Option<Bytes>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let path = hash_to_path(&self.base_dir, hash);
 
@@ -135,7 +135,7 @@ impl ChunkStore {
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf).await?;
 
-        Ok(Some(buf))
+        Ok(Some(Bytes::from(buf)))
     }
 
     /// Verify a stored chunk's file size matches `expected_len`.
@@ -257,7 +257,7 @@ mod tests {
 
         store.write_chunk(&hash, data).await.unwrap();
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -332,7 +332,7 @@ mod tests {
         store.write_chunk(&hash, data).await.unwrap();
 
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -386,8 +386,8 @@ mod tests {
         // Both chunks should be readable and contain correct data
         let result1 = store1.read_chunk(&hash1).await.unwrap();
         let result2 = store2.read_chunk(&hash2).await.unwrap();
-        assert_eq!(result1, Some(data1.to_vec()));
-        assert_eq!(result2, Some(data2.to_vec()));
+        assert_eq!(result1.as_ref().map(|b| &b[..]), Some(&data1[..]));
+        assert_eq!(result2.as_ref().map(|b| &b[..]), Some(&data2[..]));
     }
 
     #[tokio::test]
@@ -459,7 +459,7 @@ mod tests {
 
         // Content should still be correct
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -484,7 +484,7 @@ mod tests {
 
         // Verify file was rewritten with correct content
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(new_data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&new_data[..]));
     }
 
     #[tokio::test]
@@ -519,7 +519,7 @@ mod tests {
             .await
             .unwrap();
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -540,7 +540,7 @@ mod tests {
             .unwrap();
 
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -562,8 +562,11 @@ mod tests {
         let result2 = store1.read_chunk(&hash).await.unwrap();
 
         // Both paths should produce identical on-disk data
-        assert_eq!(result1, result2);
-        assert_eq!(result1, Some(data.to_vec()));
+        assert_eq!(
+            result1.as_ref().map(|b| &b[..]),
+            result2.as_ref().map(|b| &b[..])
+        );
+        assert_eq!(result1.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     // ── read_chunk_range tests ───────────────────────────────────────
@@ -599,7 +602,7 @@ mod tests {
             .await
             .unwrap()
             .expect("chunk exists");
-        assert_eq!(result, b"hello");
+        assert_eq!(&result[..], b"hello");
     }
 
     #[tokio::test]
@@ -665,6 +668,6 @@ mod tests {
             .await
             .unwrap()
             .expect("chunk exists");
-        assert_eq!(full_range, full);
+        assert_eq!(&full_range[..], &full[..]);
     }
 }

@@ -210,9 +210,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
             .await
             .map_err(|e| to_errno(&e))?;
 
-        Ok(ReplyData {
-            data: Bytes::from(data),
-        })
+        Ok(ReplyData { data })
     }
 
     /// Read the target of a symlink.
@@ -278,7 +276,7 @@ mod tests {
             _offset: u64,
             _length: u64,
             _cached_root_hash: Option<&[u8]>,
-        ) -> Result<Vec<u8>, FsError> {
+        ) -> Result<Bytes, FsError> {
             Err(FsError::NotFound)
         }
 

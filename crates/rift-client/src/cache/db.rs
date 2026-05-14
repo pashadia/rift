@@ -345,7 +345,7 @@ impl FileCache {
     ///
     /// Delegates to `ChunkStore::read_chunk`. Returns an error if the cache was
     /// opened in-memory (no chunk storage available).
-    pub async fn get_chunk(&self, hash: &[u8; 32]) -> SqliteResult<Option<Vec<u8>>> {
+    pub async fn get_chunk(&self, hash: &[u8; 32]) -> SqliteResult<Option<Bytes>> {
         let store = self.chunk_store.as_ref().ok_or_else(|| {
             rusqlite::Error::InvalidParameterName(
                 "get_chunk requires a ChunkStore; use FileCache::open(), not open_in_memory()"
@@ -400,9 +400,9 @@ impl FileCache {
         offset: u64,
         length: u64,
         file_size: u64,
-    ) -> Result<Vec<u8>, ReconstructError> {
+    ) -> Result<Bytes, ReconstructError> {
         if offset >= file_size || length == 0 {
-            return Ok(vec![]);
+            return Ok(Bytes::new());
         }
 
         if !chunks.windows(2).all(|w| w[0].offset <= w[1].offset) {
@@ -411,13 +411,13 @@ impl FileCache {
 
         let end = offset.saturating_add(length).min(file_size);
         let Some(first_idx) = chunks.iter().position(|c| c.offset + c.length > offset) else {
-            return Ok(vec![]);
+            return Ok(Bytes::new());
         };
         let Some(last_idx) = chunks.iter().rposition(|c| c.offset < end) else {
-            return Ok(vec![]);
+            return Ok(Bytes::new());
         };
         if first_idx > last_idx {
-            return Ok(vec![]);
+            return Ok(Bytes::new());
         }
 
         let mut result =
@@ -474,7 +474,7 @@ impl FileCache {
         } else if !missing.is_empty() {
             Err(ReconstructError::MissingChunks(missing))
         } else {
-            Ok(result)
+            Ok(Bytes::from(result))
         }
     }
 }
@@ -576,7 +576,7 @@ mod tests {
 
         // Read the entire file via reconstruct_range
         let result = cache.reconstruct_range(&chunks, 0, 11, 11).await.unwrap();
-        assert_eq!(result, b"hello world");
+        assert_eq!(&result[..], b"hello world");
     }
 
     #[tokio::test]
@@ -1233,7 +1233,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            result, chunk0_data,
+            &result[..],
+            &chunk0_data[..],
             "full file read with u64::MAX length should work"
         );
     }
@@ -1250,7 +1251,7 @@ mod tests {
 
         cache.put_chunk_bytes(&hash, data.clone()).await.unwrap();
         let result = cache.get_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -1262,7 +1263,10 @@ mod tests {
         let cache = FileCache::open(tmp.path()).await.unwrap();
         cache.put_chunk_bytes(&hash, data_bytes).await.unwrap();
         let result = cache.get_chunk(&hash).await.unwrap();
-        assert_eq!(result, Some(b"equiv test".to_vec()));
+        assert_eq!(
+            result.as_ref().map(|b| &b[..]),
+            Some(b"equiv test" as &[u8])
+        );
     }
 
     /// Verify `reconstruct_range` uses partial reads and matches full-read results.
@@ -1355,6 +1359,6 @@ mod tests {
         assert_eq!(loaded_manifest.chunks[0].hash, chunk_hash);
 
         let loaded_chunk = cache2.get_chunk(&chunk_hash).await.unwrap();
-        assert_eq!(loaded_chunk, Some(chunk_data.to_vec()));
+        assert_eq!(loaded_chunk.as_ref().map(|b| &b[..]), Some(&chunk_data[..]));
     }
 }
