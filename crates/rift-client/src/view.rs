@@ -357,6 +357,11 @@ impl<R: RemoteShare> RiftShareView<R> {
         Ok(chunk.data)
     }
 
+    /// Maximum number of concurrent chunk fetch operations.
+    /// 8 was chosen to balance parallelism against server load and memory usage
+    /// (8 × 512 KB max chunk = 4 MB in-flight data per read).
+    const MAX_CONCURRENT_CHUNK_FETCHES: usize = 8;
+
     /// Maximum number of chunk fetch retry attempts.
     const MAX_RETRIES: u32 = 3;
 
@@ -366,7 +371,8 @@ impl<R: RemoteShare> RiftShareView<R> {
 
     /// Fetch a chunk from the network with exponential backoff retries.
     ///
-    /// Calls `fetch_chunk_from_network` up to `MAX_RETRIES` times.
+    /// Calls `fetch_chunk_from_network` up to `MAX_RETRIES + 1` times
+    /// (1 initial attempt + up to `MAX_RETRIES` retries).
     /// Between attempts, sleeps for `RETRY_DELAY_MS * 2^(attempt-1)`.
     /// Returns `FsError::Io` if all attempts fail.
     #[instrument(skip(remote, cache, root_hash), fields(chunk_index))]
@@ -500,16 +506,20 @@ fn build_chunk_starts(leaves: &[ResolvedLeaf], file_size: u64) -> Result<Vec<u64
 /// Find the chunk index range `[start_chunk, end_chunk)` that covers `[offset, end)`.
 ///
 /// Uses `partition_point` for O(log n) lookup.
-fn calculate_chunk_range(chunk_starts: &[u64], offset: u64, end: u64) -> (u32, u32) {
+fn calculate_chunk_range(
+    chunk_starts: &[u64],
+    offset: u64,
+    end: u64,
+) -> Result<(u32, u32), FsError> {
     let start_chunk = u32::try_from(
         chunk_starts
             .partition_point(|&s| s <= offset)
             .saturating_sub(1),
     )
-    .expect("chunk index fits in u32");
+    .map_err(|_| FsError::Io)?;
     let end_chunk =
-        u32::try_from(chunk_starts.partition_point(|&s| s < end)).expect("chunk index fits in u32");
-    (start_chunk, end_chunk)
+        u32::try_from(chunk_starts.partition_point(|&s| s < end)).map_err(|_| FsError::Io)?;
+    Ok((start_chunk, end_chunk))
 }
 
 fn build_dir_entry(
@@ -674,7 +684,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             Err(_) => return Err(FsError::Io),
         };
 
-        if file_size == 0 || offset >= file_size {
+        if file_size == 0 || offset >= file_size || length == 0 {
             return Ok(vec![]);
         }
 
@@ -694,7 +704,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             }
         }
 
-        let (start_chunk, end_chunk) = calculate_chunk_range(&chunk_starts, offset, end);
+        let (start_chunk, end_chunk) = calculate_chunk_range(&chunk_starts, offset, end)?;
         let chunk_count = end_chunk - start_chunk;
         if chunk_count == 0 {
             return Ok(vec![]);
@@ -710,8 +720,12 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         let any_failed = Arc::new(AtomicBool::new(false));
         let leaves_arc = Arc::new(leaves.clone());
 
+        // NOTE: We do not short-circuit on failure. Successful chunks are cached
+        // regardless of sibling failures, which benefits retries. With MAX_RETRIES=3
+        // and exponential backoff, transient errors are retried before the entire
+        // read is failed.
         stream::iter(start_chunk..end_chunk)
-            .for_each_concurrent(8, |idx| {
+            .for_each_concurrent(Self::MAX_CONCURRENT_CHUNK_FETCHES, |idx| {
                 let chunk_data = chunk_data.clone();
                 let any_failed = any_failed.clone();
                 let leaves_arc = leaves_arc.clone();
@@ -743,9 +757,18 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         // Reassemble in order
         let needed = usize::try_from(end - offset).unwrap_or(0);
         let mut result = Vec::with_capacity(needed.max(1));
-        let results = Arc::try_unwrap(chunk_data)
-            .expect("all references dropped after for_each_concurrent")
-            .into_inner();
+        let results = match Arc::try_unwrap(chunk_data) {
+            Ok(mutex) => mutex.into_inner(),
+            Err(arc) => {
+                // for_each_concurrent should have completed, but if an Arc clone
+                // leaked (e.g., due to cancellation), fall back to locking.
+                tracing::error!("Arc::try_unwrap failed — leaked references remain");
+                let mut locked = arc.lock().await;
+                // We can't drain a Vec<Option<Bytes>> from behind a MutexGuard easily,
+                // so take ownership via std::mem::take
+                std::mem::take(&mut *locked)
+            }
+        };
         for (i, idx) in (start_chunk..end_chunk).enumerate() {
             let data = results[i]
                 .as_ref()
@@ -1007,7 +1030,9 @@ mod tests {
     use bytes::Bytes;
     use rift_common::crypto::{Blake3Hash, MerkleChild, MerkleTree};
     use rift_protocol::messages::{FileType, ReaddirEntry};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn make_file_attrs(size: u64, root_hash: [u8; 32]) -> FileAttrs {
         FileAttrs {
@@ -3937,7 +3962,7 @@ mod tests {
     #[test]
     fn calculate_chunk_range_start_of_file() {
         let starts = vec![0u64, 64, 128, 160];
-        let (s, e) = calculate_chunk_range(&starts, 0, 64);
+        let (s, e) = calculate_chunk_range(&starts, 0, 64).unwrap();
         assert_eq!(s, 0);
         assert_eq!(e, 1);
     }
@@ -3945,7 +3970,7 @@ mod tests {
     #[test]
     fn calculate_chunk_range_middle_of_file() {
         let starts = vec![0u64, 64, 128, 160];
-        let (s, e) = calculate_chunk_range(&starts, 65, 160);
+        let (s, e) = calculate_chunk_range(&starts, 65, 160).unwrap();
         assert_eq!(s, 1);
         assert_eq!(e, 3);
     }
@@ -3953,7 +3978,7 @@ mod tests {
     #[test]
     fn calculate_chunk_range_exact_boundary() {
         let starts = vec![0u64, 64, 128, 160];
-        let (s, e) = calculate_chunk_range(&starts, 64, 128);
+        let (s, e) = calculate_chunk_range(&starts, 64, 128).unwrap();
         assert_eq!(s, 1);
         assert_eq!(e, 2);
     }
@@ -4892,5 +4917,423 @@ mod tests {
             1,
             "merkle_drill should not be called during second read (cached manifest)"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_length_read_returns_empty_no_fetch() {
+        let content = b"hello world this is definitely longer than zero bytes";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+
+        let result = view.read(Path::new("file"), 50, 0, None).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+        assert!(
+            remote.fetched_chunk_indices().await.is_empty(),
+            "zero-length read should not fetch any chunks"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_reads_same_chunk_single_network_fetch() {
+        let content = b"single chunk file data";
+        let (_chunk_hashes, root_hash, chunk_data_vec) =
+            build_mock_chunks(&[content.to_vec()]);
+        let chunk_data = chunk_data_vec.into_iter().next().unwrap();
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(ConcurrentReadRemote::new(
+            Duration::from_millis(200),
+            root_hash,
+            chunk_data,
+        ));
+        let view = Arc::new(RiftShareView::new(remote.clone(), root));
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        let view2 = Arc::clone(&view);
+        let handle1 = tokio::spawn(async move {
+            view.read(Path::new("file"), 0, content.len() as u64, None).await
+        });
+        let handle2 = tokio::spawn(async move {
+            view2.read(Path::new("file"), 0, content.len() as u64, None).await
+        });
+
+        let (r1, r2) = tokio::join!(handle1, handle2);
+        let data1 = r1.expect("task 1 panicked").expect("read 1 should succeed");
+        let data2 = r2.expect("task 2 panicked").expect("read 2 should succeed");
+        assert_eq!(data1, content.to_vec());
+        assert_eq!(data2, content.to_vec());
+        assert_eq!(
+            remote.get_read_chunk_call_count(),
+            1,
+            "concurrent reads of the same chunk should result in a single network fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_cleans_up() {
+        let content = b"hello world";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+
+        // Keyed error consumed on first attempt; subsequent retries hit fallback error.
+        remote
+            .add_read_chunk_result(0, Err(anyhow::anyhow!("chunk 0 always fails")))
+            .await;
+
+        let result = view
+            .read(Path::new("file"), 0, content.len() as u64, None)
+            .await;
+        assert!(matches!(result, Err(FsError::Io)));
+
+        assert_eq!(
+            remote.get_read_chunk_call_count().await,
+            4,
+            "chunk 0 should be attempted 4 times (1 initial + 3 retries)"
+        );
+    }
+
+    // Simple counting remote used only for timing/backoff tests.
+    struct RetryRemote {
+        calls: AtomicU32,
+        hash: [u8; 32],
+        root_hash: [u8; 32],
+    }
+
+    impl RetryRemote {
+        fn new(hash: [u8; 32], root_hash: [u8; 32]) -> Self {
+            Self {
+                calls: AtomicU32::new(0),
+                hash,
+                root_hash,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteShare for RetryRemote {
+        async fn lookup(
+            &self,
+            _parent_handle: Uuid,
+            _name: &str,
+        ) -> anyhow::Result<(Uuid, FileAttrs)> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn readdir(&self, _handle: Uuid) -> anyhow::Result<Vec<ReaddirEntry>> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn stat_batch(
+            &self,
+            _handles: Vec<Uuid>,
+        ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn read_chunk(
+            &self,
+            _handle: Uuid,
+            _chunk_index: u32,
+        ) -> anyhow::Result<ChunkReadResult> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < 3 {
+                Err(anyhow::anyhow!("fail {call}"))
+            } else {
+                Ok(ChunkReadResult {
+                    chunks: vec![ChunkData {
+                        index: 0,
+                        length: 5,
+                        hash: self.hash,
+                        data: Bytes::from_static(b"hello"),
+                    }],
+                    merkle_root: self.root_hash.to_vec(),
+                })
+            }
+        }
+
+        async fn read_chunks_streaming(
+            &self,
+            _handle: Uuid,
+            _start_chunk: u32,
+            _chunk_count: u32,
+            _on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
+        ) -> anyhow::Result<Vec<u8>> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn merkle_drill(
+            &self,
+            _handle: Uuid,
+            _hash: &[u8],
+        ) -> anyhow::Result<MerkleDrillResult> {
+            Err(anyhow::anyhow!("not used"))
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_timing() {
+        let hash = blake3_of(b"hello");
+        let root_hash = hash;
+        let remote = Arc::new(RetryRemote::new(hash, root_hash));
+
+        let start = std::time::Instant::now();
+        let result = RiftShareView::<RetryRemote>::fetch_chunk_with_retries(
+            &remote,
+            None,
+            Uuid::now_v7(),
+            0,
+            &hash,
+            5,
+            &Blake3Hash::from_array(hash),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "4th attempt should succeed");
+        assert_eq!(
+            remote.calls.load(Ordering::SeqCst),
+            4,
+            "should make 4 attempts"
+        );
+        // Total sleep: 100 + 200 + 400 = 700ms
+        assert!(
+            elapsed >= Duration::from_millis(650) && elapsed <= Duration::from_millis(1500),
+            "backoff timing should be approximately correct (expected ~700ms, got {:?})",
+            elapsed
+        );
+    }
+
+    // Custom remote for concurrent-read dedup tests.
+    struct ConcurrentReadRemote {
+        read_chunk_calls: AtomicU32,
+        delay: Duration,
+        root_hash: [u8; 32],
+        chunk_data: ChunkData,
+    }
+
+    impl ConcurrentReadRemote {
+        fn new(delay: Duration, root_hash: [u8; 32], chunk_data: ChunkData) -> Self {
+            Self {
+                read_chunk_calls: AtomicU32::new(0),
+                delay,
+                root_hash,
+                chunk_data,
+            }
+        }
+
+        fn get_read_chunk_call_count(&self) -> u32 {
+            self.read_chunk_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteShare for ConcurrentReadRemote {
+        async fn lookup(
+            &self,
+            _parent_handle: Uuid,
+            _name: &str,
+        ) -> anyhow::Result<(Uuid, FileAttrs)> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn readdir(&self, _handle: Uuid) -> anyhow::Result<Vec<ReaddirEntry>> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn stat_batch(
+            &self,
+            handles: Vec<Uuid>,
+        ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
+            Ok(handles
+                .into_iter()
+                .map(|_| Ok(make_file_attrs(self.chunk_data.length, self.root_hash)))
+                .collect())
+        }
+
+        async fn read_chunk(
+            &self,
+            _handle: Uuid,
+            _chunk_index: u32,
+        ) -> anyhow::Result<ChunkReadResult> {
+            self.read_chunk_calls.fetch_add(1, Ordering::SeqCst);
+            if self.delay > Duration::ZERO {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: self.chunk_data.index,
+                    length: self.chunk_data.length,
+                    hash: self.chunk_data.hash,
+                    data: self.chunk_data.data.clone(),
+                }],
+                merkle_root: self.root_hash.to_vec(),
+            })
+        }
+
+        async fn read_chunks_streaming(
+            &self,
+            _handle: Uuid,
+            _start_chunk: u32,
+            _chunk_count: u32,
+            _on_chunk: Box<dyn FnMut(ChunkData) -> anyhow::Result<()> + Send>,
+        ) -> anyhow::Result<Vec<u8>> {
+            Err(anyhow::anyhow!("not used"))
+        }
+
+        async fn merkle_drill(
+            &self,
+            _handle: Uuid,
+            hash: &[u8],
+        ) -> anyhow::Result<MerkleDrillResult> {
+            if hash.is_empty() {
+                Ok(MerkleDrillResult {
+                    parent_hash: self.root_hash.to_vec(),
+                    children: vec![MerkleChildInfo {
+                        is_subtree: false,
+                        hash: self.chunk_data.hash.to_vec(),
+                        length: self.chunk_data.length,
+                        chunk_index: self.chunk_data.index,
+                    }],
+                })
+            } else {
+                Err(anyhow::anyhow!("unexpected hash"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_chunk_failures_aggregate() {
+        let num_chunks = 5usize;
+        let chunk_size = 100usize;
+        let chunks_data: Vec<Vec<u8>> =
+            (0..num_chunks).map(|i| vec![i as u8; chunk_size]).collect();
+        let (chunk_hashes, root_hash, _all_chunks) = build_mock_chunks(&chunks_data);
+        let file_size = (num_chunks * chunk_size) as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let root_uuid = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::with_cache(remote.clone(), root_uuid, cache_dir)
+            .await
+            .expect("with_cache should succeed");
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("file"), file_uuid)
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| MerkleChildInfo {
+                        is_subtree: false,
+                        hash: h.to_vec(),
+                        length: chunk_size as u64,
+                        chunk_index: i as u32,
+                    })
+                    .collect(),
+            }))
+            .await;
+
+        for (i, chunk_data) in chunks_data.iter().enumerate() {
+            let idx = i as u32;
+            if i == 1 || i == 3 {
+                remote
+                    .add_read_chunk_result(idx, Err(anyhow::anyhow!("chunk {i} failed")))
+                    .await;
+            } else {
+                remote
+                    .add_read_chunk_result(
+                        idx,
+                        Ok(ChunkReadResult {
+                            chunks: vec![ChunkData {
+                                index: idx,
+                                length: chunk_size as u64,
+                                hash: chunk_hashes[i],
+                                data: Bytes::from(chunk_data.clone()),
+                            }],
+                            merkle_root: root_hash.to_vec(),
+                        }),
+                    )
+                    .await;
+            }
+        }
+
+        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        assert!(matches!(result, Err(FsError::Io)));
+
+        let cache = view.cache().expect("cache should be enabled");
+        for i in [0u32, 2, 4] {
+            let hash = chunk_hashes[i as usize];
+            let found = cache.get_chunk(&hash).await.unwrap();
+            assert!(
+                found.is_some(),
+                "chunk {i} should be cached after successful fetch"
+            );
+        }
+        for i in [1u32, 3] {
+            let hash = chunk_hashes[i as usize];
+            let found = cache.get_chunk(&hash).await.unwrap();
+            assert!(
+                found.is_none(),
+                "chunk {i} should NOT be cached after failed fetch"
+            );
+        }
     }
 }
