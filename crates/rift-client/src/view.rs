@@ -555,6 +555,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         self.cache_symlink_target_if_present(&path_to_relative(path), &attrs)
             .await;
 
+        self.handles.insert_attrs(handle, &attrs).await;
+
         Ok(attrs)
     }
 
@@ -574,6 +576,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             parent_relative.join(name)
         };
         self.handles.insert(child_path.clone(), child_uuid).await;
+        self.handles.insert_attrs(child_uuid, &attrs).await;
 
         // Cache symlink target if this entry is a symlink with a non-empty target
         self.cache_symlink_target_if_present(&child_path, &attrs)
@@ -620,6 +623,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
         let dir_relative = path_to_relative(path);
 
         // Build DirEntry for each entry using stat_batch results for attrs.
+        // Also warm the metadata cache inline while attrs are in scope.
         let mut results: Vec<(DirEntry, std::path::PathBuf, Uuid, Option<String>)> =
             Vec::with_capacity(pairs.len());
 
@@ -633,7 +637,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
                 None => continue,
             };
             let (dir_entry, child_path, symlink_target) =
-                build_dir_entry(entry, attrs, &dir_relative);
+                build_dir_entry(entry, attrs.clone(), &dir_relative);
+            self.handles.insert_attrs(*child_uuid, &attrs).await;
             results.push((dir_entry, child_path, *child_uuid, symlink_target));
         }
 
@@ -1343,6 +1348,190 @@ mod tests {
         assert_eq!(
             remote.get_stat_batch_call_count().await, 0,
             "read must skip stat_batch when attrs are cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn getattr_warms_metadata_cache_so_read_skips_stat_batch() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
+
+        let content = b"getattr warms cache";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // Call getattr first — this should warm the metadata cache
+        let attrs = view.getattr(Path::new("test_file")).await.unwrap();
+        assert_eq!(attrs.size, content.len() as u64);
+        assert_eq!(remote.get_stat_batch_call_count().await, 1);
+
+        // Subsequent read should skip its internal stat_batch
+        let result = view.read(Path::new("test_file"), 0, content.len() as u64).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &content[..]);
+        assert_eq!(
+            remote.get_stat_batch_call_count().await, 1,
+            "read must not call stat_batch when getattr warmed the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_warms_metadata_cache_so_read_skips_stat_batch() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let parent_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("."), parent_uuid)
+            .await;
+
+        let file_uuid = Uuid::now_v7();
+        let content = b"lookup warms cache";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        remote
+            .set_lookup(Ok((file_uuid, make_file_attrs(content.len() as u64, root_hash))))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // Call lookup first — this should warm the metadata cache
+        let attrs = view.lookup(Path::new("."), "file").await.unwrap();
+        assert_eq!(attrs.size, content.len() as u64);
+        assert_eq!(remote.get_stat_batch_call_count().await, 0);
+
+        // Subsequent read should skip stat_batch
+        let result = view.read(Path::new("file"), 0, content.len() as u64).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &content[..]);
+        assert_eq!(
+            remote.get_stat_batch_call_count().await, 0,
+            "read must not call stat_batch when lookup warmed the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn readdir_warms_metadata_cache_so_read_skips_stat_batch() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let dir_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("."), dir_uuid)
+            .await;
+
+        let file_uuid = Uuid::now_v7();
+        let content = b"readdir warms cache";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        remote
+            .set_readdir(Ok(vec![ReaddirEntry {
+                name: "file.txt".to_string(),
+                file_type: rift_protocol::messages::FileType::Regular as i32,
+                handle: file_uuid.as_bytes().to_vec(),
+            }]))
+            .await;
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // Call readdir first — this should warm the metadata cache
+        let entries = view.readdir(Path::new(".")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "file.txt");
+        assert_eq!(remote.get_stat_batch_call_count().await, 1);
+
+        // Subsequent read should skip stat_batch
+        let result = view.read(Path::new("file.txt"), 0, content.len() as u64).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &content[..]);
+        assert_eq!(
+            remote.get_stat_batch_call_count().await, 1,
+            "read must not call stat_batch when readdir warmed the cache"
         );
     }
 
