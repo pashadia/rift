@@ -23,7 +23,10 @@ use tokio::sync::oneshot;
 /// Type alias for the waiter list shared between the first caller and waiters.
 type WaiterList = Arc<Mutex<Vec<oneshot::Sender<Result<Bytes, FsError>>>>>;
 
-/// Internal state for an in-flight chunk.
+/// Entry state for an in-flight chunk fetch.
+/// Currently only `Pending` is used; entries are removed from the map
+/// after produce completes. Future iterations may add `Completed` to
+/// cache results briefly for late arrivals.
 enum EntryState {
     /// A fetch is in progress. Waiters are collected in the oneshot list.
     Pending { waiters: WaiterList },
@@ -68,7 +71,10 @@ impl InFlightChunks {
                             // will see our sender when it drains the list.
                             let (tx, rx) = oneshot::channel();
                             {
-                                let mut list = waiters.lock().expect("waiter mutex not poisoned");
+                                let mut list = match waiters.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
                                 list.push(tx);
                             }
                             // Release the bucket lock so the first caller can
@@ -96,8 +102,14 @@ impl InFlightChunks {
                     // Bucket lock released when the temporary OccupiedEntry
                     // (returned by insert_entry) is dropped at the ';'.
 
+                    // Ensure cleanup even if produce() panics or the future is cancelled.
+                    let guard = EntryGuard::new(&self.map, *hash);
+
                     // Yield so other tasks can register their oneshot senders
                     // before we run produce.
+                    // NOTE: yield_now() is best-effort. If no waiters register before produce()
+                    // completes, deduplication is lost for that batch but correctness is preserved —
+                    // the entry is removed on completion and subsequent requests start fresh.
                     tokio::task::yield_now().await;
 
                     // Run the produce function.
@@ -109,7 +121,10 @@ impl InFlightChunks {
                         Err(_) => Err(FsError::Io),
                     };
                     {
-                        let mut list = waiters.lock().expect("waiter mutex not poisoned");
+                        let mut list = match waiters.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         for sender in list.drain(..) {
                             let _ = sender.send(send_result.clone());
                         }
@@ -119,6 +134,7 @@ impl InFlightChunks {
                     // On success, the disk cache serves subsequent hits.
                     // On error, retries start fresh.
                     self.map.remove_async(hash).await;
+                    guard.remove();
 
                     return result;
                 }
@@ -130,6 +146,38 @@ impl InFlightChunks {
 impl Default for InFlightChunks {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII guard that removes a `Pending` entry from the map on drop.
+/// Call `guard.remove()` once the entry has been successfully drained
+/// and removed to disable automatic cleanup.
+struct EntryGuard<'a> {
+    map: &'a HashMap<[u8; 32], EntryState>,
+    hash: [u8; 32],
+    removed: bool,
+}
+
+impl<'a> EntryGuard<'a> {
+    fn new(map: &'a HashMap<[u8; 32], EntryState>, hash: [u8; 32]) -> Self {
+        Self {
+            map,
+            hash,
+            removed: false,
+        }
+    }
+
+    /// Mark the entry as explicitly removed so the drop is a no-op.
+    fn remove(mut self) {
+        self.removed = true;
+    }
+}
+
+impl Drop for EntryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.map.remove_sync(&self.hash);
+        }
     }
 }
 
@@ -337,5 +385,56 @@ mod tests {
         assert!(ho.await.unwrap().is_ok());
         assert_eq!(counter_err.load(Ordering::SeqCst), 1);
         assert_eq!(counter_ok.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn _assert_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<InFlightChunks>();
+        assert_sync::<InFlightChunks>();
+    }
+
+    #[tokio::test]
+    async fn panic_in_produce_removes_pending_entry() {
+        let inflight = Arc::new(InFlightChunks::new());
+        let hash = [0x06u8; 32];
+
+        let handle = tokio::spawn({
+            let inflight = Arc::clone(&inflight);
+            async move {
+                inflight.get_or_fetch(&hash, || async { panic!("boom") }).await
+            }
+        });
+
+        let join_result = handle.await;
+        assert!(join_result.is_err());
+        assert!(join_result.unwrap_err().is_panic());
+
+        let entry = inflight.map.entry_async(hash).await;
+        assert!(
+            matches!(entry, scc::hash_map::Entry::Vacant(_)),
+            "Pending entry must be removed after producer panics"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_produce_removes_entry() {
+        let inflight = Arc::new(InFlightChunks::new());
+        let hash = [0x07u8; 32];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            inflight.get_or_fetch(&hash, || std::future::pending::<Result<Bytes, FsError>>()),
+        )
+        .await;
+
+        assert!(result.is_err(), "expected timeout");
+
+        let entry = inflight.map.entry_async(hash).await;
+        assert!(
+            matches!(entry, scc::hash_map::Entry::Vacant(_)),
+            "Pending entry must be removed after cancellation"
+        );
     }
 }
