@@ -654,8 +654,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
     async fn read(&self, path: &Path, offset: u64, length: u64) -> Result<Bytes, FsError> {
         let handle = self.resolve_path(path)?;
 
-        let (file_size, merkle_root) = match self.stat_file(handle).await {
-            Ok(result) => result,
+        let attrs = match self.stat_file(handle).await {
+            Ok(attrs) => attrs,
             Err(_) if self.cache().is_some() => {
                 // Offline fallback - try cache without network
                 if let Some(data) = self.try_read_from_cache(&handle, offset, length).await {
@@ -665,6 +665,8 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
             }
             Err(_) => return Err(FsError::Io),
         };
+        let file_size = attrs.size;
+        let merkle_root = attrs.root_hash;
 
         if file_size == 0 || offset >= file_size || length == 0 {
             return Ok(Bytes::new());
@@ -882,7 +884,10 @@ fn manifest_covers_range(chunks: &[ChunkInfo], offset: u64, length: u64, file_si
 }
 
 impl<R: RemoteShare> RiftShareView<R> {
-    async fn stat_file(&self, handle: Uuid) -> Result<(u64, Vec<u8>), FsError> {
+    async fn stat_file(&self, handle: Uuid) -> Result<FileAttrs, FsError> {
+        if let Some(attrs) = self.handles.get_attrs(&handle) {
+            return Ok(attrs);
+        }
         let mut results = self
             .remote
             .stat_batch(vec![handle])
@@ -892,7 +897,8 @@ impl<R: RemoteShare> RiftShareView<R> {
         if attrs.root_hash.is_empty() {
             return Err(FsError::Io);
         }
-        Ok((attrs.size, attrs.root_hash))
+        self.handles.insert_attrs(handle, &attrs).await;
+        Ok(attrs)
     }
 
     /// Build a [`Manifest`] from resolved leaf information and chunk start offsets.
@@ -1282,6 +1288,117 @@ mod tests {
             remote.fetched_chunk_indices().await,
             vec![0u32],
             "non-cached read should fetch chunk 0 from server"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_skips_stat_batch_when_attrs_cached() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
+
+        let content = b"cached attrs skip stat";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        // Warm the metadata cache so stat_file should skip stat_batch
+        let attrs = make_file_attrs(content.len() as u64, root_hash);
+        view.handles.insert_attrs(file_uuid, &attrs).await;
+
+        // Still need drill + chunk for the read to succeed
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        let result = view
+            .read(Path::new("test_file"), 0, content.len() as u64)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &content[..]);
+        assert_eq!(
+            remote.get_stat_batch_call_count().await, 0,
+            "read must skip stat_batch when attrs are cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_uses_stat_batch_when_attrs_not_cached() {
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        let file_uuid = Uuid::now_v7();
+        view.handles
+            .insert(std::path::PathBuf::from("test_file"), file_uuid)
+            .await;
+
+        let content = b"fallback to stat_batch";
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(
+                content.len() as u64,
+                root_hash,
+            ))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hash.to_vec(),
+                    length: content.len() as u64,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: content.len() as u64,
+                    hash: chunk_hash,
+                    data: Bytes::from(&content[..]),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        let result = view
+            .read(Path::new("test_file"), 0, content.len() as u64)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &content[..]);
+        assert_eq!(
+            remote.get_stat_batch_call_count().await, 1,
+            "read must call stat_batch when attrs are not cached"
         );
     }
 
