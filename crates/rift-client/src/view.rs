@@ -1259,6 +1259,30 @@ mod tests {
                 root_hash,
             ))]))
             .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
+
+        let result = view
+            .read(Path::new("test_file"), 0, content.len() as u64)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &content[..]);
+
+        assert_eq!(
+            remote.fetched_chunk_indices().await,
+            vec![0u32],
+            "non-cached read should fetch chunk 0 from server"
+        );
+    }
+
+    // Helper: wire up a single-chunk mock file on `remote`.
+    // Returns the root hash and chunk hash for assertions.
+    async fn setup_single_chunk_file_mock(
+        remote: &MockRemote,
+        content: &'static [u8],
+    ) -> ([u8; 32], [u8; 32]) {
+        let chunk_hash = blake3_of(content);
+        let root_hash = chunk_hash;
         remote
             .set_merkle_drill(Ok(MerkleDrillResult {
                 parent_hash: root_hash.to_vec(),
@@ -1276,24 +1300,12 @@ mod tests {
                     index: 0,
                     length: content.len() as u64,
                     hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
+                    data: Bytes::from(content),
                 }],
                 merkle_root: root_hash.to_vec(),
             }))
             .await;
-
-        let result = view
-            .read(Path::new("test_file"), 0, content.len() as u64)
-            .await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), &content[..]);
-
-        assert_eq!(
-            remote.fetched_chunk_indices().await,
-            vec![0u32],
-            "non-cached read should fetch chunk 0 from server"
-        );
+        (chunk_hash, root_hash)
     }
 
     #[tokio::test]
@@ -1316,28 +1328,7 @@ mod tests {
         view.handles.insert_attrs(file_uuid, &attrs).await;
 
         // Still need drill + chunk for the read to succeed
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)
@@ -1372,28 +1363,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         // Call getattr first — this should warm the metadata cache
         let attrs = view.getattr(Path::new("test_file")).await.unwrap();
@@ -1429,28 +1399,7 @@ mod tests {
         remote
             .set_lookup(Ok((file_uuid, make_file_attrs(content.len() as u64, root_hash))))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         // Call lookup first — this should warm the metadata cache
         let attrs = view.lookup(Path::new("."), "file").await.unwrap();
@@ -1496,28 +1445,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         // Call readdir first — this should warm the metadata cache
         let entries = view.readdir(Path::new(".")).await.unwrap();
@@ -1556,28 +1484,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)
@@ -3113,28 +3020,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         // First read: should go to server, but NOT write to cache
         let result = view.read(Path::new("file"), 0, content.len() as u64).await;
@@ -3187,28 +3073,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         // First read
         let result = view.read(Path::new("file"), 0, content.len() as u64).await;
@@ -3221,28 +3086,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         // Second read - should also go to server in no_cache mode
         let result = view.read(Path::new("file"), 0, content.len() as u64).await;
@@ -4331,28 +4175,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        remote
-            .set_merkle_drill(Ok(MerkleDrillResult {
-                parent_hash: root_hash.to_vec(),
-                children: vec![MerkleChildInfo {
-                    is_subtree: false,
-                    hash: chunk_hash.to_vec(),
-                    length: content.len() as u64,
-                    chunk_index: 0,
-                }],
-            }))
-            .await;
-        remote
-            .set_read_chunk(Ok(ChunkReadResult {
-                chunks: vec![ChunkData {
-                    index: 0,
-                    length: content.len() as u64,
-                    hash: chunk_hash,
-                    data: Bytes::from(&content[..]),
-                }],
-                merkle_root: root_hash.to_vec(),
-            }))
-            .await;
+        setup_single_chunk_file_mock(&*remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)

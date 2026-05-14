@@ -150,16 +150,9 @@ impl HandleCache {
 
     /// Look up cached metadata for a handle. Returns `None` if missing or expired.
     pub fn get_attrs(&self, handle: &Uuid) -> Option<FileAttrs> {
-        self.map
-            .metadata
-            .peek_with(handle, |_, (attrs, inserted)| {
-                if inserted.elapsed() < METADATA_CACHE_TTL {
-                    Some(attrs.clone())
-                } else {
-                    None
-                }
-            })
-            .flatten()
+        self.map.metadata.peek_with(handle, |_, (attrs, inserted)| {
+            (inserted.elapsed() < METADATA_CACHE_TTL).then(|| attrs.clone())
+        })?
     }
 
     pub async fn clear(&self) {
