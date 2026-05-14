@@ -350,7 +350,7 @@ impl<R: RemoteShare> RiftShareView<R> {
                 .put_chunk_bytes(expected_hash, chunk.data.clone())
                 .await
             {
-                tracing::warn!(chunk_index, error = %e, "failed to cache chunk");
+                tracing::error!(chunk_index, error = %e, "failed to cache chunk");
             }
         }
 
