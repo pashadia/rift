@@ -576,7 +576,7 @@ mod tests {
 
         // Read the entire file via reconstruct_range
         let result = cache.reconstruct_range(&chunks, 0, 11, 11).await.unwrap();
-        assert_eq!(&result[..], b"hello world");
+        assert_eq!(result, b"hello world" as &[u8]);
     }
 
     #[tokio::test]
@@ -1233,7 +1233,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            &result[..],
+            result,
             &chunk0_data[..],
             "full file read with u64::MAX length should work"
         );
@@ -1251,7 +1251,7 @@ mod tests {
 
         cache.put_chunk_bytes(&hash, data.clone()).await.unwrap();
         let result = cache.get_chunk(&hash).await.unwrap();
-        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
+        assert_eq!(result.as_deref(), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -1359,6 +1359,6 @@ mod tests {
         assert_eq!(loaded_manifest.chunks[0].hash, chunk_hash);
 
         let loaded_chunk = cache2.get_chunk(&chunk_hash).await.unwrap();
-        assert_eq!(loaded_chunk.as_ref().map(|b| &b[..]), Some(&chunk_data[..]));
+        assert_eq!(loaded_chunk.as_deref(), Some(&chunk_data[..]));
     }
 }

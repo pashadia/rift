@@ -332,7 +332,7 @@ mod tests {
         store.write_chunk(&hash, data).await.unwrap();
 
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
+        assert_eq!(result.as_deref(), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -386,8 +386,8 @@ mod tests {
         // Both chunks should be readable and contain correct data
         let result1 = store1.read_chunk(&hash1).await.unwrap();
         let result2 = store2.read_chunk(&hash2).await.unwrap();
-        assert_eq!(result1.as_ref().map(|b| &b[..]), Some(&data1[..]));
-        assert_eq!(result2.as_ref().map(|b| &b[..]), Some(&data2[..]));
+        assert_eq!(result1.as_deref(), Some(&data1[..]));
+        assert_eq!(result2.as_deref(), Some(&data2[..]));
     }
 
     #[tokio::test]
@@ -459,7 +459,7 @@ mod tests {
 
         // Content should still be correct
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
+        assert_eq!(result.as_deref(), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -484,7 +484,7 @@ mod tests {
 
         // Verify file was rewritten with correct content
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&new_data[..]));
+        assert_eq!(result.as_deref(), Some(&new_data[..]));
     }
 
     #[tokio::test]
@@ -519,7 +519,7 @@ mod tests {
             .await
             .unwrap();
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
+        assert_eq!(result.as_deref(), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -540,7 +540,7 @@ mod tests {
             .unwrap();
 
         let result = store.read_chunk(&hash).await.unwrap();
-        assert_eq!(result.as_ref().map(|b| &b[..]), Some(&data[..]));
+        assert_eq!(result.as_deref(), Some(&data[..]));
     }
 
     #[tokio::test]
@@ -566,7 +566,7 @@ mod tests {
             result1.as_ref().map(|b| &b[..]),
             result2.as_ref().map(|b| &b[..])
         );
-        assert_eq!(result1.as_ref().map(|b| &b[..]), Some(&data[..]));
+        assert_eq!(result1.as_deref(), Some(&data[..]));
     }
 
     // ── read_chunk_range tests ───────────────────────────────────────
@@ -602,7 +602,7 @@ mod tests {
             .await
             .unwrap()
             .expect("chunk exists");
-        assert_eq!(&result[..], b"hello");
+        assert_eq!(result, b"hello" as &[u8]);
     }
 
     #[tokio::test]

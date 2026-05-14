@@ -408,7 +408,7 @@ async fn client_reconnect_preserves_cached_data() {
         "first read should succeed: {:?}",
         content.err()
     );
-    assert_eq!(&content.unwrap()[..], b"hello rift");
+    assert_eq!(content.unwrap(), b"hello rift" as &[u8]);
 
     // Close the underlying connection
     reconnecting.close_connection_for_test();
@@ -850,8 +850,5 @@ async fn client_cache_persists_across_sessions() {
         .get_chunk(&loaded_manifest.chunks[0].hash)
         .await
         .unwrap();
-    assert_eq!(
-        loaded_chunk.as_ref().map(|b| &b[..]),
-        Some(b"hello rift" as &[u8])
-    );
+    assert_eq!(loaded_chunk.as_deref(), Some(b"hello rift" as &[u8]));
 }

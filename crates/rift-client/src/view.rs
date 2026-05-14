@@ -1288,7 +1288,7 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(&result.unwrap()[..], &content[..]);
+        assert_eq!(result.unwrap(), &content[..]);
 
         assert_eq!(
             remote.fetched_chunk_indices().await,
@@ -2847,7 +2847,7 @@ mod tests {
             .read(Path::new("file"), 0, content.len() as u64, None)
             .await;
         assert!(result.is_ok());
-        assert_eq!(&result.unwrap()[..], &content[..]);
+        assert_eq!(result.unwrap(), &content[..]);
 
         // Verify that read_chunks was called (server was contacted)
         assert_eq!(
@@ -2922,7 +2922,7 @@ mod tests {
         let result = view
             .read(Path::new("file"), 0, content.len() as u64, None)
             .await;
-        assert_eq!(&result.unwrap()[..], &content[..]);
+        assert_eq!(result.unwrap(), &content[..]);
 
         // Re-set mock results for second read (MockRemote consumes them)
         remote
@@ -2958,7 +2958,7 @@ mod tests {
         let result = view
             .read(Path::new("file"), 0, content.len() as u64, None)
             .await;
-        assert_eq!(&result.unwrap()[..], &content[..]);
+        assert_eq!(result.unwrap(), &content[..]);
 
         // Both reads should have fetched chunk 0 from the server
         assert_eq!(
@@ -4071,11 +4071,7 @@ mod tests {
             .await
             .expect("read should succeed");
 
-        assert_eq!(
-            &result[..],
-            &content[..],
-            "read must return original content"
-        );
+        assert_eq!(result, &content[..], "read must return original content");
     }
 
     #[tokio::test]
@@ -4310,7 +4306,7 @@ mod tests {
 
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
         assert_eq!(
-            &result[..],
+            result,
             &expected[..],
             "full file read must return correct data"
         );
@@ -4765,11 +4761,7 @@ mod tests {
             .expect("first read should succeed");
 
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
-        assert_eq!(
-            &result[..],
-            &expected[..],
-            "first read data must be correct"
-        );
+        assert_eq!(result, &expected[..], "first read data must be correct");
 
         // merkle_drill was called once during first read
         assert_eq!(
@@ -4790,11 +4782,7 @@ mod tests {
             .await
             .expect("second read should succeed from cache");
 
-        assert_eq!(
-            &result[..],
-            &expected[..],
-            "second read data must be correct"
-        );
+        assert_eq!(result, &expected[..], "second read data must be correct");
 
         // merkle_drill must still have been called only once — the second
         // read hit the cached manifest and skipped the drill.
@@ -4911,11 +4899,7 @@ mod tests {
             .expect("second read should succeed");
 
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
-        assert_eq!(
-            &result[..],
-            &expected[..],
-            "second read data must be correct"
-        );
+        assert_eq!(result, &expected[..], "second read data must be correct");
 
         // Verify only chunk 2 was fetched on the second read
         // (all 5 chunks are attempted in the first parallel fetch;
@@ -5420,6 +5404,6 @@ mod tests {
 
         // The result must be a Bytes of length 50 with the correct data
         assert_eq!(result.len(), 50);
-        assert_eq!(&result[..], &chunk_data[100..150]);
+        assert_eq!(result, &chunk_data[100..150]);
     }
 }
