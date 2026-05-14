@@ -1,6 +1,12 @@
+use rift_protocol::messages::FileAttrs;
 use scc::TreeIndex;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::time::Instant;
 use uuid::Uuid;
+
+/// TTL for cached metadata entries. Matches the FUSE kernel cache TTL.
+pub const METADATA_CACHE_TTL: Duration = Duration::from_secs(1);
 
 /// A many-to-one bidirectional mapping between paths and UUID handles.
 ///
@@ -18,6 +24,9 @@ pub struct HandleMap {
     /// Maps symlink paths to their target paths.
     /// Only populated for entries where `file_type == SYMLINK`.
     symlink_targets: TreeIndex<PathBuf, String>,
+    /// Cached metadata (FileAttrs) keyed by UUID with TTL expiration.
+    /// Used to skip stat_batch round-trips in read().
+    metadata: TreeIndex<Uuid, (FileAttrs, Instant)>,
 }
 
 impl Default for HandleMap {
@@ -34,6 +43,7 @@ impl HandleMap {
             path_to_uuid: TreeIndex::new(),
             uuid_to_path: TreeIndex::new(),
             symlink_targets: TreeIndex::new(),
+            metadata: TreeIndex::new(),
         }
     }
 
@@ -79,6 +89,7 @@ impl HandleMap {
         self.path_to_uuid.clear();
         self.uuid_to_path.clear();
         self.symlink_targets.clear();
+        self.metadata.clear();
     }
 }
 
@@ -127,6 +138,28 @@ impl HandleCache {
     /// Look up the symlink target for a path. Lock-free, O(log n).
     pub fn get_symlink_target(&self, path: &Path) -> Option<String> {
         self.map.get_symlink_target(path)
+    }
+
+    /// Insert cached metadata for a handle. Refreshes the TTL timestamp.
+    pub async fn insert_attrs(&self, handle: Uuid, attrs: &FileAttrs) {
+        self.map
+            .metadata
+            .upsert_async(handle, (attrs.clone(), Instant::now()))
+            .await;
+    }
+
+    /// Look up cached metadata for a handle. Returns `None` if missing or expired.
+    pub fn get_attrs(&self, handle: &Uuid) -> Option<FileAttrs> {
+        self.map
+            .metadata
+            .peek_with(handle, |_, (attrs, inserted)| {
+                if inserted.elapsed() < METADATA_CACHE_TTL {
+                    Some(attrs.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 
     pub async fn clear(&self) {
@@ -407,5 +440,347 @@ mod tests {
             None,
             "non-symlink path should return None"
         );
+    }
+
+    // =====================================================================
+    // Metadata cache tests
+    // =====================================================================
+
+    fn make_file_attrs(size: u64) -> FileAttrs {
+        FileAttrs {
+            size,
+            root_hash: vec![0u8; 32],
+            file_type: rift_protocol::messages::FileType::Regular as i32,
+            nlinks: 1,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            ..Default::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Category A: Basic CRUD
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_attrs_returns_none_for_unknown_uuid() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let unknown = make_uuid(99);
+        assert_eq!(cache.get_attrs(&unknown), None);
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_fresh_attrs() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+        assert_eq!(cache.get_attrs(&handle), Some(attrs));
+    }
+
+    #[tokio::test]
+    async fn metadata_is_keyed_by_uuid_not_path() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let shared = make_uuid(1);
+        let attrs = make_file_attrs(42);
+
+        cache.insert(PathBuf::from("path_a"), shared).await;
+        cache.insert(PathBuf::from("path_b"), shared).await;
+        cache.insert_attrs(shared, &attrs).await;
+
+        // Same UUID, different paths — metadata shared
+        assert_eq!(cache.get_attrs(&shared), Some(attrs));
+    }
+
+    #[tokio::test]
+    async fn root_uuid_can_have_cached_attrs() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let attrs = make_file_attrs(99);
+        cache.insert_attrs(root, &attrs).await;
+        assert_eq!(cache.get_attrs(&root), Some(attrs));
+    }
+
+    // ------------------------------------------------------------------
+    // Category C: Overwrites
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn insert_attrs_overwrites_existing() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let old_attrs = make_file_attrs(10);
+        let new_attrs = make_file_attrs(20);
+
+        cache.insert_attrs(handle, &old_attrs).await;
+        cache.insert_attrs(handle, &new_attrs).await;
+        assert_eq!(cache.get_attrs(&handle), Some(new_attrs));
+    }
+
+    #[tokio::test]
+    async fn insert_attrs_renews_timestamp_on_same_content() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(10);
+
+        cache.insert_attrs(handle, &attrs).await;
+        cache.insert_attrs(handle, &attrs).await;
+        assert_eq!(cache.get_attrs(&handle), Some(attrs));
+    }
+
+    // ------------------------------------------------------------------
+    // Category B: TTL / Expiration
+    // ------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn get_attrs_returns_some_at_half_ttl() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+
+        tokio::time::advance(super::METADATA_CACHE_TTL / 2).await;
+        assert_eq!(cache.get_attrs(&handle), Some(attrs));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_attrs_returns_some_just_before_ttl() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+
+        tokio::time::advance(super::METADATA_CACHE_TTL - Duration::from_millis(1)).await;
+        assert_eq!(cache.get_attrs(&handle), Some(attrs));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_attrs_returns_none_after_ttl() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+
+        tokio::time::advance(super::METADATA_CACHE_TTL + Duration::from_millis(1)).await;
+        assert_eq!(cache.get_attrs(&handle), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attrs_present_then_expires() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+
+        // Phase 1: immediately present
+        assert_eq!(cache.get_attrs(&handle), Some(attrs.clone()));
+
+        // Phase 2: after TTL, gone
+        tokio::time::advance(super::METADATA_CACHE_TTL + Duration::from_millis(1)).await;
+        assert_eq!(cache.get_attrs(&handle), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_renews_ttl() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(10);
+
+        cache.insert_attrs(handle, &attrs).await;
+        tokio::time::advance(super::METADATA_CACHE_TTL / 2).await;
+        // Re-insert should reset TTL
+        cache.insert_attrs(handle, &attrs).await;
+        // Now advance past the original TTL but not the renewed one
+        tokio::time::advance(super::METADATA_CACHE_TTL / 2 + Duration::from_millis(1)).await;
+        // Total time elapsed: TTL + 1ms, but second insert was at TTL/2, so
+        // time since second insert is TTL/2 + 1ms which is < TTL
+        assert_eq!(cache.get_attrs(&handle), Some(attrs));
+    }
+
+    // ------------------------------------------------------------------
+    // Category D: Clear
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn clear_removes_all_metadata() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+
+        cache.clear().await;
+        assert_eq!(cache.get_attrs(&handle), None);
+    }
+
+    #[tokio::test]
+    async fn clear_preserves_root_path_but_not_root_metadata() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let attrs = make_file_attrs(99);
+        cache.insert_attrs(root, &attrs).await;
+
+        cache.clear().await;
+        assert_eq!(cache.get_attrs(&root), None);
+        assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
+    }
+
+    // ------------------------------------------------------------------
+    // Category E: Concurrency / Race conditions
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_insert_and_get_attrs() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handles: Vec<Uuid> = (0..10).map(|i| make_uuid(i)).collect();
+        let cache = std::sync::Arc::new(cache);
+
+        let mut writers = vec![];
+        for (i, &handle) in handles.iter().enumerate() {
+            let c = cache.clone();
+            writers.push(tokio::spawn(async move {
+                let attrs = make_file_attrs(i as u64);
+                c.insert_attrs(handle, &attrs).await;
+            }));
+        }
+
+        let mut readers = vec![];
+        for &handle in &handles {
+            let c = cache.clone();
+            readers.push(tokio::spawn(async move {
+                // May see None if read races before write
+                c.get_attrs(&handle)
+            }));
+        }
+
+        for t in writers {
+            t.await.unwrap();
+        }
+        for t in readers {
+            // After all writers complete, readers should eventually see Some
+            let _ = t.await.unwrap();
+        }
+
+        // Final verification: all entries are present
+        for (i, &handle) in handles.iter().enumerate() {
+            let attrs = cache.get_attrs(&handle).expect("entry must exist after all writers");
+            assert_eq!(attrs.size, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_insert_same_uuid() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let cache = std::sync::Arc::new(cache);
+        let mut tasks = vec![];
+
+        for i in 0..20 {
+            let c = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                let attrs = make_file_attrs(i as u64);
+                c.insert_attrs(handle, &attrs).await;
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // Must return *a* valid entry, not panic
+        let result = cache.get_attrs(&handle);
+        assert!(result.is_some());
+        // With upsert semantics, the last writer wins, but any value is acceptable.
+        // The assertion we care about is: no panic, no corruption.
+    }
+
+    #[tokio::test]
+    async fn clear_concurrent_with_get_attrs() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+        cache.insert_attrs(handle, &attrs).await;
+
+        let cache = std::sync::Arc::new(cache);
+        let c1 = cache.clone();
+        let c2 = cache.clone();
+
+        let reader = tokio::spawn(async move {
+            // Read repeatedly while clear runs
+            for _ in 0..100 {
+                let _ = c1.get_attrs(&handle);
+            }
+        });
+
+        let clearer = tokio::spawn(async move {
+            c2.clear().await;
+        });
+
+        let _ = tokio::join!(reader, clearer);
+        // No panic is the real assertion
+    }
+
+    // ------------------------------------------------------------------
+    // Category F: Isolation / Non-interference
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn insert_attrs_does_not_affect_path_mappings() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+
+        cache.insert_attrs(handle, &attrs).await;
+
+        // Path mappings should be untouched
+        assert_eq!(cache.get_by_path(Path::new(".")), Some(root));
+        assert_eq!(cache.get_by_path(Path::new("hello")), None);
+        assert_eq!(cache.get_by_handle(&handle), None);
+    }
+
+    #[tokio::test]
+    async fn path_reinsertion_does_not_touch_metadata() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle = make_uuid(1);
+        let attrs = make_file_attrs(42);
+
+        cache.insert(PathBuf::from("file.txt"), handle).await;
+        cache.insert_attrs(handle, &attrs).await;
+
+        // Re-insert same path→UUID should not invalidate metadata
+        cache.insert(PathBuf::from("file.txt"), handle).await;
+        assert_eq!(cache.get_attrs(&handle), Some(attrs));
+    }
+
+    #[tokio::test]
+    async fn metadata_for_different_uuids_is_independent() {
+        let root = Uuid::now_v7();
+        let cache = HandleCache::new(root);
+        let handle_a = make_uuid(1);
+        let handle_b = make_uuid(2);
+        let attrs_a = make_file_attrs(100);
+        let attrs_b = make_file_attrs(200);
+
+        cache.insert_attrs(handle_a, &attrs_a).await;
+        cache.insert_attrs(handle_b, &attrs_b).await;
+
+        assert_eq!(cache.get_attrs(&handle_a), Some(attrs_a));
+        assert_eq!(cache.get_attrs(&handle_b), Some(attrs_b));
     }
 }
