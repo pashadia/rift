@@ -403,7 +403,9 @@ mod tests {
         let handle = tokio::spawn({
             let inflight = Arc::clone(&inflight);
             async move {
-                inflight.get_or_fetch(&hash, || async { panic!("boom") }).await
+                inflight
+                    .get_or_fetch(&hash, || async { panic!("boom") })
+                    .await
             }
         });
 
@@ -425,7 +427,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            inflight.get_or_fetch(&hash, || std::future::pending::<Result<Bytes, FsError>>()),
+            inflight.get_or_fetch(&hash, std::future::pending::<Result<Bytes, FsError>>),
         )
         .await;
 

@@ -4953,8 +4953,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_reads_same_chunk_single_network_fetch() {
         let content = b"single chunk file data";
-        let (_chunk_hashes, root_hash, chunk_data_vec) =
-            build_mock_chunks(&[content.to_vec()]);
+        let (_chunk_hashes, root_hash, chunk_data_vec) = build_mock_chunks(&[content.to_vec()]);
         let chunk_data = chunk_data_vec.into_iter().next().unwrap();
 
         let root = Uuid::now_v7();
@@ -4972,10 +4971,13 @@ mod tests {
 
         let view2 = Arc::clone(&view);
         let handle1 = tokio::spawn(async move {
-            view.read(Path::new("file"), 0, content.len() as u64, None).await
+            view.read(Path::new("file"), 0, content.len() as u64, None)
+                .await
         });
         let handle2 = tokio::spawn(async move {
-            view2.read(Path::new("file"), 0, content.len() as u64, None).await
+            view2
+                .read(Path::new("file"), 0, content.len() as u64, None)
+                .await
         });
 
         let (r1, r2) = tokio::join!(handle1, handle2);
