@@ -12,7 +12,6 @@ pub type SqliteResult<T> = Result<T, tokio_rusqlite::Error>;
 
 pub type GetMerkleFut<'a> =
     Pin<Box<dyn Future<Output = SqliteResult<Option<MerkleEntry>>> + Send + 'a>>;
-pub type PutMerkleFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + Send + 'a>>;
 pub type PutTreeFut<'a> = Pin<Box<dyn Future<Output = SqliteResult<()>> + Send + 'a>>;
 pub type GetChildrenFut<'a> =
     Pin<Box<dyn Future<Output = SqliteResult<Option<Vec<MerkleChild>>>> + Send + 'a>>;
@@ -30,15 +29,6 @@ pub trait MerkleCache: Send + Sync {
     fn get_all_leaf_info<'a>(&'a self, path: &'a Path) -> GetAllLeafInfoFut<'a>;
 
     fn delete_merkle<'a>(&'a self, path: &'a Path) -> DeleteMerkleFut<'a>;
-
-    fn put_merkle<'a>(
-        &'a self,
-        path: &'a Path,
-        mtime_ns: Option<u64>,
-        file_size: u64,
-        root: &'a Blake3Hash,
-        leaf_hashes: &'a [Blake3Hash],
-    ) -> PutMerkleFut<'a>;
 
     fn put_tree<'a>(
         &'a self,
@@ -64,17 +54,6 @@ impl MerkleCache for Database {
 
     fn delete_merkle<'a>(&'a self, path: &'a Path) -> DeleteMerkleFut<'a> {
         Box::pin(self.delete_merkle(path))
-    }
-
-    fn put_merkle<'a>(
-        &'a self,
-        path: &'a Path,
-        mtime_ns: Option<u64>,
-        file_size: u64,
-        root: &'a Blake3Hash,
-        leaf_hashes: &'a [Blake3Hash],
-    ) -> PutMerkleFut<'a> {
-        Box::pin(self.put_merkle(path, mtime_ns, file_size, root, leaf_hashes))
     }
 
     fn put_tree<'a>(
@@ -107,17 +86,6 @@ impl MerkleCache for NoopCache {
     }
 
     fn delete_merkle<'a>(&'a self, _path: &'a Path) -> DeleteMerkleFut<'a> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn put_merkle<'a>(
-        &'a self,
-        _path: &'a Path,
-        _mtime_ns: Option<u64>,
-        _file_size: u64,
-        _root: &'a Blake3Hash,
-        _leaf_hashes: &'a [Blake3Hash],
-    ) -> PutMerkleFut<'a> {
         Box::pin(async { Ok(()) })
     }
 

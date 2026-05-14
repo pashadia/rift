@@ -1627,15 +1627,15 @@ mod merkle_integration {
 
         let root_hash = Blake3Hash::new(b"test-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        helpers_with_db::insert_merkle_cache(
+            &db,
             &file_path,
             file_mtime_ns(&file_path),
             file_size(&file_path),
             &root_hash,
             &leaf_hashes,
         )
-        .await
-        .unwrap();
+        .await;
 
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
@@ -1731,15 +1731,15 @@ mod merkle_integration {
 
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        helpers_with_db::insert_merkle_cache(
+            &db,
             &file_path,
             file_mtime_ns(&file_path),
             file_size(&file_path),
             &cached_root,
             &leaf_hashes,
         )
-        .await
-        .unwrap();
+        .await;
 
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
@@ -1773,15 +1773,15 @@ mod merkle_integration {
         let stale_root = Blake3Hash::new(b"stale-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         let mtime_ns = file_mtime_ns(&file_path).map(|ns| ns.saturating_sub(1));
-        db.put_merkle(
+        helpers_with_db::insert_merkle_cache(
+            &db,
             &file_path,
             mtime_ns,
             file_size(&file_path),
             &stale_root,
             &leaf_hashes,
         )
-        .await
-        .unwrap();
+        .await;
 
         let req = StatRequest {
             handles: vec![file_handle.as_bytes().to_vec()],
@@ -1953,15 +1953,15 @@ mod merkle_integration {
 
         let root_hash = Blake3Hash::new(b"hello-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        helpers_with_db::insert_merkle_cache(
+            &db,
             &file_path,
             file_mtime_ns(&file_path),
             file_size(&file_path),
             &root_hash,
             &leaf_hashes,
         )
-        .await
-        .unwrap();
+        .await;
 
         let req = LookupRequest {
             parent_handle: root_handle.as_bytes().to_vec(),
@@ -2032,15 +2032,15 @@ mod merkle_integration {
 
         let cached_root = Blake3Hash::new(b"cached-content");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        helpers_with_db::insert_merkle_cache(
+            &db,
             &file1,
             file_mtime_ns(&file1),
             file_size(&file1),
             &cached_root,
             &leaf_hashes,
         )
-        .await
-        .unwrap();
+        .await;
 
         let req = StatRequest {
             handles: vec![
@@ -2110,6 +2110,8 @@ use rift_server::metadata::db::Database;
 mod helpers_with_db {
     use super::*;
     use crate::helpers::gen_cert;
+    use rift_common::crypto::{Blake3Hash, MerkleTree};
+    use rift_server::metadata::db::Database;
 
     pub async fn start_server_with_db<M: rift_server::handler::MerkleCache + 'static>(
         share: PathBuf,
@@ -2139,7 +2141,7 @@ mod helpers_with_db {
             .expect("sabotage SQL should succeed");
     }
 
-    /// Drop the `merkle_cache` table, causing `put_merkle` to fail.
+    /// Drop the `merkle_cache` table, causing `insert_merkle_cache` to fail.
     /// stat and read still return correct data; they just can't cache.
     pub async fn drop_merkle_cache(db: &Database) {
         sabotage_db(db, "DROP TABLE IF EXISTS merkle_cache").await;
@@ -2164,6 +2166,43 @@ mod helpers_with_db {
             "DROP TABLE IF EXISTS merkle_cache; DROP TABLE IF EXISTS merkle_tree_nodes; DROP TABLE IF EXISTS merkle_leaf_info;",
         )
         .await;
+    }
+
+    /// Insert a row into `merkle_cache` directly. Used by tests that need to
+    /// fabricate stale or incomplete cache states without going through `put_tree`.
+    pub async fn insert_merkle_cache(
+        db: &Database,
+        path: &std::path::Path,
+        mtime_ns: Option<u64>,
+        file_size: u64,
+        root: &Blake3Hash,
+        leaf_hashes: &[Blake3Hash],
+    ) {
+        let merkle = MerkleTree::default();
+        let serialized_leaves = merkle.serialize_leaves(leaf_hashes);
+        let path_str = path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let leaf_count = leaf_hashes.len() as i64;
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
+
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO merkle_cache
+                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    path_str,
+                    mtime_ns_i64,
+                    file_size as i64,
+                    root_bytes,
+                    serialized_leaves,
+                    leaf_count,
+                    0i64,
+                ),
+            )
+        })
+        .await
+        .expect("insert_merkle_cache should succeed");
     }
 
     pub fn file_mtime_ns(path: &std::path::PathBuf) -> Option<u64> {
@@ -2193,15 +2232,15 @@ async fn server_sends_root_hash_when_db_configured() {
     let db = Database::open_in_memory().await.unwrap();
     let root_hash = Blake3Hash::new(b"test-content");
     let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-    db.put_merkle(
+    helpers_with_db::insert_merkle_cache(
+        &db,
         &file_path,
         helpers_with_db::file_mtime_ns(&file_path),
         helpers_with_db::file_size(&file_path),
         &root_hash,
         &leaf_hashes,
     )
-    .await
-    .unwrap();
+    .await;
 
     let server_db = Arc::new(db);
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
@@ -2317,15 +2356,15 @@ async fn stat_uses_cached_root_when_file_unchanged() {
     let db = Database::open_in_memory().await.unwrap();
     let cached_root = Blake3Hash::new(b"my-cached-root-hash");
     let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-    db.put_merkle(
+    helpers_with_db::insert_merkle_cache(
+        &db,
         &file_path,
         helpers_with_db::file_mtime_ns(&file_path),
         helpers_with_db::file_size(&file_path),
         &cached_root,
         &leaf_hashes,
     )
-    .await
-    .unwrap();
+    .await;
 
     let server_db = Arc::new(db);
     let addr = helpers_with_db::start_server_with_db(root.clone(), server_db).await;
@@ -3624,7 +3663,7 @@ mod db_failure_resilience_tests {
     use super::*;
     use rift_server::metadata::db::Database;
 
-    /// Stat must return a correct `root_hash` even when `put_merkle` fails.
+    /// Stat must return a correct `root_hash` even when `insert_merkle_cache` fails.
     /// The root hash is computed from file content regardless of DB state.
     #[tokio::test]
     async fn stat_returns_correct_root_hash_despite_db_write_failure() {
@@ -3663,7 +3702,7 @@ mod db_failure_resilience_tests {
         assert_eq!(attrs.size, 10, "file size should be 10 bytes");
     }
 
-    /// Read must return correct chunk data even when `put_merkle` fails.
+    /// Read must return correct chunk data even when `insert_merkle_cache` fails.
     /// The read handler computes content/chunks from the file regardless of DB state.
     #[tokio::test]
     async fn read_returns_correct_data_despite_db_write_failure() {

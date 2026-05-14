@@ -305,7 +305,45 @@ mod tests {
     use super::*;
     use crate::metadata::db::Database;
     use crate::metadata::merkle::CacheStatus;
-    use rift_common::crypto::Blake3Hash;
+    use rift_common::crypto::{Blake3Hash, MerkleTree};
+    use std::sync::Arc;
+
+    /// Insert a row into `merkle_cache` directly. Used by tests that need to
+    /// fabricate stale cache states.
+    async fn insert_merkle_cache(
+        db: &Database,
+        path: &std::path::Path,
+        mtime_ns: Option<u64>,
+        file_size: u64,
+        root: &Blake3Hash,
+        leaf_hashes: &[Blake3Hash],
+    ) -> Result<(), tokio_rusqlite::Error> {
+        let merkle = MerkleTree::default();
+        let serialized_leaves = merkle.serialize_leaves(leaf_hashes);
+        let path_str = path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let leaf_count = leaf_hashes.len() as i64;
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
+
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO merkle_cache
+                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    path_str,
+                    mtime_ns_i64,
+                    file_size as i64,
+                    root_bytes,
+                    serialized_leaves,
+                    leaf_count,
+                    0i64,
+                ),
+            )?;
+            Ok(())
+        })
+        .await
+    }
 
     #[tokio::test]
     async fn background_check_caches_empty_share() {
@@ -373,7 +411,8 @@ mod tests {
         // Pre-populate cache with WRONG mtime (simulates stale entry)
         let root = Blake3Hash::new(b"wrong_root");
         let leaf = Blake3Hash::new(b"wrong_leaf");
-        db.put_merkle(
+        insert_merkle_cache(
+            &db,
             &file_path,
             Some(0), // wrong mtime
             999,     // wrong size
@@ -464,9 +503,9 @@ mod tests {
 
         // Create a proper incomplete entry: cache row with non-zero leaf_count,
         // tree nodes present, but leaf_info missing. We use raw SQL because
-        // put_tree would never produce this inconsistent state, and put_merkle
-        // with zero leaves would now correctly be interpreted as Complete for
-        // an empty file.
+        // put_tree would never produce this inconsistent state, and a direct
+        // merkle_cache insert with zero leaves would now correctly be
+        // interpreted as Complete for an empty file.
         let root = Blake3Hash::new(b"incomplete_root");
         let meta = std::fs::metadata(&file_path).unwrap();
         let mtime_ns = meta

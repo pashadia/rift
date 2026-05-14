@@ -1259,7 +1259,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)
@@ -1328,7 +1328,7 @@ mod tests {
         view.handles.insert_attrs(file_uuid, &attrs).await;
 
         // Still need drill + chunk for the read to succeed
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)
@@ -1337,7 +1337,8 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &content[..]);
         assert_eq!(
-            remote.get_stat_batch_call_count().await, 0,
+            remote.get_stat_batch_call_count().await,
+            0,
             "read must skip stat_batch when attrs are cached"
         );
     }
@@ -1363,7 +1364,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         // Call getattr first — this should warm the metadata cache
         let attrs = view.getattr(Path::new("test_file")).await.unwrap();
@@ -1371,11 +1372,14 @@ mod tests {
         assert_eq!(remote.get_stat_batch_call_count().await, 1);
 
         // Subsequent read should skip its internal stat_batch
-        let result = view.read(Path::new("test_file"), 0, content.len() as u64).await;
+        let result = view
+            .read(Path::new("test_file"), 0, content.len() as u64)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &content[..]);
         assert_eq!(
-            remote.get_stat_batch_call_count().await, 1,
+            remote.get_stat_batch_call_count().await,
+            1,
             "read must not call stat_batch when getattr warmed the cache"
         );
     }
@@ -1397,9 +1401,12 @@ mod tests {
         let root_hash = chunk_hash;
 
         remote
-            .set_lookup(Ok((file_uuid, make_file_attrs(content.len() as u64, root_hash))))
+            .set_lookup(Ok((
+                file_uuid,
+                make_file_attrs(content.len() as u64, root_hash),
+            )))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         // Call lookup first — this should warm the metadata cache
         let attrs = view.lookup(Path::new("."), "file").await.unwrap();
@@ -1411,7 +1418,8 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &content[..]);
         assert_eq!(
-            remote.get_stat_batch_call_count().await, 0,
+            remote.get_stat_batch_call_count().await,
+            0,
             "read must not call stat_batch when lookup warmed the cache"
         );
     }
@@ -1445,7 +1453,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         // Call readdir first — this should warm the metadata cache
         let entries = view.readdir(Path::new(".")).await.unwrap();
@@ -1454,11 +1462,14 @@ mod tests {
         assert_eq!(remote.get_stat_batch_call_count().await, 1);
 
         // Subsequent read should skip stat_batch
-        let result = view.read(Path::new("file.txt"), 0, content.len() as u64).await;
+        let result = view
+            .read(Path::new("file.txt"), 0, content.len() as u64)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &content[..]);
         assert_eq!(
-            remote.get_stat_batch_call_count().await, 1,
+            remote.get_stat_batch_call_count().await,
+            1,
             "read must not call stat_batch when readdir warmed the cache"
         );
     }
@@ -1484,7 +1495,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)
@@ -1493,7 +1504,8 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &content[..]);
         assert_eq!(
-            remote.get_stat_batch_call_count().await, 1,
+            remote.get_stat_batch_call_count().await,
+            1,
             "read must call stat_batch when attrs are not cached"
         );
     }
@@ -3020,7 +3032,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         // First read: should go to server, but NOT write to cache
         let result = view.read(Path::new("file"), 0, content.len() as u64).await;
@@ -3073,7 +3085,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         // First read
         let result = view.read(Path::new("file"), 0, content.len() as u64).await;
@@ -3086,7 +3098,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         // Second read - should also go to server in no_cache mode
         let result = view.read(Path::new("file"), 0, content.len() as u64).await;
@@ -4175,7 +4187,7 @@ mod tests {
                 root_hash,
             ))]))
             .await;
-        setup_single_chunk_file_mock(&*remote, content).await;
+        setup_single_chunk_file_mock(&remote, content).await;
 
         let result = view
             .read(Path::new("test_file"), 0, content.len() as u64)

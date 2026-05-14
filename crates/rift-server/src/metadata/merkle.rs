@@ -142,54 +142,6 @@ impl Database {
     /// Takes explicit `mtime_ns` and `file_size` rather than reading from the
     /// filesystem, so callers can pass verified/cached values.
     ///
-    /// `mtime_ns` is `Option<u64>`:
-    /// - `None` means unknown/unavailable mtime (will store NULL in database)
-    /// - `Some(0)` means actual Unix epoch timestamp
-    pub async fn put_merkle(
-        &self,
-        path: &Path,
-        mtime_ns: Option<u64>,
-        file_size: u64,
-        root: &Blake3Hash,
-        leaf_hashes: &[Blake3Hash],
-    ) -> SqliteResult<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()) as i64;
-
-        let merkle = MerkleTree::default();
-        let serialized_leaves = merkle.serialize_leaves(leaf_hashes);
-
-        let path_str = path.to_string_lossy().to_string();
-        let root_bytes = root.as_bytes().to_vec();
-        let serialized = serialized_leaves;
-
-        // Truncation only possible if usize > i64::MAX, which cannot happen for leaf counts.
-        let leaf_count = leaf_hashes.len() as i64;
-
-        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
-
-        self.call(move |conn: &mut rusqlite::Connection| {
-            conn.execute(
-                "INSERT OR REPLACE INTO merkle_cache
-                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                (
-                    path_str,
-                    mtime_ns_i64,
-                    file_size as i64,
-                    root_bytes,
-                    serialized,
-                    leaf_count,
-                    now,
-                ),
-            )
-        })
-        .await?;
-
-        Ok(())
-    }
-
     /// Store a complete Merkle tree for a file, including intermediate
     /// nodes and leaf metadata.
     ///
@@ -517,6 +469,43 @@ mod tests {
         fs::metadata(path).unwrap().len()
     }
 
+    /// Insert a row into `merkle_cache` directly. Used by tests that need to
+    /// fabricate stale or incomplete cache states without going through `put_tree`.
+    async fn insert_merkle_cache(
+        db: &Database,
+        path: &Path,
+        mtime_ns: Option<u64>,
+        file_size: u64,
+        root: &Blake3Hash,
+        leaf_hashes: &[Blake3Hash],
+    ) -> SqliteResult<()> {
+        let merkle = MerkleTree::default();
+        let serialized_leaves = merkle.serialize_leaves(leaf_hashes);
+        let path_str = path.to_string_lossy().to_string();
+        let root_bytes = root.as_bytes().to_vec();
+        let leaf_count = leaf_hashes.len() as i64;
+        let mtime_ns_i64 = mtime_ns.map(|ns| ns as i64);
+
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO merkle_cache
+                 (file_path, mtime_ns, file_size, root_hash, leaf_hashes, leaf_count, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    path_str,
+                    mtime_ns_i64,
+                    file_size as i64,
+                    root_bytes,
+                    serialized_leaves,
+                    leaf_count,
+                    0i64,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn cache_status_returns_missing_for_no_entry() {
         let db = Database::open_in_memory().await.unwrap();
@@ -583,7 +572,7 @@ mod tests {
         let size = file_size(&file_path);
 
         // Store with stale mtime
-        db.put_merkle(&file_path, stale_mtime, size, &root, &[leaf])
+        insert_merkle_cache(&db, &file_path, stale_mtime, size, &root, &[leaf])
             .await
             .unwrap();
 
@@ -606,7 +595,7 @@ mod tests {
         let stale_size = 999u64;
 
         // Store with stale size
-        db.put_merkle(&file_path, mtime_ns, stale_size, &root, &[leaf])
+        insert_merkle_cache(&db, &file_path, mtime_ns, stale_size, &root, &[leaf])
             .await
             .unwrap();
 
@@ -632,7 +621,7 @@ mod tests {
         let size = file_size(&file_path);
 
         // Only put the merkle_cache row, NOT merkle_tree_nodes or merkle_leaf_info
-        db.put_merkle(&file_path, mtime_ns, size, &root, &[leaf])
+        insert_merkle_cache(&db, &file_path, mtime_ns, size, &root, &[leaf])
             .await
             .unwrap();
 
@@ -806,7 +795,8 @@ mod tests {
 
         let root = Blake3Hash::new(b"test");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        insert_merkle_cache(
+            &db,
             &file_path,
             file_mtime_ns(&file_path),
             file_size(&file_path),
@@ -852,7 +842,8 @@ mod tests {
 
         let root = Blake3Hash::new(b"test");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        insert_merkle_cache(
+            &db,
             &file_path,
             file_mtime_ns(&file_path),
             file_size(&file_path),
@@ -879,7 +870,8 @@ mod tests {
 
         let root = Blake3Hash::new(b"test");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        insert_merkle_cache(
+            &db,
             &file_path,
             file_mtime_ns(&file_path),
             file_size(&file_path),
@@ -907,7 +899,8 @@ mod tests {
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         {
             let db = Database::open(&db_path).await.unwrap();
-            db.put_merkle(
+            insert_merkle_cache(
+                &db,
                 &file_path,
                 file_mtime_ns(&file_path),
                 file_size(&file_path),
@@ -1159,9 +1152,16 @@ mod tests {
         let root = Blake3Hash::new(b"test");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
         // Store with mtime_ns = None (NULL in DB)
-        db.put_merkle(&file_path, None, file_size(&file_path), &root, &leaf_hashes)
-            .await
-            .unwrap();
+        insert_merkle_cache(
+            &db,
+            &file_path,
+            None,
+            file_size(&file_path),
+            &root,
+            &leaf_hashes,
+        )
+        .await
+        .unwrap();
 
         // get_merkle should return None (stale) rather than erroring
         let result = db.get_merkle(&file_path).await;
@@ -1190,7 +1190,8 @@ mod tests {
 
         let root = Blake3Hash::new(b"test");
         let leaf_hashes = vec![Blake3Hash::new(b"chunk1")];
-        db.put_merkle(
+        insert_merkle_cache(
+            &db,
             &file_path,
             Some(0),
             file_size(&file_path),

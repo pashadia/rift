@@ -24,8 +24,8 @@ pub struct HandleMap {
     /// Maps symlink paths to their target paths.
     /// Only populated for entries where `file_type == SYMLINK`.
     symlink_targets: TreeIndex<PathBuf, String>,
-    /// Cached metadata (FileAttrs) keyed by UUID with TTL expiration.
-    /// Used to skip stat_batch round-trips in read().
+    /// Cached metadata (`FileAttrs`) keyed by UUID with TTL expiration.
+    /// Used to skip `stat_batch` round-trips in `read()`.
     metadata: TreeIndex<Uuid, (FileAttrs, Instant)>,
 }
 
@@ -150,9 +150,11 @@ impl HandleCache {
 
     /// Look up cached metadata for a handle. Returns `None` if missing or expired.
     pub fn get_attrs(&self, handle: &Uuid) -> Option<FileAttrs> {
-        self.map.metadata.peek_with(handle, |_, (attrs, inserted)| {
-            (inserted.elapsed() < METADATA_CACHE_TTL).then(|| attrs.clone())
-        })?
+        self.map
+            .metadata
+            .peek_with(handle, |_, (attrs, inserted)| {
+                (inserted.elapsed() < METADATA_CACHE_TTL).then(|| attrs.clone())
+            })?
     }
 
     pub async fn clear(&self) {
@@ -637,7 +639,7 @@ mod tests {
     async fn concurrent_insert_and_get_attrs() {
         let root = Uuid::now_v7();
         let cache = HandleCache::new(root);
-        let handles: Vec<Uuid> = (0..10).map(|i| make_uuid(i)).collect();
+        let handles: Vec<Uuid> = (0..10).map(make_uuid).collect();
         let cache = std::sync::Arc::new(cache);
 
         let mut writers = vec![];
@@ -668,7 +670,9 @@ mod tests {
 
         // Final verification: all entries are present
         for (i, &handle) in handles.iter().enumerate() {
-            let attrs = cache.get_attrs(&handle).expect("entry must exist after all writers");
+            let attrs = cache
+                .get_attrs(&handle)
+                .expect("entry must exist after all writers");
             assert_eq!(attrs.size, i as u64);
         }
     }
