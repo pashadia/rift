@@ -1002,12 +1002,14 @@ impl<C: RiftConnection> RiftClient<rift_transport::RecordingConnection<C>> {
 // ---------------------------------------------------------------------------
 
 /// Wrapper type for `MerkleDrill` results, simplifying the protocol response.
+#[derive(Clone, Debug)]
 pub struct MerkleDrillResult {
     pub parent_hash: Vec<u8>,
     pub children: Vec<MerkleChildInfo>,
 }
 
 /// Information about a child node returned from merkle drill.
+#[derive(Clone, Debug)]
 pub struct MerkleChildInfo {
     pub is_subtree: bool,
     pub hash: Vec<u8>,

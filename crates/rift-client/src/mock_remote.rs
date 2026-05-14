@@ -45,18 +45,29 @@ pub struct MockRemote {
     lookup_result: Mutex<Option<anyhow::Result<(Uuid, FileAttrs)>>>,
     readdir_result: Mutex<Option<anyhow::Result<Vec<ReaddirEntry>>>>,
     stat_batch_result: Mutex<Option<anyhow::Result<Vec<Result<FileAttrs, FsError>>>>>,
+    stat_batch_persistent: Mutex<Option<Result<Vec<Result<FileAttrs, FsError>>, String>>>,
     read_chunk_result: Mutex<Option<anyhow::Result<ChunkReadResult>>>,
 
     /// Map from hash (as `Vec<u8>`) to drill result. Empty `Vec` key = root drill.
+    /// Consumed on first lookup.
     merkle_drill_results: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
+
+    /// Persistent merkle drill results: returned on every lookup without
+    /// being consumed. Checked after the one-shot map.
+    merkle_drill_persistent: Mutex<HashMap<Vec<u8>, MerkleDrillResult>>,
 
     /// Per-chunk delays: maps `chunk_index` to delay before returning the result.
     /// Used to test out-of-order arrival in parallel fetch.
+    /// Delays persist across calls (not consumed) so retries experience them too.
     chunk_delays: Mutex<HashMap<u32, std::time::Duration>>,
 
     /// Keyed `read_chunk` results: maps `chunk_index` to the
     /// result to return for that specific call. Each entry is consumed on first match.
     read_chunk_keyed: Mutex<HashMap<u32, anyhow::Result<ChunkReadResult>>>,
+
+    /// Per-chunk FIFO sequences for `read_chunk`. Each call pops the next result.
+    /// Takes priority over keyed and one-shot results.
+    read_chunk_sequences: Mutex<HashMap<u32, Vec<anyhow::Result<ChunkReadResult>>>>,
 
     // -- call tracking --
     /// Total number of times `read_chunk` was called.
@@ -92,10 +103,13 @@ impl Default for MockRemote {
             lookup_result: Mutex::new(None),
             readdir_result: Mutex::new(None),
             stat_batch_result: Mutex::new(None),
+            stat_batch_persistent: Mutex::new(None),
             read_chunk_result: Mutex::new(None),
             merkle_drill_results: Mutex::new(HashMap::new()),
+            merkle_drill_persistent: Mutex::new(HashMap::new()),
             chunk_delays: Mutex::new(HashMap::new()),
             read_chunk_keyed: Mutex::new(HashMap::new()),
+            read_chunk_sequences: Mutex::new(HashMap::new()),
             read_chunk_called: Mutex::new(0),
             all_read_chunk_args: Mutex::new(Vec::new()),
             last_read_chunk_arg: Mutex::new(None),
@@ -121,6 +135,19 @@ impl MockRemote {
     /// Pre-set the result for the next `stat_batch` call.
     pub async fn set_stat_batch(&self, result: anyhow::Result<Vec<Result<FileAttrs, FsError>>>) {
         *self.stat_batch_result.lock().await = Some(result);
+    }
+
+    /// Pre-set a **persistent** result for `stat_batch` calls. The result
+    /// is returned on every call and is never consumed.
+    pub async fn set_stat_batch_persistent(
+        &self,
+        result: anyhow::Result<Vec<Result<FileAttrs, FsError>>>,
+    ) {
+        let stored = match result {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.to_string()),
+        };
+        *self.stat_batch_persistent.lock().await = Some(stored);
     }
 
     /// Pre-set the result for the next `read_chunk` call (one-shot).
@@ -169,9 +196,26 @@ impl MockRemote {
 
     /// Set a per-chunk delay: for chunk at `index`, wait `duration` before
     /// returning the result. Used to test out-of-order arrival in parallel
-    /// fetch scenarios.
+    /// fetch scenarios. The delay persists across calls (retries included).
     pub async fn set_chunk_delay(&self, index: u32, duration: std::time::Duration) {
         self.chunk_delays.lock().await.insert(index, duration);
+    }
+
+    /// Pre-set a FIFO sequence of results for `read_chunk` calls with a
+    /// specific chunk index. Each call consumes the next entry.
+    ///
+    /// Sequence results take priority over keyed and one-shot results.
+    /// Useful for testing retry logic where the same chunk must fail N
+    /// times before eventually succeeding.
+    pub async fn add_read_chunk_sequence(
+        &self,
+        chunk_index: u32,
+        results: Vec<anyhow::Result<ChunkReadResult>>,
+    ) {
+        self.read_chunk_sequences
+            .lock()
+            .await
+            .insert(chunk_index, results);
     }
 
     /// Store the root drill result (empty hash key).
@@ -191,6 +235,21 @@ impl MockRemote {
     /// remain available until consumed (not take-once).
     pub async fn set_merkle_drill_for_hash(&self, hash: Vec<u8>, result: MerkleDrillResult) {
         self.merkle_drill_results.lock().await.insert(hash, result);
+    }
+
+    /// Store a **persistent** `merkle_drill` result keyed by hash. The result
+    /// is returned on every matching lookup and is never consumed. This is
+    /// useful when multiple concurrent reads may call `merkle_drill` before
+    /// the manifest has been cached.
+    pub async fn set_merkle_drill_persistent_for_hash(
+        &self,
+        hash: Vec<u8>,
+        result: MerkleDrillResult,
+    ) {
+        self.merkle_drill_persistent
+            .lock()
+            .await
+            .insert(hash, result);
     }
 
     /// Return the total number of times `read_chunk` was called.
@@ -261,11 +320,16 @@ impl RemoteShare for MockRemote {
     ) -> anyhow::Result<Vec<Result<FileAttrs, FsError>>> {
         *self.stat_batch_called.lock().await += 1;
         *self.last_stat_batch_args.lock().await = Some(handles.clone());
-        self.stat_batch_result
-            .lock()
-            .await
-            .take()
-            .unwrap_or_else(|| Err(anyhow::anyhow!("no stat_batch result set")))
+        {
+            let mut result = self.stat_batch_result.lock().await;
+            if let Some(res) = result.take() {
+                return res;
+            }
+        }
+        if let Some(res) = self.stat_batch_persistent.lock().await.clone() {
+            return res.map_err(|e| anyhow::anyhow!(e));
+        }
+        Err(anyhow::anyhow!("no stat_batch result set"))
     }
 
     async fn read_chunk(&self, _handle: Uuid, chunk_index: u32) -> anyhow::Result<ChunkReadResult> {
@@ -273,12 +337,27 @@ impl RemoteShare for MockRemote {
         *self.last_read_chunk_arg.lock().await = Some(chunk_index);
         self.all_read_chunk_args.lock().await.push(chunk_index);
 
-        // Apply per-chunk delay (for parallel fetch ordering tests)
-        if let Some(delay) = self.chunk_delays.lock().await.remove(&chunk_index) {
+        // Check sequences first (highest priority)
+        let mut sequences = self.read_chunk_sequences.lock().await;
+        let seq_result = sequences.get_mut(&chunk_index).and_then(|seq| {
+            if seq.is_empty() {
+                None
+            } else {
+                Some(seq.remove(0))
+            }
+        });
+        drop(sequences);
+
+        // Apply per-chunk delay (persistent — not consumed)
+        if let Some(delay) = self.chunk_delays.lock().await.get(&chunk_index).copied() {
             tokio::time::sleep(delay).await;
         }
 
-        // Check keyed results first (takes priority)
+        if let Some(result) = seq_result {
+            return result;
+        }
+
+        // Check keyed results (takes priority over one-shot)
         if let Some(result) = self.read_chunk_keyed.lock().await.remove(&chunk_index) {
             return result;
         }
@@ -322,9 +401,19 @@ impl RemoteShare for MockRemote {
             .await
             .push(hash.to_vec());
         let mut map = self.merkle_drill_results.lock().await;
-        map.remove(hash)
-            .or_else(|| map.remove(&vec![]))
-            .ok_or_else(|| anyhow::anyhow!("no merkle_drill result for hash {:?}", hash))
+        let result = map.remove(hash).or_else(|| map.remove(&vec![]));
+        drop(map);
+        if let Some(result) = result {
+            return Ok(result);
+        }
+        let result = {
+            let persistent = self.merkle_drill_persistent.lock().await;
+            persistent
+                .get(hash)
+                .or_else(|| persistent.get(&vec![]))
+                .cloned()
+        };
+        result.ok_or_else(|| anyhow::anyhow!("no merkle_drill result for hash {:?}", hash))
     }
 }
 
