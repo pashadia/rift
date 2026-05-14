@@ -5364,4 +5364,62 @@ mod tests {
             );
         }
     }
+
+    // ── Bytes fast path tests ──────────────────────────────────────────
+
+    /// Verify that the Bytes return type is correct and single-chunk reads
+    /// produce the right data without unnecessary allocation.
+    #[tokio::test]
+    async fn read_single_chunk_fast_path_returns_correct_bytes() {
+        // Setup: 1 chunk of 512 bytes, read offset=100, length=50
+        // This falls entirely within a single chunk, so the fast path
+        // (Bytes::slice) should be used.
+        let chunk_data: Vec<u8> = (0u8..=255u8).cycle().take(512).collect();
+        let (chunk_hashes, root_hash, _) = build_mock_chunks(std::slice::from_ref(&chunk_data));
+        let file_size = 512u64;
+
+        let root = Uuid::now_v7();
+        let remote = Arc::new(MockRemote::new());
+        let view = RiftShareView::new(remote.clone(), root);
+
+        view.handles
+            .insert(std::path::PathBuf::from("file"), Uuid::now_v7())
+            .await;
+
+        remote
+            .set_stat_batch(Ok(vec![Ok(make_file_attrs(file_size, root_hash))]))
+            .await;
+        remote
+            .set_merkle_drill(Ok(MerkleDrillResult {
+                parent_hash: root_hash.to_vec(),
+                children: vec![MerkleChildInfo {
+                    is_subtree: false,
+                    hash: chunk_hashes[0].to_vec(),
+                    length: file_size,
+                    chunk_index: 0,
+                }],
+            }))
+            .await;
+        remote
+            .set_read_chunk(Ok(ChunkReadResult {
+                chunks: vec![ChunkData {
+                    index: 0,
+                    length: file_size,
+                    hash: chunk_hashes[0],
+                    data: Bytes::from(chunk_data.clone()),
+                }],
+                merkle_root: root_hash.to_vec(),
+            }))
+            .await;
+
+        // Read a sub-range within the single chunk
+        let result = view
+            .read(Path::new("file"), 100, 50, None)
+            .await
+            .expect("read should succeed");
+
+        // The result must be a Bytes of length 50 with the correct data
+        assert_eq!(result.len(), 50);
+        assert_eq!(&result[..], &chunk_data[100..150]);
+    }
 }
