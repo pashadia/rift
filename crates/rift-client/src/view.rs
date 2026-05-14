@@ -1,5 +1,6 @@
 use crate::cache::db::{ChunkInfo, FileCache};
 use crate::handle::HandleCache;
+use crate::in_flight::InFlightChunks;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -70,6 +71,7 @@ pub struct RiftShareView<R: RemoteShare> {
     remote: Arc<R>,
     cache: Option<Arc<FileCache>>,
     handles: Arc<HandleCache>,
+    in_flight: Arc<InFlightChunks>,
     /// When true, skip all cache reads and writes - every chunk is fetched
     /// fresh from the server. Useful for debugging data-integrity issues
     /// (e.g. sporadic corruption in large files with deep Merkle trees).
@@ -83,6 +85,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             remote,
             cache: None,
             handles: Arc::new(handles),
+            in_flight: Arc::new(InFlightChunks::new()),
             no_cache: false,
         }
     }
@@ -98,6 +101,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             remote,
             cache: Some(Arc::new(cache)),
             handles: Arc::new(handles),
+            in_flight: Arc::new(InFlightChunks::new()),
             no_cache: false,
         })
     }
@@ -263,39 +267,82 @@ impl<R: RemoteShare> RiftShareView<R> {
             }
         }
 
-        // Slow path: fetch from network
-        let result = self
-            .remote
-            .read_chunk(handle, leaf.chunk_index)
+        // Cache miss: use InFlightChunks to deduplicate concurrent fetches.
+        let remote = Arc::clone(&self.remote);
+        let cache = self.cache.as_ref().map(Arc::clone);
+        let chunk_index = leaf.chunk_index;
+        let hash = *leaf.hash.as_bytes();
+        let leaf_hash = *leaf.hash.as_bytes();
+        let leaf_len = leaf.length;
+        let root_hash_copy = root_hash.clone();
+        let handle_copy = handle;
+
+        self.in_flight
+            .get_or_fetch(&hash, move || {
+                let remote = Arc::clone(&remote);
+                let cache = cache.clone();
+                async move {
+                    Self::fetch_chunk_from_network(
+                        &remote,
+                        cache.as_deref(),
+                        handle_copy,
+                        chunk_index,
+                        &leaf_hash,
+                        leaf_len,
+                        &root_hash_copy,
+                    )
+                    .await
+                }
+            })
+            .await
+    }
+
+    /// Raw network fetch + Merkle verification for a single chunk.
+    /// Does NOT check the local cache or `InFlightChunks` — callers are
+    /// responsible for caching. Takes `Arc<R>` to avoid capturing `&self`.
+    #[instrument(skip(remote, cache, root_hash), fields(chunk_index))]
+    async fn fetch_chunk_from_network(
+        remote: &Arc<R>,
+        cache: Option<&FileCache>,
+        handle: Uuid,
+        chunk_index: u32,
+        expected_hash: &[u8; 32],
+        expected_length: u64,
+        root_hash: &Blake3Hash,
+    ) -> Result<Bytes, FsError> {
+        let result = remote
+            .read_chunk(handle, chunk_index)
             .await
             .map_err(|_| FsError::Io)?;
 
         // Verify merkle root
         let computed_root = Blake3Hash::from_slice(&result.merkle_root).map_err(|_| FsError::Io)?;
-        if computed_root != *root_hash {
-            tracing::error!(chunk_index = leaf.chunk_index, "merkle root mismatch");
+        if computed_root != root_hash.clone() {
+            tracing::error!(chunk_index, "merkle root mismatch");
             return Err(FsError::Io);
         }
 
         // Extract and verify the single chunk
         let chunk = result.single();
 
-        if Blake3Hash::new(&chunk.data) != leaf.hash {
-            tracing::error!(chunk_index = leaf.chunk_index, "chunk hash mismatch");
+        let actual = Blake3Hash::new(&chunk.data);
+        let expected = Blake3Hash::from_slice(expected_hash).map_err(|_| FsError::Io)?;
+        if actual != expected {
+            tracing::error!(chunk_index, "chunk hash mismatch");
             return Err(FsError::Io);
         }
-        if chunk.data.len() as u64 != leaf.length {
-            tracing::error!(chunk_index = leaf.chunk_index, "chunk length mismatch");
+        if chunk.data.len() as u64 != expected_length {
+            tracing::error!(chunk_index, "chunk length mismatch");
             return Err(FsError::Io);
         }
 
         // Cache the chunk data
-        if let Some(cache) = self.cache() {
+        if let Some(cache) = cache {
             if let Err(e) = cache
-                .put_chunk_bytes(leaf.hash.as_bytes(), chunk.data.clone())
+                .put_chunk_bytes(expected_hash, chunk.data.clone())
                 .await
             {
-                tracing::warn!(chunk_index = leaf.chunk_index, error = %e, "failed to cache chunk");
+                tracing::warn!(chunk_index, error = %e, "failed to cache chunk");
             }
         }
 
