@@ -1,5 +1,6 @@
 use crate::cache::db::{ChunkInfo, FileCache};
 use crate::handle::HandleCache;
+use crate::in_flight::InFlightChunks;
 use crate::remote::RemoteShare;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -73,6 +74,8 @@ pub struct RiftShareView<R: RemoteShare> {
     remote: Arc<R>,
     cache: Option<Arc<FileCache>>,
     handles: Arc<HandleCache>,
+    /// Deduplication layer for in-flight chunk fetches.
+    in_flight: Arc<InFlightChunks>,
     /// When true, skip all cache reads and writes - every chunk is fetched
     /// fresh from the server. Useful for debugging data-integrity issues
     /// (e.g. sporadic corruption in large files with deep Merkle trees).
@@ -86,6 +89,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             remote,
             cache: None,
             handles: Arc::new(handles),
+            in_flight: Arc::new(InFlightChunks::new()),
             no_cache: false,
         }
     }
@@ -101,6 +105,7 @@ impl<R: RemoteShare> RiftShareView<R> {
             remote,
             cache: Some(Arc::new(cache)),
             handles: Arc::new(handles),
+            in_flight: Arc::new(InFlightChunks::new()),
             no_cache: false,
         })
     }
@@ -240,6 +245,10 @@ impl<R: RemoteShare> RiftShareView<R> {
     ///
     /// Verifies both the Merkle root (against `root_hash`) and the per-chunk
     /// hash (against `leaf.hash`) before returning data.
+    ///
+    /// Uses `InFlightChunks` to deduplicate concurrent fetches of the same
+    /// chunk hash — the first caller runs the produce closure; subsequent
+    /// callers wait for the result.
     #[instrument(skip(self, leaf, root_hash), fields(chunk_index = leaf.chunk_index))]
     async fn fetch_chunk(
         &self,
@@ -266,43 +275,135 @@ impl<R: RemoteShare> RiftShareView<R> {
             }
         }
 
-        // Slow path: fetch from network
-        let result = self
-            .remote
-            .read_chunk(handle, leaf.chunk_index)
+        // Cache miss: use InFlightChunks to deduplicate concurrent fetches.
+        let remote = Arc::clone(&self.remote);
+        let cache = self.cache.as_ref().map(Arc::clone);
+        let chunk_index = leaf.chunk_index;
+        let hash = *leaf.hash.as_bytes();
+        let leaf_hash = *leaf.hash.as_bytes();
+        let leaf_len = leaf.length;
+        let root_hash_copy = root_hash.clone();
+        let handle_copy = handle;
+
+        self.in_flight
+            .get_or_fetch(&hash, move || {
+                let remote = Arc::clone(&remote);
+                let cache = cache.clone();
+                async move {
+                    Self::fetch_chunk_with_retries(
+                        &remote,
+                        cache.as_deref(),
+                        handle_copy,
+                        chunk_index,
+                        &leaf_hash,
+                        leaf_len,
+                        &root_hash_copy,
+                    )
+                    .await
+                }
+            })
+            .await
+    }
+
+    /// Raw network fetch + Merkle verification for a single chunk.
+    /// Does NOT check the local cache or `InFlightChunks` — callers are
+    /// responsible for caching. Takes `Arc<R>` to avoid capturing `&self`.
+    #[instrument(skip(remote, cache, root_hash), fields(chunk_index))]
+    async fn fetch_chunk_from_network(
+        remote: &Arc<R>,
+        cache: Option<&FileCache>,
+        handle: Uuid,
+        chunk_index: u32,
+        expected_hash: &[u8; 32],
+        expected_length: u64,
+        root_hash: &Blake3Hash,
+    ) -> Result<Bytes, FsError> {
+        let result = remote
+            .read_chunk(handle, chunk_index)
             .await
             .map_err(|_| FsError::Io)?;
 
         // Verify merkle root
         let computed_root = Blake3Hash::from_slice(&result.merkle_root).map_err(|_| FsError::Io)?;
-        if computed_root != *root_hash {
-            tracing::error!(chunk_index = leaf.chunk_index, "merkle root mismatch");
+        if computed_root != root_hash.clone() {
+            tracing::error!(chunk_index, "merkle root mismatch");
             return Err(FsError::Io);
         }
 
         // Extract and verify the single chunk
         let chunk = result.single();
 
-        if Blake3Hash::new(&chunk.data) != leaf.hash {
-            tracing::error!(chunk_index = leaf.chunk_index, "chunk hash mismatch");
+        let actual = Blake3Hash::new(&chunk.data);
+        let expected = Blake3Hash::from_slice(expected_hash).map_err(|_| FsError::Io)?;
+        if actual != expected {
+            tracing::error!(chunk_index, "chunk hash mismatch");
             return Err(FsError::Io);
         }
-        if chunk.data.len() as u64 != leaf.length {
-            tracing::error!(chunk_index = leaf.chunk_index, "chunk length mismatch");
+        if chunk.data.len() as u64 != expected_length {
+            tracing::error!(chunk_index, "chunk length mismatch");
             return Err(FsError::Io);
         }
 
         // Cache the chunk data
-        if let Some(cache) = self.cache() {
+        if let Some(cache) = cache {
             if let Err(e) = cache
-                .put_chunk_bytes(leaf.hash.as_bytes(), chunk.data.clone())
+                .put_chunk_bytes(expected_hash, chunk.data.clone())
                 .await
             {
-                tracing::warn!(chunk_index = leaf.chunk_index, error = %e, "failed to cache chunk");
+                tracing::warn!(chunk_index, error = %e, "failed to cache chunk");
             }
         }
 
         Ok(chunk.data)
+    }
+
+    /// Maximum number of chunk fetch retry attempts.
+    const MAX_RETRIES: u32 = 3;
+
+    /// Retry interval base (milliseconds). Actual delays:
+    /// attempt 1: 100ms, attempt 2: 200ms, attempt 3: 400ms
+    const RETRY_DELAY_MS: u64 = 100;
+
+    /// Fetch a chunk from the network with exponential backoff retries.
+    ///
+    /// Calls `fetch_chunk_from_network` up to `MAX_RETRIES` times.
+    /// Between attempts, sleeps for `RETRY_DELAY_MS * 2^(attempt-1)`.
+    /// Returns `FsError::Io` if all attempts fail.
+    #[instrument(skip(remote, cache, root_hash), fields(chunk_index))]
+    async fn fetch_chunk_with_retries(
+        remote: &Arc<R>,
+        cache: Option<&FileCache>,
+        handle: Uuid,
+        chunk_index: u32,
+        expected_hash: &[u8; 32],
+        expected_length: u64,
+        root_hash: &Blake3Hash,
+    ) -> Result<Bytes, FsError> {
+        let mut last_error = FsError::Io;
+        for attempt in 0..=Self::MAX_RETRIES {
+            if attempt > 0 {
+                let delay_ms = Self::RETRY_DELAY_MS * 2u64.pow(attempt - 1);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            match Self::fetch_chunk_from_network(
+                remote,
+                cache,
+                handle,
+                chunk_index,
+                expected_hash,
+                expected_length,
+                root_hash,
+            )
+            .await
+            {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::warn!(chunk_index, attempt, "chunk fetch failed, retrying");
+                    last_error = e;
+                }
+            }
+        }
+        Err(last_error)
     }
 
     /// Obtain the chunk leaf data and byte-offset table for a file.
@@ -1766,8 +1867,10 @@ mod tests {
             "cross-chunk read should concatenate tail of chunk0 and head of chunk1"
         );
 
+        let mut fetched = remote.fetched_chunk_indices().await;
+        fetched.sort();
         assert_eq!(
-            remote.fetched_chunk_indices().await,
+            fetched,
             vec![0u32, 1],
             "cross-chunk read should fetch both chunks 0 and 1"
         );
@@ -3334,9 +3437,11 @@ mod tests {
             result, expected_full,
             "full read data should be correct after partial read cache miss"
         );
+        let mut fetched = remote.fetched_chunk_indices().await;
+        fetched.sort();
         assert_eq!(
-            remote.fetched_chunk_indices().await,
-            vec![1u32, 0, 2],
+            fetched,
+            vec![0u32, 1, 2],
             "total fetched: chunk 1 (partial read) + chunks 0 and 2 (full read, chunk 1 was cached)"
         );
     }
@@ -4171,7 +4276,8 @@ mod tests {
         let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
         assert_eq!(result, expected, "full file read must return correct data");
 
-        let fetched = remote.fetched_chunk_indices().await;
+        let mut fetched = remote.fetched_chunk_indices().await;
+        fetched.sort();
         assert_eq!(
             fetched,
             (0..num_chunks as u32).collect::<Vec<_>>(),
@@ -4251,7 +4357,8 @@ mod tests {
             "partial range read must return correct bytes"
         );
 
-        let fetched = remote.fetched_chunk_indices().await;
+        let mut fetched = remote.fetched_chunk_indices().await;
+        fetched.sort();
         assert_eq!(
             fetched,
             vec![2u32, 3],
@@ -4764,19 +4871,16 @@ mod tests {
         //  only chunk 2 is fetched again on the second read because
         //  chunks 0,1,3,4 are already in cache)
         let fetched = remote.fetched_chunk_indices().await;
-        // 5 attempts in first parallel fetch (indices 0..4), plus chunk 2 retry = 6 total
-        assert_eq!(
-            fetched.len(),
-            6,
-            "5 chunks in first read (incl. failed chunk 2) + 1 retry on second read"
-        );
-        // Chunk 2 was attempted twice (first read + second read retry)
+        // With retry logic (MAX_RETRIES=3), chunk 2 is attempted 4 times
+        // (1 initial + 3 retries) in the first read, plus once more in
+        // the second read after the error is fixed.
+        // Other chunks: 1 attempt each (first read only; cached on second read).
+        // Order is nondeterministic due to parallel fetch.
         let chunk2_count = fetched.iter().filter(|&&i| i == 2).count();
         assert_eq!(
-            chunk2_count, 2,
-            "chunk 2 should be attempted twice (once in each read)"
+            chunk2_count, 5,
+            "chunk 2 should be attempted 5 times (4 retries in first read + 1 in second read)"
         );
-        // All other chunks should appear exactly once (first read)
         for c in &[0u32, 1, 3, 4] {
             let count = fetched.iter().filter(|&&i| i == *c).count();
             assert_eq!(count, 1, "chunk {} should appear only once (first read)", c);
