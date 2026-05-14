@@ -400,9 +400,7 @@ async fn client_reconnect_preserves_cached_data() {
         .expect("lookup failed");
 
     // First read - should fetch from server and cache
-    let content = view
-        .read(std::path::Path::new("hello.txt"), 0, 100, None)
-        .await;
+    let content = view.read(std::path::Path::new("hello.txt"), 0, 100).await;
     assert!(
         content.is_ok(),
         "first read should succeed: {:?}",

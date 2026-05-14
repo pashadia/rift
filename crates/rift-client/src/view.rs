@@ -40,13 +40,7 @@ pub trait ShareView: Send + Sync + 'static {
     async fn readdir(&self, path: &Path) -> Result<Vec<DirEntry>, FsError>;
 
     /// Reads a byte range from a file by path.
-    async fn read(
-        &self,
-        path: &Path,
-        offset: u64,
-        length: u64,
-        cached_root_hash: Option<&[u8]>,
-    ) -> Result<Bytes, FsError>;
+    async fn read(&self, path: &Path, offset: u64, length: u64) -> Result<Bytes, FsError>;
 
     /// Reads the target of a symbolic link by path.
     /// Returns the symlink target as a String.
@@ -657,13 +651,7 @@ impl<R: RemoteShare> ShareView for RiftShareView<R> {
     }
 
     #[instrument(skip(self), fields(path = %path.display(), offset, length))]
-    async fn read(
-        &self,
-        path: &Path,
-        offset: u64,
-        length: u64,
-        _cached_root_hash: Option<&[u8]>,
-    ) -> Result<Bytes, FsError> {
+    async fn read(&self, path: &Path, offset: u64, length: u64) -> Result<Bytes, FsError> {
         let handle = self.resolve_path(path)?;
 
         let (file_size, merkle_root) = match self.stat_file(handle).await {
@@ -1284,7 +1272,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("test_file"), 0, content.len() as u64, None)
+            .read(Path::new("test_file"), 0, content.len() as u64)
             .await;
 
         assert!(result.is_ok());
@@ -1361,7 +1349,7 @@ mod tests {
             }))
             .await;
 
-        view.read(Path::new("file"), 120, 50, None)
+        view.read(Path::new("file"), 120, 50)
             .await
             .expect("read should succeed");
 
@@ -1393,7 +1381,7 @@ mod tests {
         // No merkle_drill or read_chunks setup - they must NOT be called.
 
         let result = view
-            .read(Path::new("file"), 400, 100, None)
+            .read(Path::new("file"), 400, 100)
             .await
             .expect("offset beyond EOF must return Ok(empty), not an error");
 
@@ -1461,7 +1449,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 250, 999, None)
+            .read(Path::new("file"), 250, 999)
             .await
             .expect("read past EOF must not return an error (POSIX short read)");
 
@@ -1550,7 +1538,7 @@ mod tests {
             })
             .await;
 
-        view.read(Path::new("file"), 0, file_size, None)
+        view.read(Path::new("file"), 0, file_size)
             .await
             .expect("read should succeed");
 
@@ -1637,7 +1625,7 @@ mod tests {
             })
             .await;
 
-        view.read(Path::new("file"), 0, file_size, None)
+        view.read(Path::new("file"), 0, file_size)
             .await
             .expect("read should succeed");
 
@@ -1735,7 +1723,7 @@ mod tests {
             .await;
 
         // Read 50 bytes at offset 120 - entirely within chunk 1.
-        view.read(Path::new("file"), 120, 50, None)
+        view.read(Path::new("file"), 120, 50)
             .await
             .expect("read should succeed");
 
@@ -1820,7 +1808,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 100, 10, None)
+            .read(Path::new("file"), 100, 10)
             .await
             .expect("read should succeed");
 
@@ -1886,7 +1874,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 80, 50, None)
+            .read(Path::new("file"), 80, 50)
             .await
             .expect("read should succeed");
 
@@ -1964,7 +1952,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("multi_chunk_file"), 120, 50, None)
+            .read(Path::new("multi_chunk_file"), 120, 50)
             .await
             .expect("read should succeed");
 
@@ -1983,7 +1971,7 @@ mod tests {
         let remote = Arc::new(MockRemote::new());
         let view = RiftShareView::new(remote, root);
 
-        let result = view.read(Path::new("nonexistent"), 0, 1024, None).await;
+        let result = view.read(Path::new("nonexistent"), 0, 1024).await;
         assert!(matches!(result, Err(FsError::NotFound)));
     }
 
@@ -2593,7 +2581,7 @@ mod tests {
             .await;
 
         // Read the entire file
-        let result = view.read(Path::new("big_file"), 0, file_size, None).await;
+        let result = view.read(Path::new("big_file"), 0, file_size).await;
         assert!(result.is_ok(), "read with subtrees should succeed");
         let data = result.unwrap();
         assert_eq!(data.len(), file_size as usize);
@@ -2661,7 +2649,7 @@ mod tests {
             }))
             .await;
 
-        let result = view.read(Path::new("test_file"), 0, 100, None).await;
+        let result = view.read(Path::new("test_file"), 0, 100).await;
         assert!(
             matches!(result, Err(FsError::Io)),
             "wrong chunk data should return FsError::Io, got {:?}",
@@ -2720,7 +2708,7 @@ mod tests {
             }))
             .await;
 
-        let result = view.read(Path::new("test_file"), 0, 100, None).await;
+        let result = view.read(Path::new("test_file"), 0, 100).await;
         assert!(
             matches!(result, Err(FsError::Io)),
             "wrong merkle_root should return FsError::Io, got {:?}",
@@ -2778,7 +2766,7 @@ mod tests {
             }))
             .await;
 
-        let result = view.read(Path::new("test_file"), 0, 100, None).await;
+        let result = view.read(Path::new("test_file"), 0, 100).await;
         assert!(
             matches!(result, Err(FsError::Io)),
             "wrong chunk length should return FsError::Io, got {:?}",
@@ -2843,9 +2831,7 @@ mod tests {
             .await;
 
         // First read: should go to server, but NOT write to cache
-        let result = view
-            .read(Path::new("file"), 0, content.len() as u64, None)
-            .await;
+        let result = view.read(Path::new("file"), 0, content.len() as u64).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &content[..]);
 
@@ -2919,9 +2905,7 @@ mod tests {
             .await;
 
         // First read
-        let result = view
-            .read(Path::new("file"), 0, content.len() as u64, None)
-            .await;
+        let result = view.read(Path::new("file"), 0, content.len() as u64).await;
         assert_eq!(result.unwrap(), &content[..]);
 
         // Re-set mock results for second read (MockRemote consumes them)
@@ -2955,9 +2939,7 @@ mod tests {
             .await;
 
         // Second read - should also go to server in no_cache mode
-        let result = view
-            .read(Path::new("file"), 0, content.len() as u64, None)
-            .await;
+        let result = view.read(Path::new("file"), 0, content.len() as u64).await;
         assert_eq!(result.unwrap(), &content[..]);
 
         // Both reads should have fetched chunk 0 from the server
@@ -3156,7 +3138,7 @@ mod tests {
         // Read at offset 0 - partial manifest should cause cache miss,
         // falling through to server fetch
         let result = view
-            .read(Path::new("file"), 0, 100, None)
+            .read(Path::new("file"), 0, 100)
             .await
             .expect("read should succeed");
 
@@ -3288,7 +3270,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("read should succeed even with out-of-order chunks");
 
@@ -3404,7 +3386,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 100, 50, None)
+            .read(Path::new("file"), 100, 50)
             .await
             .expect("partial read should succeed");
         // bytes 100-150 are the first 50 bytes of chunk 1
@@ -3458,7 +3440,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("full read should succeed");
         let mut expected_full = chunk0_data;
@@ -4067,7 +4049,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("test_file"), 0, content.len() as u64, None)
+            .read(Path::new("test_file"), 0, content.len() as u64)
             .await
             .expect("read should succeed");
 
@@ -4300,7 +4282,7 @@ mod tests {
         }
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("read should succeed");
 
@@ -4379,7 +4361,7 @@ mod tests {
         }
 
         let result = view
-            .read(Path::new("file"), 250, 100, None)
+            .read(Path::new("file"), 250, 100)
             .await
             .expect("read should succeed");
 
@@ -4466,7 +4448,7 @@ mod tests {
         }
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("read should succeed");
 
@@ -4549,7 +4531,7 @@ mod tests {
             }
         }
 
-        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        let result = view.read(Path::new("file"), 0, file_size).await;
         assert!(
             matches!(result, Err(FsError::Io)),
             "partial failure must return FsError::Io"
@@ -4662,7 +4644,7 @@ mod tests {
             }
         }
 
-        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        let result = view.read(Path::new("file"), 0, file_size).await;
         assert!(
             matches!(result, Err(FsError::Io)),
             "read with chunk 2 failure must return FsError::Io"
@@ -4756,7 +4738,7 @@ mod tests {
         }
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("first read should succeed");
 
@@ -4778,7 +4760,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("second read should succeed from cache");
 
@@ -4865,7 +4847,7 @@ mod tests {
             }
         }
 
-        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        let result = view.read(Path::new("file"), 0, file_size).await;
         assert!(
             matches!(result, Err(FsError::Io)),
             "first read must fail due to chunk 2 error"
@@ -4894,7 +4876,7 @@ mod tests {
             .await;
 
         let result = view
-            .read(Path::new("file"), 0, file_size, None)
+            .read(Path::new("file"), 0, file_size)
             .await
             .expect("second read should succeed");
 
@@ -4951,7 +4933,7 @@ mod tests {
             ))]))
             .await;
 
-        let result = view.read(Path::new("file"), 50, 0, None).await;
+        let result = view.read(Path::new("file"), 50, 0).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
         assert!(
@@ -4980,15 +4962,14 @@ mod tests {
             .await;
 
         let view2 = Arc::clone(&view);
-        let handle1 = tokio::spawn(async move {
-            view.read(Path::new("file"), 0, content.len() as u64, None)
-                .await
-        });
-        let handle2 = tokio::spawn(async move {
-            view2
-                .read(Path::new("file"), 0, content.len() as u64, None)
-                .await
-        });
+        let handle1 =
+            tokio::spawn(
+                async move { view.read(Path::new("file"), 0, content.len() as u64).await },
+            );
+        let handle2 =
+            tokio::spawn(
+                async move { view2.read(Path::new("file"), 0, content.len() as u64).await },
+            );
 
         let (r1, r2) = tokio::join!(handle1, handle2);
         let data1 = r1.expect("task 1 panicked").expect("read 1 should succeed");
@@ -5040,9 +5021,7 @@ mod tests {
             .add_read_chunk_result(0, Err(anyhow::anyhow!("chunk 0 always fails")))
             .await;
 
-        let result = view
-            .read(Path::new("file"), 0, content.len() as u64, None)
-            .await;
+        let result = view.read(Path::new("file"), 0, content.len() as u64).await;
         assert!(matches!(result, Err(FsError::Io)));
 
         assert_eq!(
@@ -5327,7 +5306,7 @@ mod tests {
             }
         }
 
-        let result = view.read(Path::new("file"), 0, file_size, None).await;
+        let result = view.read(Path::new("file"), 0, file_size).await;
         assert!(matches!(result, Err(FsError::Io)));
 
         let cache = view.cache().expect("cache should be enabled");
@@ -5398,7 +5377,7 @@ mod tests {
 
         // Read a sub-range within the single chunk
         let result = view
-            .read(Path::new("file"), 100, 50, None)
+            .read(Path::new("file"), 100, 50)
             .await
             .expect("read should succeed");
 

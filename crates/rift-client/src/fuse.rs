@@ -206,7 +206,7 @@ impl<V: ShareView + 'static> PathFilesystem for RiftFilesystem<V> {
 
         let data = self
             .view
-            .read(path, offset, size.into(), None)
+            .read(path, offset, size.into())
             .await
             .map_err(|e| to_errno(&e))?;
 
@@ -270,13 +270,7 @@ mod tests {
         async fn readdir(&self, _path: &Path) -> Result<Vec<DirEntry>, FsError> {
             Err(FsError::NotFound)
         }
-        async fn read(
-            &self,
-            _path: &Path,
-            _offset: u64,
-            _length: u64,
-            _cached_root_hash: Option<&[u8]>,
-        ) -> Result<Bytes, FsError> {
+        async fn read(&self, _path: &Path, _offset: u64, _length: u64) -> Result<Bytes, FsError> {
             Err(FsError::NotFound)
         }
 

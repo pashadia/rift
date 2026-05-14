@@ -262,7 +262,7 @@ async fn run_cache_test(test: &CacheTest) {
 
     // Perform a full-file read
     let result = view
-        .read(Path::new("file"), 0, file_size, None)
+        .read(Path::new("file"), 0, file_size)
         .await
         .expect("read should succeed");
 
@@ -419,8 +419,8 @@ async fn full_pipeline_parallel_fetch_dedup_eager_cache_retry() {
 
     // Two concurrent reads with overlapping ranges
     let view2 = Arc::clone(&view);
-    let handle1 = tokio::spawn(async move { view.read(Path::new("file"), 0, 500, None).await });
-    let handle2 = tokio::spawn(async move { view2.read(Path::new("file"), 300, 500, None).await });
+    let handle1 = tokio::spawn(async move { view.read(Path::new("file"), 0, 500).await });
+    let handle2 = tokio::spawn(async move { view2.read(Path::new("file"), 300, 500).await });
 
     let (r1, r2) = tokio::join!(handle1, handle2);
     let data1 = r1.expect("task 1 panicked").expect("read 1 should succeed");
@@ -557,7 +557,7 @@ async fn full_pipeline_retry_after_partial_failure() {
         }
     }
 
-    let result = view.read(Path::new("file"), 0, file_size, None).await;
+    let result = view.read(Path::new("file"), 0, file_size).await;
     assert!(
         matches!(result, Err(FsError::Io)),
         "first read must return EIO when chunk 2 exhausts retries"
@@ -612,7 +612,7 @@ async fn full_pipeline_retry_after_partial_failure() {
         .await;
 
     let result = view
-        .read(Path::new("file"), 0, file_size, None)
+        .read(Path::new("file"), 0, file_size)
         .await
         .expect("second read should succeed");
     let expected: Vec<u8> = chunks_data.iter().flatten().copied().collect();
@@ -695,7 +695,7 @@ async fn full_pipeline_offline_fallback_after_full_cache() {
         .set_stat_batch(Err(anyhow::anyhow!("network down")))
         .await;
 
-    let result = view.read(Path::new("file"), 0, file_size, None).await;
+    let result = view.read(Path::new("file"), 0, file_size).await;
     assert!(
         result.is_ok(),
         "read should fall back to cache when network is down"
@@ -775,7 +775,7 @@ async fn full_pipeline_offline_fallback_partial_cache_returns_eio() {
         .set_stat_batch(Err(anyhow::anyhow!("network down")))
         .await;
 
-    let result = view.read(Path::new("file"), 0, file_size, None).await;
+    let result = view.read(Path::new("file"), 0, file_size).await;
     assert!(
         matches!(result, Err(FsError::Io)),
         "partial cache with network down must return EIO"
